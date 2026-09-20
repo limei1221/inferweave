@@ -49,7 +49,8 @@ class ModelRunner:
         mode = "none" if self.enforce_eager else config.cudagraph_mode
         self.cudagraph_mode = self._cudagraph_mode(mode, mla, attention_backend)
         if rank == 0 and self.cudagraph_mode != mode:
-            logger.info("full CUDA graphs are off: %s has no MLA decode", attention_backend.get_name())
+            logger.info("%s MLA decode cannot run in a full graph; cudagraph_mode is %r not %r",
+                        attention_backend.get_name(), self.cudagraph_mode, mode)
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.graphs: dict = {}
@@ -229,8 +230,11 @@ class ModelRunner:
 
     @staticmethod
     def _cudagraph_mode(mode: str, mla: bool, backend: type[AttentionBackend]) -> str:
-        """The mode these captures can serve. A full graph holds attention, so MLA needs a backend that attends latents."""
-        if mla and mode in FULL_MODES and not backend.supports_mla_decode():
+        """The mode these captures can serve. A full graph holds attention, so MLA decode must both attend
+        latents and be safe to replay; FlashMLA bakes a per-step schedule a replay cannot refresh, so it falls
+        back to piecewise (decode runs eager, the rest of the model is still captured)."""
+        full_safe = backend.supports_mla_decode() and backend.supports_full_cudagraph_mla_decode()
+        if mla and mode in FULL_MODES and not full_safe:
             return "piecewise" if mode in PIECEWISE_MODES else "none"
         return mode
 

@@ -255,8 +255,11 @@ class TestStepKind:
 class TestCudagraphMode:
     """What an MLA model's backend leaves capturable. Pure: config and backend."""
 
-    def mode(self, mode, decodes_latents, mla=True):
-        backend = type("FakeBackend", (), {"supports_mla_decode": staticmethod(lambda: decodes_latents)})
+    def mode(self, mode, decodes_latents, mla=True, full_safe=True):
+        backend = type("FakeBackend", (), {
+            "supports_mla_decode": staticmethod(lambda: decodes_latents),
+            "supports_full_cudagraph_mla_decode": staticmethod(lambda: full_safe),
+        })
         return ModelRunner._cudagraph_mode(mode, mla, backend)
 
     def test_a_backend_without_mla_decode_loses_its_full_graphs(self):
@@ -264,7 +267,12 @@ class TestCudagraphMode:
         assert self.mode("full_and_piecewise", decodes_latents=False) == "piecewise"
         assert self.mode("full", decodes_latents=False) == "none"
 
-    def test_a_backend_with_mla_decode_keeps_the_mode(self):
+    def test_a_decode_that_bakes_a_schedule_loses_its_full_graphs(self):
+        """FlashMLA attends latents but bakes a per-step schedule a replay cannot refresh."""
+        assert self.mode("full_and_piecewise", decodes_latents=True, full_safe=False) == "piecewise"
+        assert self.mode("full", decodes_latents=True, full_safe=False) == "none"
+
+    def test_a_backend_with_replay_safe_mla_decode_keeps_the_mode(self):
         assert self.mode("full_and_piecewise", decodes_latents=True) == "full_and_piecewise"
 
     def test_a_model_without_mla_is_never_downgraded(self):

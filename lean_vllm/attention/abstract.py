@@ -35,6 +35,12 @@ class AttentionBackend(ABC):
         return False
 
     @staticmethod
+    def supports_full_cudagraph_mla_decode() -> bool:
+        """False if mla_decode bakes per-step state a full-graph replay cannot refresh (e.g. a FlashMLA
+        schedule built from cache_seqlens), so decode must stay eager and only piecewise graphs apply."""
+        return True
+
+    @staticmethod
     def mla_block_size() -> int | None:
         """The page size mla_decode requires, or None for any."""
         return None

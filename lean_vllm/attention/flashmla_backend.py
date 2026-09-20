@@ -28,6 +28,14 @@ class FlashMLABackend(FlashAttention3Backend):
         return True
 
     @staticmethod
+    def supports_full_cudagraph_mla_decode() -> bool:
+        # flash_mla_with_kvcache builds a tile schedule from this step's context_lens inside the kernel
+        # (this build fuses the old get_mla_metadata into dense_decode_fwd). A full-graph replay reuses the
+        # schedule captured for one set of lengths against later, different lengths and reads out of bounds,
+        # so decode stays eager and only the rest of the model is captured piecewise.
+        return False
+
+    @staticmethod
     def mla_block_size() -> int | None:
         return 64
 

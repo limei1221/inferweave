@@ -4,6 +4,7 @@ Only the blocking `step()` leaves the loop; a lock keeps everything else off the
 """
 
 import asyncio
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import AsyncIterator, Callable
 from uuid import uuid4
@@ -165,6 +166,7 @@ class AsyncLLMEngine:
 
     def _die(self, error: BaseException):
         """A status code cannot be retracted, so live streams get the error instead."""
+        logging.getLogger(__name__).error("the engine thread died", exc_info=error)
         self.error = error
         self._fail_streams(self._dead_error())
         self._close_profiler()
