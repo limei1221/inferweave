@@ -118,19 +118,17 @@ The graph-mode option differs between engines: lean-vLLM uses
 `--cudagraph-mode full_and_piecewise`; vLLM uses the equivalent
 `FULL_AND_PIECEWISE` setting in `--compilation-config`.
 
-The two engines also differ in what the full graph *covers* for MLA decode.
-vLLM captures MLA decode inside its full graph: it uses the older split FlashMLA
-API, which computes the decode schedule outside the graph into persistent buffers
-that a replay refreshes each step. The FlashMLA build here (deepseek-ai HEAD)
-removed that split API and fuses the schedule into `dense_decode_fwd`, baking it
-to the capture step's sequence lengths; a full-graph replay then reads it out of
-bounds. So lean-vLLM keeps MLA decode out of the full graph—`full_and_piecewise`
-is downgraded to `piecewise`, decode attention runs eager (the same FlashMLA
-kernel, uncaptured) while the rest of the model is still graph-captured. Startup
-logs the downgrade (`flashmla MLA decode cannot run in a full graph`). The net
-effect on lean-vLLM is the loss of graph launch-overhead reduction around the
-decode attention op only; when comparing decode throughput, note that vLLM's full
-graph covers one op that lean-vLLM's does not.
+Both engines now capture MLA decode inside the full graph. The FlashMLA build
+here (deepseek-ai HEAD) fuses the tile schedule and split-KV workspace into
+`dense_decode_fwd`, sizing them from `cache_seqlens`. Both lean-vLLM and vLLM
+capture that construction once, at capture time, with worst-case sequence lengths,
+so the baked schedule and workspace cover the longest sequence; the kernel then
+gates its KV loop on the `context_lens` each replay refreshes, so a replay with
+shorter, different lengths stays in bounds. lean-vLLM captures at `max_model_len`
+(see `capture_cudagraph` in `lean_vllm/engine/model_runner.py`); a pure-decode
+step that fits a captured batch size replays the whole model, attention included.
+Steps past the largest captured batch size still fall back to piecewise graphs
+with decode attention run eager between the pieces.
 
 MLA caches one compressed latent per token per layer—about 31 KB per token
 across V2-Lite's 27 layers, against the ~6 KB a plain paged cache of its heads

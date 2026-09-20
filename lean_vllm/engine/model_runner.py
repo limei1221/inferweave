@@ -398,11 +398,18 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # FlashMLA bakes its tile schedule and split-KV workspace from context_lens at capture, so capture the
+        # worst case: block 0 is valid, so a full block_tables of zeros holds max_model_len tokens per row. Every
+        # replay refreshes context_lens/block_tables (see _replay_full), and the kernel gates on those lengths.
+        context_lens.fill_(config.max_model_len)
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs]):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+                # The warmup scheduled MLA decode into the default pool; clear it so the capture reschedules
+                # into the graph's own pool (else the graph bakes pointers freed with this context).
+                get_context().mla_decode_metadata = None
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:

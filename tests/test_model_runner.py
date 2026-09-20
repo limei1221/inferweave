@@ -268,7 +268,7 @@ class TestCudagraphMode:
         assert self.mode("full", decodes_latents=False) == "none"
 
     def test_a_decode_that_bakes_a_schedule_loses_its_full_graphs(self):
-        """FlashMLA attends latents but bakes a per-step schedule a replay cannot refresh."""
+        """A backend that attends latents but bakes per-step state a replay cannot refresh."""
         assert self.mode("full_and_piecewise", decodes_latents=True, full_safe=False) == "piecewise"
         assert self.mode("full", decodes_latents=True, full_safe=False) == "none"
 
