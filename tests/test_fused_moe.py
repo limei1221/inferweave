@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from lean_vllm.layers.fused_moe import align_blocks, use_triton
+from lean_vllm.layers.fused_moe import align_blocks, fused_experts, use_triton
 from lean_vllm.layers.moe import FusedMoE
 
 HIDDEN, INTERMEDIATE = 32, 16
@@ -103,6 +103,26 @@ def test_the_blocked_path_matches_grouped_mm(moe, batch, block_m):
         got = blocked_moe(moe, x, topk_weights, topk_ids, block_m)
         want = moe.torch_experts(x, topk_weights, topk_ids)
     torch.testing.assert_close(got, want)
+
+
+requires_triton_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available() or use_triton.__globals__["_IMPORT_ERROR"] is not None,
+    reason="the Triton MoE kernel needs a CUDA device and a Triton build",
+)
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+def test_the_triton_kernel_matches_grouped_mm_on_cuda(moe, batch, dtype):
+    """The real tl.dot arithmetic against grouped_mm, in the dtype the model runs; the CPU test only reaches the indexing."""
+    layer = moe.to("cuda", dtype)
+    x, topk_weights, topk_ids = batch
+    x, topk_weights, topk_ids = x.to("cuda", dtype), topk_weights.to("cuda", dtype), topk_ids.cuda()
+    with torch.inference_mode():
+        got = fused_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids, layer.act_fn)
+        want = layer.torch_experts(x, topk_weights, topk_ids)
+    # bf16: reduction order differs between the kernel and grouped_mm, so allow bf16 rounding.
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
 
 
 def test_forward_takes_the_torch_path_off_cuda(moe, batch):
