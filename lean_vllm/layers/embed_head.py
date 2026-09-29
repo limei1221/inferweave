@@ -58,6 +58,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
         if context.logits_indices is not None:
             # A chunk that has not finished its prompt has no token to sample.
+            # [num_batch_tokens, hidden_dim] -> [num_sampling_rows, hidden_dim]
             x = x[context.logits_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:

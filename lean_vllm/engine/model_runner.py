@@ -89,11 +89,11 @@ class ModelRunner:
 
     def exit(self):
         if self.world_size > 1:
-            dist.barrier()
+            dist.barrier()    # sync ranks
         if self.cudagraph_mode != "none":
             del self.graphs, self.piecewise_graphs, self.graph_pool
-        dev.synchronize(self.device)
-        dist.destroy_process_group()
+        dev.synchronize(self.device)    # drain the device
+        dist.destroy_process_group()    # drop the comms
 
     def loop(self):
         while True:
@@ -176,14 +176,14 @@ class ModelRunner:
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size    # exclusive, so one past the last block
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
                     slot_start += start % self.block_size
                 if i != end_block - 1:
                     slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
+                else:    # last logical block, half-full probably
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
 

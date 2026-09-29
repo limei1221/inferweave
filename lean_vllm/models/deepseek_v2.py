@@ -141,7 +141,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: [N, config.hidden_size]
         scores = F.linear(x.float(), self.gate.weight.float()).softmax(dim=-1)
+        # scores: [N, config.n_routed_experts]
         if self.topk_method == "group_limited_greedy":
             # Only experts in the topk_group best groups stay eligible.
             groups = reduce(scores, "n (g e) -> n g", "max", g=self.num_group)

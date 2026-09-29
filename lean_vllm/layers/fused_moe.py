@@ -123,8 +123,8 @@ def fused_experts(
     act_fn: torch.nn.Module,
 ) -> torch.Tensor:
     """x through its top-k experts: sort into blocks, a GEMM either side of the activation, then sum."""
-    num_tokens, _ = x.shape
-    num_experts, gate_up_size, hidden_size = gate_up_proj.shape    # gate and up are stacked: 2I
+    num_tokens, _ = x.shape    # [T, D]
+    num_experts, gate_up_size, hidden_size = gate_up_proj.shape    # [E, 2I, D]
     top_k = topk_ids.size(1)
     num_pairs = num_tokens * top_k
     launch = config(num_pairs)
@@ -144,9 +144,9 @@ def fused_experts(
         )
 
     # Every pair is written exactly once, so the padding never reads an uninitialized row.
-    h = torch.empty(num_pairs, gate_up_size, device=x.device, dtype=x.dtype)
-    gemm(x, gate_up_proj, h, top_k, mul_routed_weight=False)
-    h = act_fn(h)
-    out = torch.empty(num_pairs, hidden_size, device=x.device, dtype=x.dtype)
+    h = torch.empty(num_pairs, gate_up_size, device=x.device, dtype=x.dtype)    # [T*K, 2I]
+    gemm(x, gate_up_proj, h, top_k, mul_routed_weight=False)    # x has one row per token
+    h = act_fn(h)    # [T*K, 2I] -> [T*K, I]
+    out = torch.empty(num_pairs, hidden_size, device=x.device, dtype=x.dtype)    # [T*K, D]
     gemm(h, down_proj, out, 1, mul_routed_weight=True)    # h is already one row per pair
-    return reduce(out, "(n k) d -> n d", "sum", k=top_k)
+    return reduce(out, "(n k) d -> n d", "sum", k=top_k)    # [T, D]
