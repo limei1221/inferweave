@@ -130,13 +130,17 @@ and stopping the server for each.
 
 ```bash
 uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
-    --suite rate --rates 1,2,4,8,16 --num-kvcache-blocks 8192 --out results/8b
+    --suite rate --rates 1,2,4,8,16 --kvcache-tokens 131072 --out results/8b
 ```
 
-No benchmark numbers are published yet. The backends were verified for
-numerical correctness against a dense reference on an A100 back when the CUDA
-one was FlashAttention-2; the FlashAttention-3 backend that replaced it awaits
-its first H100.
+Published reports, each against vLLM 0.26.0 on one H100:
+
+- [13 September](docs/benchmark-2026-09-13.md), Qwen3-8B: at parity below
+  saturation, 5–7% behind on goodput at the plateau.
+- [20 September](docs/benchmark-2026-09-20.md), DeepSeek-V2-Lite-Chat: median
+  TPOT 7.0 ms against vLLM's 4.4 ms at low load, and plateaus at about 20
+  requests/s where vLLM reaches 31.8.
+
 [docs/benchmark-runbook.md](docs/benchmark-runbook.md) is the step-by-step for
 producing numbers on a rented H100.
 

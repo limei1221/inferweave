@@ -1,20 +1,90 @@
 # Online serving
 
-`lean-vllm serve` puts the engine behind an OpenAI-compatible HTTP API. Tokens
-stream back as they are produced, and one token budget per step decides what
-runs: prefill chunks and decode rows together.
+`lean-vllm serve` puts the engine behind an OpenAI-compatible HTTP API. Requests
+arrive at any time and share one token budget per step, so prompt chunks and
+decoding requests run in the same batch. Tokens stream back as they are
+produced.
 
-## Start a server
+It serves every model the engine loads (Qwen3 and DeepSeek-V2, see
+[deepseek-v2.md](deepseek-v2.md)), one model per server. On Qwen3-8B on an H100
+it matches vLLM below saturation and trails it by 5–7% at the plateau
+([13 September report](benchmark-2026-09-13.md)).
+
+## What is supported
+
+### Endpoints
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /v1/completions` | Completes a prompt, given as a string or token ids |
+| `POST /v1/chat/completions` | Completes `system` / `user` / `assistant` messages through the chat template |
+| `GET /v1/models` | Lists the one model id this server answers to |
+| `GET /health` | 200, or 503 once the engine thread has died |
+| `GET /metrics` | Prometheus text |
+| `GET /metrics.json` | The same numbers as a JSON summary |
+
+Both completion endpoints stream over SSE with `"stream": true`. No API key is
+checked.
+
+### Request fields
+
+| Field | Support |
+| --- | --- |
+| `model`, `prompt` / `messages` | Required |
+| `max_tokens` | Default 64 |
+| `temperature` | Default 1.0; 0 is greedy |
+| `stream`, `stream_options.include_usage` | Supported |
+| `stop` | A string or a list of strings |
+| `n` | 1 only |
+| `ignore_eos` (extra) | Generates the full `max_tokens` |
+| `priority` (extra) | Lower runs first, under `--scheduling-policy priority` |
+| `top_p`, `top_k`, `min_p`, `seed`, penalties, `logprobs`, `logit_bias`, `tools`, `echo`, `suffix`, `best_of` | **Refused with a 400** |
+
+Unsupported fields are refused rather than ignored, because ignoring them would
+silently return the wrong output. A field set to its no-op value, such as
+`"top_p": 1.0`, is accepted, since many clients send those by default.
+
+### Errors
+
+| Status | When |
+| ---: | --- |
+| 400 | An unsupported field, or prompt + `max_tokens` longer than the context |
+| 404 | A `model` this server does not serve |
+| 429 | The waiting queue is full (`--max-waiting-requests`) |
+| 503 | The engine died, or the request can never fit in the KV cache |
+| 504 | The request waited past `--request-timeout` without being scheduled |
+
+Once a stream has sent its 200, a later error arrives as an SSE error event. A
+client that disconnects frees its KV blocks straight away.
+
+### Engine features
+
+| Feature | Default | Notes |
+| --- | --- | --- |
+| Chunked prefill, mixed prefill + decode steps | On | Off runs whole prompts, never mixed with decode |
+| Prefix caching | On | Reuses cached prompt blocks |
+| Async scheduling | On | Schedules the next step while the GPU runs the current one; turns itself off under tensor parallelism |
+| CUDA graphs | `full_and_piecewise` | Full graphs for decode, piecewise for small prefill and mixed steps |
+| Priority scheduling | Off (`fcfs`) | `--scheduling-policy priority` |
+| Admission control, queue timeout | Off | `--max-waiting-requests`, `--request-timeout` |
+| Preemption | Recompute | The sequence goes back to the head of the queue; there is no swapping to CPU |
+| Tensor parallelism | 1 | Up to 8 GPUs |
+
+Not supported: serving several models from one server, restarting the engine in
+place, `torch.compile`, and the sampling features refused above.
+
+## Running it
 
 ```bash
 uv sync --extra serve
 uv run lean-vllm serve ~/workspace/huggingface/Qwen3-8B --port 8000 --served-model-name qwen
 ```
 
-`--served-model-name` is the id the server answers to; without it, the model
-path is. Every `Config` field is a flag; `lean-vllm serve --help` lists them.
+`--served-model-name` is the id the server answers to. Without it, the id is
+the model path. Every `Config` field is a flag, and `lean-vllm serve --help`
+lists them.
 
-Any OpenAI client works, and no key is checked:
+Any OpenAI client works:
 
 ```python
 from openai import OpenAI
@@ -31,179 +101,47 @@ print(completion.choices[0].message.content)
 `example_serving.py` streams two prompts concurrently and reports each one's
 time to first token.
 
-## API
+### Flags
 
-| endpoint | |
-| --- | --- |
-| `POST /v1/completions` | prompt as a string or token ids |
-| `POST /v1/chat/completions` | messages, through the chat template |
-| `GET /v1/models` | the id this server serves |
-| `GET /health` | 503 once the engine thread dies |
-| `GET /metrics`, `/metrics.json` | Prometheus text, or a JSON summary |
-
-Supported fields: `model`, `prompt` / `messages`, `max_tokens` (default 64),
-`temperature` (default 1.0; 0 is greedy), `stream`, `stream_options`, `stop`,
-and `n` only as 1. Two extras: `ignore_eos` generates the full `max_tokens`,
-and `priority` orders requests under `--scheduling-policy priority` (lower runs
-first).
-
-Every other field (`top_p`, `seed`, penalties, `logprobs`, `tools`, ...) is
-**refused with a 400, not ignored**, since ignoring it returns wrong output
-silently. Refusal is by value: `"top_p": 1.0` asks for nothing and passes.
-
-| status | when |
-| ---: | --- |
-| 400 | an unsupported field, or prompt + `max_tokens` over the context |
-| 404 | a `model` this server does not serve |
-| 429 | the waiting queue is full (`--max-waiting-requests`) |
-| 503 | the engine died, or the request can never fit in the cache |
-| 504 | the request waited past `--request-timeout` without running |
-
-Once a stream has sent its 200, later errors arrive as an SSE error event.
-
-## Scheduling
-
-Each step schedules running sequences first (one token per decode, the next
-chunk per unfinished prefill), then admits waiting requests into the budget
-left. Preemption recomputes rather than swaps, and puts the sequence back at
-the head of the queue. A sequence that cannot fit even alone is dropped.
-
-| flag | default | |
+| Flag | Default | What it controls |
 | --- | ---: | --- |
-| `--max-num-batched-tokens` | 8192 | tokens per step |
-| `--max-num-seqs` | 1024 | sequences running at once |
-| `--enable-chunked-prefill` | on | off runs whole prompts, never mixed with decode |
-| `--long-prefill-token-threshold` | 0 | per-step token cap on one prompt, as in vLLM V1; 0 is none |
-| `--scheduling-policy` | `fcfs` | or `priority` |
-| `--max-waiting-requests` | 0 | refuse arrivals with a 429 past this queue length; 0 is none |
-| `--request-timeout` | 0 | drop a request never scheduled after this many seconds, with a 504; 0 is none |
-| `--num-kvcache-blocks` | profiled | pin it to hold cache capacity fixed across runs |
-| `--kvcache-block-size` | 16 | tokens per block |
-| `--enable-prefix-caching` | on | see [Prefix caching](#prefix-caching) |
-| `--async-scheduling` | on | see [Pipelined steps](#pipelined-steps) |
-| `--cudagraph-mode` | `full_and_piecewise` | see [CUDA graphs](#cuda-graphs) |
-| `--enforce-eager` | off | same as `--cudagraph-mode none` |
+| `--max-num-batched-tokens` | 8192 | Token budget per step |
+| `--max-num-seqs` | 1024 | Sequences running at once |
+| `--max-model-len` | 4096 | Context length, capped at the model's own |
+| `--enable-chunked-prefill` | on | Mixing prompt chunks with decode |
+| `--long-prefill-token-threshold` | 0 | Per-step token cap on one prompt, as in vLLM V1; 0 is none |
+| `--scheduling-policy` | `fcfs` | Or `priority` |
+| `--max-waiting-requests` | 0 | Queue length past which arrivals get a 429; 0 is none |
+| `--request-timeout` | 0 | Seconds a request may wait unscheduled before a 504; 0 is none |
+| `--gpu-memory-utilization` | 0.9 | Share of GPU memory for weights, activations and KV cache |
+| `--num-kvcache-blocks` | profiled | Pins the cache size, to hold it fixed across runs |
+| `--kvcache-block-size` | 16 | Tokens per KV block |
+| `--enable-prefix-caching` | on | See [Prefix caching](#prefix-caching) |
+| `--prefix-caching-hash-algo` | `sha256` | Or `xxhash` |
+| `--async-scheduling` | on | See [Pipelined steps](#pipelined-steps) |
+| `--cudagraph-mode` | `full_and_piecewise` | Or `full`, `piecewise`, `none`; see [CUDA graphs](#cuda-graphs) |
+| `--enforce-eager` | off | Same as `--cudagraph-mode none` |
+| `--tensor-parallel-size` | 1 | GPUs per model, up to 8 |
 
-Admission control is off by default, as in vLLM, so overload shows up in p99
-latency rather than a rejection rate. Read goodput alongside p99.
+Admission control is off by default, as in vLLM, so overload shows up as p99
+latency rather than rejections. Read goodput alongside p99.
 
-## Pipelined steps
+## Performance
 
-`step()` launches one step and then drains the one before it, so the drain's
-host work runs while the GPU computes. `--async-scheduling` decides how much
-overlaps:
+The [13 September report](benchmark-2026-09-13.md) compares lean-vLLM with
+vLLM 0.26.0 on Qwen3-8B on one H100:
 
-```text
-off                              on
----                              --
-await tokens of step k-1         schedule step k
-reconcile step k-1               launch step k
-schedule step k                  await tokens of step k-1
-launch step k                    reconcile step k-1
-detokenize step k-1              detokenize step k-1
-```
+- Below saturation the two are at parity: identical goodput at load 1, and
+  median TPOT 3% higher.
+- At the plateau lean-vLLM reaches about 24.1–24.5 requests/s against vLLM's
+  25.7–26.1.
+- Async scheduling adds 7–9% goodput under load.
+- The remaining gap is mostly large prefill steps, which run eager here and
+  compiled in vLLM.
 
-Off, only detokenization overlaps. On, scheduling and batch preparation do too,
-at a cost: a stop is seen one step late, so a request that hits EOS or a stop
-string has one extra token computed and discarded. Requests ending at
-`max_tokens` do not pay it.
+DeepSeek-V2-Lite has its own [20 September report](benchmark-2026-09-20.md).
 
-Two details keep this safe:
-
-- `SampledTokens` copies sampled tokens to pinned memory on a separate CUDA
-  stream, so awaiting step k-1 does not block on step k's kernels.
-- All other device work stays on one stream, so a later step always runs after
-  an earlier step's KV writes. That is what makes it safe to free or share a KV
-  block while a step is in flight.
-
-On by default, as in vLLM; it turns itself off under tensor parallelism, where
-other ranks never see the sampled tokens. On an H100 it cuts offline GPU idle
-from 22.4% to 3.2% and adds 7–9% goodput on Qwen3-8B
-([benchmark](benchmark-2026-09-13.md)).
-
-## CUDA graphs
-
-| step | `full_and_piecewise` (default) runs it as |
-| --- | --- |
-| pure decode, up to 512 rows | one full graph |
-| prefill or mixed, 64–512 tokens | piecewise graphs |
-| anything else | eager |
-
-`full` leaves all prefill and mixed steps eager; `piecewise` also sends decode
-through piecewise graphs; `none` captures nothing.
-
-Piecewise means each decoder layer is captured in two pieces, before and after
-attention. Attention stays eager because FlashAttention's varlen call depends
-on the sequence layout, which changes every step. The pieces are captured with
-`torch.cuda.CUDAGraph`, not torch.compile, so they save kernel launch cost but
-fuse nothing.
-
-A step pads up to its token bucket, and padding costs real compute. Past 512
-tokens that cost exceeds the launch overhead saved, so large steps run eager;
-vLLM compiles them instead. At plateau load on Qwen3-8B those eager steps take
-about half the step time.
-
-Things to know:
-
-- Greedy output can differ slightly from eager, because padding changes which
-  cuBLAS kernel runs. Replay matches the same pieces run eagerly at the same
-  padded width bitwise.
-- Nothing inside a piece may sync with the host (`.item()`, `.tolist()`,
-  `.cpu()`); re-check after changing `layers/` or `models/`.
-- Graph memory comes on top of the KV cache rather than out of it, so every mode
-  gets the same cache, but a tight card can run out of memory at capture.
-
-## Prefix caching
-
-A prompt is split into blocks, each hashed with the chain of blocks before it.
-A request whose leading blocks are cached reuses them and prefills only the
-rest.
-
-- Hashes are computed once, as tokens arrive, never inside a step.
-- The last block is always recomputed, since attention needs a query token.
-- Freed blocks are evicted deepest first, so shared prefixes outlive their
-  suffixes.
-- Caching changes what a request costs, never when it runs.
-
-`--prefix-caching-hash-algo` is `sha256` by default, or `xxhash` for speed when
-every client is trusted; a collision could serve one tenant another's tokens.
-The tokens behind a hit are compared before reuse either way.
-`--no-enable-prefix-caching` turns it all off, for A/B runs.
-
-## Metrics
-
-`/metrics.json` reports step count and time, batch tokens, the prefill/decode
-split, steps by graph kind, preemptions, prefix-cache hit rate, peak KV usage,
-and counts and means for TTFT, TPOT, queue delay and end-to-end latency. Names
-mirror vLLM's under `lean_vllm:`, except that the prefix-cache counters count
-blocks where vLLM's count tokens. Compute percentiles on the client; the
-histogram buckets are too coarse.
-
-Steps are counted as `graph`, `piecewise`, or an eager reason: `prefill`
-(a prefill or mixed step outside the piecewise range), `decode` (a decode step
-no graph covers: past the full-graph sizes, or under `piecewise` alone outside
-its range) or `enforced` (`none`).
-
-`model_busy_fraction`, the share of wall clock inside a forward pass, is the
-utilization to trust; the nvidia-smi figure beside it counts any live kernel as
-busy.
-
-## Benchmarks
-
-```bash
-uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8
-uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
-    --suite rate --rates 1,2,4,8,16 --kvcache-tokens 327680 --out results/8b
-```
-
-`bench_serving.py` sends open-loop Poisson arrivals through the OpenAI SDK and
-works against vLLM unchanged; `sweep.py` runs it across arms with a fresh server
-per run. Only `--dataset prefix` shares prompt prefixes, for `--suite prefix`.
-
-See [benchmark-runbook.md](benchmark-runbook.md) for a fresh GPU box and
-[the latest report](benchmark-2026-09-13.md) for numbers.
-
-## How it fits together
+## How it works
 
 ```text
      HTTP (FastAPI / uvicorn)      <- tokenize, stop strings, SSE
@@ -217,12 +155,137 @@ See [benchmark-runbook.md](benchmark-runbook.md) for a fresh GPU box and
           ModelRunner              <- one mixed batch
 ```
 
-The engine is synchronous. Its loop runs on the event loop and hands each
-`step()` to a single worker thread, because a step blocks for a whole forward
-pass and would starve the HTTP handlers. Requests and aborts reach the engine on
-the event loop, between steps: an add waits for the step in flight, and an abort
-that arrives during one is applied as it returns.
+The engine is synchronous. Its loop runs on the asyncio event loop and hands
+each `step()` to a single worker thread, since a step blocks for a whole forward
+pass and would otherwise starve the HTTP handlers. New requests and aborts reach
+the engine between steps. An abort that arrives during a step is applied when
+the step returns.
 
-There is no in-process restart. An unhandled engine exception fails every
-outstanding request, flips `/health` to 503, and exits for a supervisor to
-restart.
+If the engine raises, every outstanding request fails, `/health` turns 503, and
+the process exits for a supervisor to restart.
+
+### Scheduling
+
+Each step first schedules the running sequences: one token for each decode, and
+the next chunk for each unfinished prompt. Waiting requests are then admitted
+into whatever budget is left. When the KV cache runs out, a sequence is
+preempted: its blocks are freed, and it is recomputed later from the head of the
+queue. A sequence that cannot fit even on its own is dropped with a 503.
+
+### Pipelined steps
+
+`step()` launches one step and then finishes the one before it, so host work
+overlaps the GPU. `--async-scheduling` decides how much overlaps:
+
+```text
+off                              on
+---                              --
+await tokens of step k-1         schedule step k
+reconcile step k-1               launch step k
+schedule step k                  await tokens of step k-1
+launch step k                    reconcile step k-1
+detokenize step k-1              detokenize step k-1
+```
+
+With it off, only detokenization overlaps. With it on, scheduling and batch
+preparation overlap too, but a stop is seen one step late. A request that ends
+on EOS or a stop string therefore has one extra token computed and discarded.
+Requests that end at `max_tokens` do not pay this.
+
+Two details keep it safe:
+
+- `SampledTokens` copies sampled tokens to pinned memory on a separate CUDA
+  stream, so waiting for step k-1 does not block on step k's kernels.
+- All other device work stays on one stream, so a step always runs after the
+  previous step's KV writes. That makes it safe to free or share a KV block
+  while a step is in flight.
+
+Tensor parallelism turns it off, because the other ranks never see the sampled
+tokens. On an H100 it cuts offline GPU idle time from 22.4% to 3.2%.
+
+### CUDA graphs
+
+| Step | Under `full_and_piecewise` (default) |
+| --- | --- |
+| Pure decode, up to 512 rows | One full graph |
+| Prefill or mixed, 64–512 tokens | Piecewise graphs |
+| Anything else | Eager |
+
+`full` runs all prefill and mixed steps eager. `piecewise` also sends decode
+through piecewise graphs. `none` captures nothing.
+
+Piecewise means each decoder layer is captured as two pieces, before and after
+attention, and attention runs eager in between, because its inputs change shape
+every step. Pieces are captured with `torch.cuda.CUDAGraph`, not
+`torch.compile`, so they save launch overhead but fuse no kernels.
+
+A step is padded up to its graph's size, and the padding costs real compute.
+Past 512 tokens that cost outweighs the launch overhead saved, so large steps run
+eager, where vLLM compiles them. At plateau load on Qwen3-8B those eager steps
+take about half the step time.
+
+Things to know:
+
+- Greedy output can differ slightly from eager mode, because padding changes
+  which cuBLAS kernel runs.
+- Code inside a piece must not sync with the host (`.item()`, `.tolist()`,
+  `.cpu()`). Re-check this after changing `layers/` or `models/`.
+- Graph memory comes on top of the KV cache, so every mode gets the same cache
+  size, but a tight GPU can run out of memory during capture.
+
+### Prefix caching
+
+A prompt is split into blocks, and each block is hashed together with the chain
+of blocks before it. A request whose leading blocks are already cached reuses
+them and prefills only the rest.
+
+- Hashes are computed as tokens arrive, never inside a step.
+- The last block is always recomputed, since attention needs at least one query
+  token.
+- Freed blocks are evicted deepest first, so shared prefixes outlive their
+  suffixes.
+- Caching changes what a request costs, never when it is scheduled.
+
+The hash is `sha256` by default. `xxhash` is faster, but use it only when every
+client is trusted: a collision could serve one tenant another's tokens. Either
+way, the tokens behind a hit are compared before reuse.
+`--no-enable-prefix-caching` turns caching off for A/B runs.
+
+### Metrics
+
+`/metrics.json` reports:
+
+- steps: count, time, batch tokens, the prefill/decode split, and how each step
+  ran;
+- preemptions, prefix-cache hit rate, and peak KV usage;
+- counts and means of TTFT, TPOT, queue delay and end-to-end latency.
+
+Names mirror vLLM's under the `lean_vllm:` prefix, except that the prefix-cache
+counters count blocks where vLLM's count tokens. Compute latency percentiles on
+the client, as the histogram buckets are too coarse.
+
+Each step is counted as `graph`, `piecewise`, or eager with a reason:
+
+- `prefill`: a prefill or mixed step outside the piecewise range;
+- `decode`: a decode step no graph covers;
+- `enforced`: graphs are off.
+
+For GPU utilization, trust `model_busy_fraction`, the share of wall-clock time
+spent inside a forward pass. The nvidia-smi figure beside it counts any running
+kernel as busy.
+
+## Benchmarking
+
+```bash
+uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8
+uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
+    --suite rate --rates 1,2,4,8,16 --kvcache-tokens 327680 --out results/8b
+```
+
+`bench_serving.py` sends Poisson arrivals through the OpenAI SDK, so it works
+against vLLM unchanged. `sweep.py` runs it across server configurations,
+starting a fresh server for each run. Only `--dataset prefix` shares prompt
+prefixes, for `--suite prefix`.
+
+[benchmark-runbook.md](benchmark-runbook.md) walks through a run on a fresh GPU
+box.
