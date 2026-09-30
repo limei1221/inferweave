@@ -67,7 +67,7 @@ class BaseRequest(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> "BaseRequest":
         if self.n != 1:
-            raise ValueError("n > 1 is not supported")
+            raise ValueError("n must be 1")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be at least 1")
         if self.temperature < 0:

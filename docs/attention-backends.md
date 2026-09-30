@@ -159,9 +159,9 @@ one query, and the bottom-right mask already fits it.
 
 `decode` remains as the pure-decode path, because that is the only shape a CUDA
 graph can capture. The runner uses it only when **no** row is a prompt chunk.
-Checking that every query length is 1 would be wrong: a prompt whose last chunk
-is one token long must still take the prefill path, so that it samples only
-when it should.
+Checking that every query length is 1 would be wrong: a prompt chunk can be
+one token long when the budget runs down to one, and unless it ends the prompt
+it must not sample.
 
 ### FlashAttention-3's two prefill calls
 

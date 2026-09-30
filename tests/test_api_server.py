@@ -254,7 +254,7 @@ class TestRefusals:
     def test_n_greater_than_one_is_refused(self, client):
         response = complete(client, n=2)
         assert response.status_code == 400
-        assert "n > 1" in response.json()["error"]["message"]
+        assert "n must be 1" in response.json()["error"]["message"]
 
     def test_an_unknown_field_is_refused_rather_than_ignored(self, client):
         assert complete(client, nucleus_sampling=True).status_code == 400

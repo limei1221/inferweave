@@ -23,8 +23,8 @@ it matches vLLM below saturation and trails it by 5–7% at the plateau
 | `GET /metrics` | Prometheus text |
 | `GET /metrics.json` | The same numbers as a JSON summary |
 
-Both completion endpoints stream over SSE with `"stream": true`. No API key is
-checked.
+Both completion endpoints stream over Server-Sent Events (SSE) with
+`"stream": true`. No API key is checked.
 
 ### Request fields
 
@@ -35,7 +35,7 @@ checked.
 | `temperature` | Default 1.0; 0 is greedy |
 | `stream`, `stream_options.include_usage` | Supported |
 | `stop` | A string or a list of strings |
-| `n` | 1 only |
+| `n` (completions per prompt) | 1 only |
 | `ignore_eos` (extra) | Generates the full `max_tokens` |
 | `priority` (extra) | Lower runs first, under `--scheduling-policy priority` |
 | `top_p`, `top_k`, `min_p`, `seed`, penalties, `logprobs`, `logit_bias`, `tools`, `echo`, `suffix`, `best_of` | **Refused with a 400** |

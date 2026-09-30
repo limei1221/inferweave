@@ -133,7 +133,7 @@ layer for its `kv_cache_shape` rather than reading head counts off the config.
 Values are 128 wide and keys 192, so values are zero-padded to 192 for the
 kernel and the output is cut back to 128.
 
-**Decode** skips the expansion. Since `q · (W_k c) = (W_kᵀ q) · c`, each head's
+**Decode** skips the expansion. Since `q · (W_UK c) = (W_UKᵀ q) · c`, each head's
 query is projected into latent space and attends the cached latents directly
 as one shared key head. The value projection is applied after attention. vLLM
 does the same with `W_UK_T` and `W_UV`. `flashmla` and `torch` implement this

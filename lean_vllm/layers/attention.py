@@ -289,7 +289,7 @@ class MLAAttention(Attention):
     def _decode_latents(self, q: torch.Tensor, context: Context) -> torch.Tensor:
         """Attention over the cached latents as they are, so nothing expands.
 
-        q . W_k c = W_k^T q . c moves the query into latent space; W_v applies after, as attention is linear in values.
+        q . W_UK c = W_UK^T q . c moves the query into latent space; W_UV applies after, as attention is linear in values.
         """
         W_UK_T, W_UV = self.latent_projections()
         N, P, L = W_UK_T.shape
