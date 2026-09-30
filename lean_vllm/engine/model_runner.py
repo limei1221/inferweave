@@ -7,6 +7,7 @@ from torch.profiler import record_function
 
 from lean_vllm.attention import AttentionBackend, get_attention_backend
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
+from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.models import get_model_class
@@ -54,8 +55,8 @@ class ModelRunner:
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.graphs: dict = {}
-        self.piecewise_graphs: dict = {}
         self.graph_pool = None                 # shared by both capture kinds
+        self.compile_backend: PiecewiseBackend | None = None    # holds the pieces and their graphs
         self.world_size = config.tensor_parallel_size
         self.rank = rank
 
@@ -75,6 +76,8 @@ class ModelRunner:
                 # Warmup expands a step's worth of new latents, so a chunk this size fits what it measured.
                 module.max_context_chunk = config.max_num_batched_tokens
         load_model(self.model, config.model)
+        if self.cudagraph_mode != "none":
+            self.compile_model()
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -92,7 +95,9 @@ class ModelRunner:
         if self.world_size > 1:
             dist.barrier()    # sync ranks
         if self.cudagraph_mode != "none":
-            del self.graphs, self.piecewise_graphs, self.graph_pool
+            for piece in self.compile_backend.pieces:
+                piece.graphs.clear()
+            del self.graphs, self.graph_pool
         dev.synchronize(self.device)    # drain the device
         dist.destroy_process_group()    # drop the comms
 
@@ -110,6 +115,11 @@ class ModelRunner:
             dist.broadcast_object_list([method_name, args], src=0, group=self.call_group)
         method = getattr(self, method_name, None)
         return method(*args)
+
+    def compile_model(self):
+        """As vLLM: traced whole, split at attention, pieces compiled by Inductor. Warmup's step runs the compile."""
+        self.graph_pool = torch.cuda.graph_pool_handle()
+        self.compile_backend = compile_piecewise(self.model, self.graph_pool)
 
     def warmup_model(self):
         dev.empty_cache(self.device)
@@ -259,7 +269,7 @@ class ModelRunner:
         return mode
 
     def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
-        """How this step runs: "graph", "piecewise", or why it must run eager. num_tokens is the batch size for decode."""
+        """How this step runs: "graph", "piecewise", or why no graph covers it. num_tokens is the batch size for decode."""
         if self.cudagraph_mode == "none":
             return "enforced"
         if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
@@ -267,12 +277,14 @@ class ModelRunner:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
             return "piecewise"
-        # No graph covers the step: "prefill" for a prefill or mixed step, "decode" for a pure decode one.
+        # No graph covers the step, which runs compiled: "prefill" for a prefill or mixed step, "decode" for pure decode.
         return "prefill" if is_prefill else "decode"
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         self.step_kind = self._step_kind(is_prefill, input_ids.size(0))
+        if self.compile_backend is not None and not self.compile_backend.pieces:    # this call traces
+            mark_dynamic_tokens(input_ids, positions)
         if self.step_kind == "graph":
             return self.model.compute_logits(self._replay_full(input_ids, positions))
         if self.step_kind == "piecewise":
@@ -301,22 +313,15 @@ class ModelRunner:
         return None if bucket is None or num_tokens < self.piecewise_bs[0] else bucket
 
     def _replay_piecewise(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """A graph per piece, with attention run eager on the real rows between them."""
+        """The compiled model padded to the step's bucket: pieces replay their graphs, attention runs eager on real rows."""
         num_tokens = input_ids.size(0)
         bucket = self._piecewise_bucket(num_tokens)
-        graphs, buffers = self.piecewise_graphs[bucket], self.piecewise_vars
+        buffers = self.piecewise_vars
         buffers["input_ids"][:num_tokens] = input_ids
         buffers["positions"][:num_tokens] = positions
-
-        graphs["head"].replay()
-        for layer, pre, post in zip(self.model.model.layers, graphs["pre"], graphs["post"]):
-            pre.replay()
-            # Real rows only: attention reads this step's sequence layout, which no graph can hold.
-            attn_out = layer.self_attn.attn(*(buffer[:num_tokens] for buffer in buffers["attn_in"]))
-            buffers["attn_out"][:num_tokens] = attn_out
-            post.replay()
-        graphs["tail"].replay()
-        return buffers["output"][:num_tokens]
+        context = get_context()
+        context.piecewise_size, context.num_actual_tokens = bucket, num_tokens
+        return self.model(buffers["input_ids"][:bucket], buffers["positions"][:bucket])[:num_tokens]
 
     def run(self, seqs: list[Sequence]) -> SampledTokens | None:
         """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
@@ -346,64 +351,21 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_piecewise(self):
-        """Capture the model either side of attention, one graph per piece per bucket."""
-        hf_config = self.config.hf_config
-        layers = self.model.model.layers
+        """Run the compiled model once per bucket, largest first; each piece captures its graph as the run reaches it."""
         self.piecewise_bs = self._piecewise_buckets()
         largest = self.piecewise_bs[-1]
-        buffers = dict(
-            input_ids=torch.zeros(largest, dtype=torch.int64),
-            positions=torch.zeros(largest, dtype=torch.int64),
-            hidden=torch.zeros(largest, hf_config.hidden_size),
-            residual=torch.zeros(largest, hf_config.hidden_size),
-            output=torch.zeros(largest, hf_config.hidden_size),
-            attn_out=torch.zeros(layers[0].self_attn.attn.output_shape(largest)),
-        )
-        # What attention takes is the model's own: q, k and v for Qwen3, a query and a latent for MLA.
-        *attn_inputs, _ = layers[0].pre_attention(buffers["positions"], buffers["hidden"], None)
-        buffers["attn_in"] = [torch.zeros_like(tensor) for tensor in attn_inputs]
-        self.piecewise_vars = buffers
-        self.piecewise_graphs = {}
-
-        def capture(run):
-            """Warm up, then capture. The warmup pass is what allocates."""
-            run()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, self.graph_pool):
-                run()
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            torch.cuda.synchronize()
-            return graph
-
+        input_ids = torch.zeros(largest, dtype=torch.int64)
+        positions = torch.zeros(largest, dtype=torch.int64)
+        self.piecewise_vars = dict(input_ids=input_ids, positions=positions)
         for size in reversed(self.piecewise_bs):
-            def head(size=size):
-                buffers["hidden"][:size].copy_(self.model.model.embed_tokens(buffers["input_ids"][:size]))
-
-            def tail(size=size):
-                normed, _ = self.model.model.norm(buffers["hidden"][:size], buffers["residual"][:size])
-                buffers["output"][:size].copy_(normed)
-
-            def pre(layer, first, size=size):
-                # The first layer takes no residual in; its graph bakes that in.
-                carried = None if first else buffers["residual"][:size]
-                *attn_inputs, residual = layer.pre_attention(
-                    buffers["positions"][:size], buffers["hidden"][:size], carried)
-                for buffer, tensor in zip(buffers["attn_in"], attn_inputs):
-                    buffer[:size].copy_(tensor)
-                buffers["residual"][:size].copy_(residual)
-
-            def post(layer, size=size):
-                hidden, residual = layer.post_attention(buffers["attn_out"][:size], buffers["residual"][:size])
-                buffers["hidden"][:size].copy_(hidden)
-                buffers["residual"][:size].copy_(residual)
-
-            self.piecewise_graphs[size] = {
-                "head": capture(head),
-                "pre": [capture(lambda layer=layer, first=i == 0: pre(layer, first)) for i, layer in enumerate(layers)],
-                "post": [capture(lambda layer=layer: post(layer)) for layer in layers],
-                "tail": capture(tail),
-            }
+            # Attention runs for real between the pieces, on one fresh prompt that writes no cache slot.
+            seq = Sequence([0] * size)
+            seq.num_scheduled_tokens = size
+            _, _, _, context = self.prepare_batch([seq])
+            context["slot_mapping"] = torch.full((size,), -1, dtype=torch.int32)
+            with set_context(**context, piecewise_size=size):
+                self.model(input_ids[:size], positions[:size])
+            torch.cuda.synchronize()
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -432,8 +394,6 @@ class ModelRunner:
                 get_context().mla_decode_metadata = None
                 with torch.cuda.graph(graph, self.graph_pool):
                     outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
 

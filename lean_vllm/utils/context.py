@@ -21,6 +21,8 @@ class Context:
     mla_decode_metadata: object | None = None    # FlashMLA's schedule holder, made by the step's first layer
     prefill_rows: list[bool] | None = None    # explicit request phases; a one-token prefill is not decode
     mla_partitions: list | None = None    # (token indices, Context), shared across layers of a mixed step
+    piecewise_size: int | None = None    # the bucket whose piecewise graphs this pass captures or replays
+    num_actual_tokens: int | None = None    # the step's own rows, when a piecewise bucket pads it; None is all
 
 _CONTEXT = Context()
 

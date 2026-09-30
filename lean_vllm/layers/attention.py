@@ -30,24 +30,33 @@ def _layer(layer_name: str) -> "Attention":
     return layer
 
 
-@torch.library.custom_op("lean_vllm::attention", mutates_args=())
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_name: str) -> torch.Tensor:
-    return _layer(layer_name).attend(q, k, v)
+def _actual_rows(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """The step's own rows: a piecewise bucket pads the step, and padding must not reach the cache."""
+    n = get_context().num_actual_tokens
+    return tensors if n is None else tuple(tensor[:n] for tensor in tensors)
+
+
+# The ops write into out, which the piece before them allocates, so its address is fixed in a captured graph.
+@torch.library.custom_op("lean_vllm::attention", mutates_args=("out",))
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
+    q, k, v = _actual_rows(q, k, v)
+    out[:q.size(0)] = _layer(layer_name).attend(q, k, v)
 
 
 @attention.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_name: str) -> torch.Tensor:
-    return torch.empty_like(q)
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
+    return None
 
 
-@torch.library.custom_op("lean_vllm::mla_attention", mutates_args=())
-def mla_attention(q: torch.Tensor, latent: torch.Tensor, layer_name: str) -> torch.Tensor:
-    return _layer(layer_name).attend(q, latent)
+@torch.library.custom_op("lean_vllm::mla_attention", mutates_args=("out",))
+def mla_attention(q: torch.Tensor, latent: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
+    q, latent = _actual_rows(q, latent)
+    out[:q.size(0)] = _layer(layer_name).attend(q, latent)
 
 
 @mla_attention.register_fake
-def _(q: torch.Tensor, latent: torch.Tensor, layer_name: str) -> torch.Tensor:
-    return q.new_empty(q.size(0), q.size(1), _layer(layer_name).v_head_dim)
+def _(q: torch.Tensor, latent: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
+    return None
 
 
 class Attention(nn.Module):
@@ -79,12 +88,14 @@ class Attention(nn.Module):
         self.k_cache, self.v_cache = cache[0], cache[1]
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
-        """What attend returns for this many tokens; piecewise capture sizes its buffer with it."""
+        """What attend returns for this many tokens; forward sizes the op's output with it."""
         return (num_tokens, self.num_heads, self.head_dim)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # Through an opaque op, so a compiled model would split here; the runner's piecewise capture is manual.
-        return torch.ops.lean_vllm.attention(q, k, v, self.layer_name)
+        # Through an opaque op, so the compiled model splits here and attention runs eager between the pieces.
+        out = q.new_empty(self.output_shape(q.size(0)))
+        torch.ops.lean_vllm.attention(q, k, v, out, self.layer_name)
+        return out
 
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """The op's body. Its KV cache write is undeclared, as the cache is module state."""
@@ -226,7 +237,9 @@ class MLAAttention(Attention):
         return (num_tokens, self.num_heads, self.v_head_dim)
 
     def forward(self, q: torch.Tensor, latent: torch.Tensor):
-        return torch.ops.lean_vllm.mla_attention(q, latent, self.layer_name)
+        out = q.new_empty(self.output_shape(q.size(0)))
+        torch.ops.lean_vllm.mla_attention(q, latent, out, self.layer_name)
+        return out
 
     def attend(self, q: torch.Tensor, latent: torch.Tensor):
         context = get_context()

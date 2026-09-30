@@ -105,7 +105,8 @@ The [20 September report](benchmark-2026-09-20.md) compares V2-Lite-Chat against
 vLLM 0.26.0 on one H100. With no queueing, lean-vLLM's median time per output
 token is 7.0 ms against vLLM's 4.4 ms. Under load, lean-vLLM plateaus at about
 20 requests/s while vLLM reaches 31.8. Decode now runs from CUDA graphs, and
-most of the remaining gap is eager prefill.
+most of the remaining gap was eager prefill, which now runs compiled; the report
+predates that.
 
 ## How it works
 
@@ -174,7 +175,8 @@ rotates adjacent pairs (GPT-J style), so its rope uses `is_neox_style=False`.
 - **Piecewise graphs** capture everything around attention, and attention runs
   eager between the pieces. The MoE sits inside a piece, so the Triton path
   sizes its blocks from the batch shape rather than the routing, and never
-  reads a count back to the host.
+  reads a count back to the host. It is an opaque op to `torch.compile`, as in
+  vLLM, so the trace does not fix its launch to one batch size.
 
 ## Next steps
 

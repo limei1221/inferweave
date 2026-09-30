@@ -9,7 +9,7 @@ from time import perf_counter
 
 INF = float("inf")
 
-# Step kinds that replayed a graph; the rest ran eager, as "prefill", "decode" or "enforced".
+# Step kinds that replayed a graph; the rest ran without one, as "prefill", "decode" or "enforced".
 GRAPH_KINDS = ("graph", "piecewise")
 
 LATENCY_BUCKETS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, INF)
@@ -155,7 +155,7 @@ class Metrics:
 
         self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
         self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
-        self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes that ran eager.", label="reason")
+        self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes no CUDA graph covered.", label="reason")
         # Share of the clock, not the count: eager steps take longer each.
         self.step_seconds = Counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
         self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")

@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 
 from lean_vllm.layers.fused_moe import align_blocks, fused_experts, use_triton
-from lean_vllm.layers.moe import FusedMoE
+from lean_vllm.layers.moe import FusedMoE, silu_and_mul, torch_experts
 
 HIDDEN, INTERMEDIATE = 32, 16
 NUM_EXPERTS, TOP_K, TOKENS = 8, 3, 20
@@ -50,7 +50,7 @@ def blocked_moe(moe: FusedMoE, x, topk_weights, topk_ids, block_m: int) -> torch
     out = torch.empty(num_pairs, x.size(1))
     for gate_up in (True, False):
         # h is one row per pair already, so the second gemm reads it without dividing.
-        a, b, c, per = (x, moe.gate_up_proj, h, moe.top_k) if gate_up else (moe.act_fn(h), moe.down_proj, out, 1)
+        a, b, c, per = (x, moe.gate_up_proj, h, moe.top_k) if gate_up else (silu_and_mul(h), moe.down_proj, out, 1)
         for block, expert in enumerate(block_experts.tolist()):
             if block * block_m >= num_rows: break
             pairs = sorted_pairs[block * block_m:(block + 1) * block_m]
@@ -101,7 +101,7 @@ def test_the_blocked_path_matches_grouped_mm(moe, batch, block_m):
     x, topk_weights, topk_ids = batch
     with torch.inference_mode():
         got = blocked_moe(moe, x, topk_weights, topk_ids, block_m)
-        want = moe.torch_experts(x, topk_weights, topk_ids)
+        want = torch_experts(x, moe.gate_up_proj, moe.down_proj, topk_weights, topk_ids)
     torch.testing.assert_close(got, want)
 
 
@@ -119,8 +119,8 @@ def test_the_triton_kernel_matches_grouped_mm_on_cuda(moe, batch, dtype):
     x, topk_weights, topk_ids = batch
     x, topk_weights, topk_ids = x.to("cuda", dtype), topk_weights.to("cuda", dtype), topk_ids.cuda()
     with torch.inference_mode():
-        got = fused_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids, layer.act_fn)
-        want = layer.torch_experts(x, topk_weights, topk_ids)
+        got = fused_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids, silu_and_mul)
+        want = torch_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids)
     # bf16: reduction order differs between the kernel and grouped_mm, so allow bf16 rounding.
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
 
@@ -128,7 +128,8 @@ def test_the_triton_kernel_matches_grouped_mm_on_cuda(moe, batch, dtype):
 def test_forward_takes_the_torch_path_off_cuda(moe, batch):
     x, topk_weights, topk_ids = batch
     with torch.inference_mode():
-        assert torch.equal(moe(x, topk_weights, topk_ids), moe.torch_experts(x, topk_weights, topk_ids))
+        want = torch_experts(x, moe.gate_up_proj, moe.down_proj, topk_weights, topk_ids)
+        assert torch.equal(moe(x, topk_weights, topk_ids), want)
 
 
 def test_an_unknown_backend_is_refused(monkeypatch):

@@ -65,13 +65,14 @@ client that disconnects frees its KV blocks straight away.
 | Prefix caching | On | Reuses cached prompt blocks |
 | Async scheduling | On | Schedules the next step while the GPU runs the current one; turns itself off under tensor parallelism |
 | CUDA graphs | `full_and_piecewise` | Full graphs for decode, piecewise for small prefill and mixed steps |
+| `torch.compile` | On, unless graphs are off | Inductor compiles the model between attention ops, as vLLM does |
 | Priority scheduling | Off (`fcfs`) | `--scheduling-policy priority` |
 | Admission control, queue timeout | Off | `--max-waiting-requests`, `--request-timeout` |
 | Preemption | Recompute | The sequence goes back to the head of the queue; there is no swapping to CPU |
 | Tensor parallelism | 1 | Up to 8 GPUs |
 
 Not supported: serving several models from one server, restarting the engine in
-place, `torch.compile`, and the sampling features refused above.
+place, and the sampling features refused above.
 
 ## Running it
 
@@ -136,8 +137,8 @@ vLLM 0.26.0 on Qwen3-8B on one H100:
 - At the plateau lean-vLLM reaches about 24.1–24.5 requests/s against vLLM's
   25.7–26.1.
 - Async scheduling adds 7–9% goodput under load.
-- The remaining gap is mostly large prefill steps, which run eager here and
-  compiled in vLLM.
+- The remaining gap was mostly large prefill steps, which ran eager here and
+  compiled in vLLM. They now run compiled here too; the report predates that.
 
 DeepSeek-V2-Lite has its own [20 September report](benchmark-2026-09-20.md).
 
@@ -209,27 +210,33 @@ tokens. On an H100 it cuts offline GPU idle time from 22.4% to 3.2%.
 | --- | --- |
 | Pure decode, up to 512 rows | One full graph |
 | Prefill or mixed, 64–512 tokens | Piecewise graphs |
-| Anything else | Eager |
+| Anything else | Compiled, no graph |
 
-`full` runs all prefill and mixed steps eager. `piecewise` also sends decode
-through piecewise graphs. `none` captures nothing.
+`full` runs all prefill and mixed steps compiled, without a graph. `piecewise`
+also sends decode steps of 64–512 rows through piecewise graphs, so smaller
+decode steps run without one. `none` compiles and captures nothing, so every
+step runs eager.
 
-Piecewise means each decoder layer is captured as two pieces, before and after
-attention, and attention runs eager in between, because its inputs change shape
-every step. Pieces are captured with `torch.cuda.CUDAGraph`, not
-`torch.compile`, so they save launch overhead but fuse no kernels.
+As in vLLM, the model is traced once with `torch.compile` and split at each
+attention op. Inductor compiles each piece between two attention ops, fusing
+its elementwise work. Attention runs eager between the pieces, because its
+inputs change shape every step. Each piece is then captured as a CUDA graph per
+bucket.
 
 A step is padded up to its graph's size, and the padding costs real compute.
-Past 512 tokens that cost outweighs the launch overhead saved, so large steps run
-eager, where vLLM compiles them. At plateau load on Qwen3-8B those eager steps
-take about half the step time.
+Past 512 tokens that cost outweighs the launch overhead saved, so large steps
+run the compiled pieces without a graph, as vLLM's do.
 
 Things to know:
 
+- The first start compiles the model. Inductor caches the result on disk, so
+  later starts are faster.
 - Greedy output can differ slightly from eager mode, because padding changes
-  which cuBLAS kernel runs.
-- Code inside a piece must not sync with the host (`.item()`, `.tolist()`,
-  `.cpu()`). Re-check this after changing `layers/` or `models/`.
+  which cuBLAS kernel runs and Inductor fuses differently.
+- The model must trace as one graph, with no Python branch on the token count;
+  a trace that fixes the count fails at startup. Code inside a piece must not
+  sync with the host (`.item()`, `.tolist()`, `.cpu()`). Re-check both after
+  changing `layers/` or `models/`.
 - Graph memory comes on top of the KV cache, so every mode gets the same cache
   size, but a tight GPU can run out of memory during capture.
 
@@ -264,11 +271,12 @@ Names mirror vLLM's under the `lean_vllm:` prefix, except that the prefix-cache
 counters count blocks where vLLM's count tokens. Compute latency percentiles on
 the client, as the histogram buckets are too coarse.
 
-Each step is counted as `graph`, `piecewise`, or eager with a reason:
+Each step is counted as `graph`, `piecewise`, or, when no graph covers it,
+with a reason:
 
-- `prefill`: a prefill or mixed step outside the piecewise range;
-- `decode`: a decode step no graph covers;
-- `enforced`: graphs are off.
+- `prefill`: a prefill or mixed step outside the piecewise range, run compiled;
+- `decode`: a decode step no graph covers, run compiled;
+- `enforced`: graphs and compilation are off, so the step ran eager.
 
 For GPU utilization, trust `model_busy_fraction`, the share of wall-clock time
 spent inside a forward pass. The nvidia-smi figure beside it counts any running

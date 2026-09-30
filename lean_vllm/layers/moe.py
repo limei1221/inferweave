@@ -9,6 +9,54 @@ from lean_vllm.layers.activation import SiluAndMul
 from lean_vllm.layers.linear import divide
 
 
+silu_and_mul = SiluAndMul()
+
+
+def torch_experts(
+    x: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    """The portable path: one row per token-expert pair, two grouped matrix multiplies, scatter back."""
+    num_experts, top_k = gate_up_proj.size(0), topk_ids.size(1)
+    expert_ids, order = rearrange(topk_ids, "n k -> (n k)").sort()
+    token_ids = order // top_k
+    # Where each expert's run of sorted rows ends; searchsorted, unlike bincount, does not sync.
+    experts = torch.arange(num_experts, device=x.device, dtype=expert_ids.dtype)
+    offsets = torch.searchsorted(expert_ids, experts, right=True).to(torch.int32)
+    h = F.grouped_mm(x[token_ids], rearrange(gate_up_proj, "e o i -> e i o"), offs=offsets)
+    h = F.grouped_mm(silu_and_mul(h), rearrange(down_proj, "e o i -> e i o"), offs=offsets)
+    h = h * rearrange(topk_weights, "n k -> (n k) 1")[order].to(h.dtype)
+    return torch.zeros_like(x).index_add_(0, token_ids, h)
+
+
+# Opaque to torch.compile, as vLLM's: the Triton path picks its launch from the batch size, which a trace would fix.
+@torch.library.custom_op("lean_vllm::moe_experts", mutates_args=())
+def moe_experts(
+    x: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    if fused_moe.use_triton(x):
+        return fused_moe.fused_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, silu_and_mul)
+    return torch_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids)
+
+
+@moe_experts.register_fake
+def _(
+    x: torch.Tensor,
+    gate_up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 class FusedMoE(nn.Module):
     """Routed experts, stacked per projection and run as two grouped matrix multiplies.
 
@@ -32,7 +80,6 @@ class FusedMoE(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, self.intermediate_size))
         self.gate_up_proj.weight_loader = self.weight_loader
         self.down_proj.weight_loader = self.weight_loader
-        self.act_fn = SiluAndMul()
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: tuple[int, str]):
         expert_id, proj = shard_id
@@ -43,25 +90,8 @@ class FusedMoE(nn.Module):
         shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
         param.data[expert_id].narrow(0, offset, self.intermediate_size).copy_(shard)
 
-    def torch_experts(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
-        """The portable path: one row per token-expert pair, two grouped matrix multiplies, scatter back."""
-        expert_ids, order = rearrange(topk_ids, "n k -> (n k)").sort()
-        token_ids = order // self.top_k
-        # Where each expert's run of sorted rows ends; searchsorted, unlike bincount, does not sync.
-        experts = torch.arange(self.num_experts, device=x.device, dtype=expert_ids.dtype)
-        offsets = torch.searchsorted(expert_ids, experts, right=True).to(torch.int32)
-        h = F.grouped_mm(x[token_ids], rearrange(self.gate_up_proj, "e o i -> e i o"), offs=offsets)
-        h = F.grouped_mm(self.act_fn(h), rearrange(self.down_proj, "e o i -> e i o"), offs=offsets)
-        h = h * rearrange(topk_weights, "n k -> (n k) 1")[order].to(h.dtype)
-        return torch.zeros_like(x).index_add_(0, token_ids, h)
-
     def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
-        if fused_moe.use_triton(x):
-            out = fused_moe.fused_experts(
-                x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.act_fn
-            )
-        else:
-            out = self.torch_experts(x, topk_weights, topk_ids)
+        out = torch.ops.lean_vllm.moe_experts(x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids)
         if self.tp_size > 1:
             dist.all_reduce(out)
         return out
