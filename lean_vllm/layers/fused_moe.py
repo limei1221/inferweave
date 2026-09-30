@@ -143,7 +143,7 @@ def fused_experts(
             TOP_K=pairs_per_row, MUL_ROUTED_WEIGHT=mul_routed_weight, **launch,
         )
 
-    # Every pair is written exactly once, so the padding never reads an uninitialized row.
+    # The first GEMM writes every pair's row before the second reads it, so empty is safe.
     h = torch.empty(num_pairs, gate_up_size, device=x.device, dtype=x.dtype)    # [T*K, 2I]
     gemm(x, gate_up_proj, h, top_k, mul_routed_weight=False)    # x has one row per token
     h = act_fn(h)    # [T*K, 2I] -> [T*K, I]

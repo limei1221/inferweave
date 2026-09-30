@@ -42,7 +42,7 @@ class FlashMLABackend(FlashAttention3Backend):
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
         if context.mla_decode_metadata is None:
-            # Scheduled by the first layer's call; the rest reuse it, as they share the step's lengths.
+            # A holder the kernel fills with the schedule on the first layer's call; the rest reuse it.
             context.mla_decode_metadata, _ = get_mla_metadata()
         o, _ = flash_mla_with_kvcache(
             rearrange(q, "b h d -> b 1 h d"), rearrange(latent_cache, "n p d -> n p 1 d"), context.block_tables, context.context_lens, v_dim,

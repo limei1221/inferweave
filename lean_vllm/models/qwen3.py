@@ -8,7 +8,7 @@ from lean_vllm.layers.activation import SiluAndMul
 from lean_vllm.layers.attention import Attention
 from lean_vllm.layers.layernorm import RMSNorm
 from lean_vllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from lean_vllm.layers.rotary_embedding import get_rope
+from lean_vllm.layers.rotary_embedding import get_rope, rope_config
 from lean_vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
@@ -52,13 +52,12 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.attn = Attention(
             self.num_heads,
@@ -66,6 +65,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
+        # Qwen3 has q/k norms and no qkv bias, Qwen2 the reverse, so the one flag picks both.
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -127,6 +127,7 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        rope_theta, rope_scaling = rope_config(config)
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -135,8 +136,8 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

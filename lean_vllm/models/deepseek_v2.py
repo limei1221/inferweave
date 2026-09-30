@@ -9,15 +9,9 @@ from lean_vllm.layers.attention import MLAAttention
 from lean_vllm.layers.layernorm import RMSNorm
 from lean_vllm.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear, divide
 from lean_vllm.layers.moe import FusedMoE
-from lean_vllm.layers.rotary_embedding import get_rope, yarn_get_mscale
+from lean_vllm.layers.rotary_embedding import get_rope, rope_config, yarn_get_mscale
 from lean_vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from lean_vllm.models.qwen3 import Qwen3MLP as DeepseekV2MLP    # the same gated silu MLP
-
-
-def rope_config(config: PretrainedConfig) -> tuple[float, dict]:
-    """rope_parameters from transformers 5, or rope_theta and rope_scaling before it."""
-    params = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
-    return params.get("rope_theta", getattr(config, "rope_theta", 10000)), params
 
 
 class DeepseekV2Attention(nn.Module):

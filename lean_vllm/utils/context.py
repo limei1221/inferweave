@@ -18,7 +18,7 @@ class Context:
     cu_seqlens_q_host: list[int] | None = None    # cu_seqlens_q and _k kept on the host, so MLA plans without a sync
     cu_seqlens_k_host: list[int] | None = None
     context_chunks: list | None = None    # filled on first use by layers.attention.context_chunks
-    mla_decode_metadata: object | None = None    # FlashMLA's schedule, filled by the step's first layer
+    mla_decode_metadata: object | None = None    # FlashMLA's schedule holder, made by the step's first layer
     prefill_rows: list[bool] | None = None    # explicit request phases; a one-token prefill is not decode
     mla_partitions: list | None = None    # (token indices, Context), shared across layers of a mixed step
 

@@ -1,6 +1,7 @@
 """Server-side metrics, as Prometheus text and as a JSON summary.
 
-Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both.
+Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both. The prefix-cache counters
+count blocks where vLLM's count tokens, so only their ratio compares.
 """
 
 import threading
@@ -8,7 +9,7 @@ from time import perf_counter
 
 INF = float("inf")
 
-# Step kinds that replayed a graph; the rest name why the step ran eager.
+# Step kinds that replayed a graph; the rest ran eager, as "prefill", "decode" or "enforced".
 GRAPH_KINDS = ("graph", "piecewise")
 
 LATENCY_BUCKETS = (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 60.0, INF)
@@ -134,13 +135,13 @@ class Metrics:
 
         self.running = Gauge("lean_vllm:num_requests_running", "Requests in the running set.")
         self.waiting = Gauge("lean_vllm:num_requests_waiting", "Requests in the waiting queue.")
-        self.kv_usage = Gauge("lean_vllm:gpu_cache_usage_perc", "Fraction of KV blocks in use.")
+        self.kv_usage = Gauge("lean_vllm:kv_cache_usage_perc", "Fraction of KV blocks in use.")
 
         self.requests_received = Counter("lean_vllm:num_requests_received_total", "Requests admitted.")
         self.requests_rejected = Counter("lean_vllm:num_requests_rejected_total", "Requests refused by admission control.")
         self.requests_aborted = Counter("lean_vllm:num_requests_aborted_total", "Requests cancelled by their client.")
         self.requests_finished = Counter(
-            "lean_vllm:request_success_total", "Requests that ran to a finish.", label="finish_reason"
+            "lean_vllm:request_success_total", "Requests that ran to a finish.", label="finished_reason"
         )
         self.preemptions = Counter("lean_vllm:num_preemptions_total", "Sequences preempted to free blocks.")
 
@@ -160,7 +161,7 @@ class Metrics:
         self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
         self.ttft = Histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
-        self.tpot = Histogram("lean_vllm:time_per_output_token_seconds", "Mean seconds per token after the first.", TPOT_BUCKETS)
+        self.tpot = Histogram("lean_vllm:request_time_per_output_token_seconds", "Mean seconds per token after the first.", TPOT_BUCKETS)
         self.queue_time = Histogram("lean_vllm:request_queue_time_seconds", "Arrival to first schedule.", LATENCY_BUCKETS)
         self.e2e = Histogram("lean_vllm:e2e_request_latency_seconds", "Arrival to finish.", LATENCY_BUCKETS)
         self.request_prompt_tokens = Histogram("lean_vllm:request_prompt_tokens", "Prompt length.", TOKEN_BUCKETS)

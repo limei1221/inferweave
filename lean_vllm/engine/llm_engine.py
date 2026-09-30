@@ -27,7 +27,7 @@ def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_s
     if bad is not None:
         raise InvalidRequest(f"token id {bad} is outside the {vocab_size}-token vocabulary")
     if len(prompt) >= max_model_len:
-        raise InvalidRequest(f"prompt is {len(prompt)} tokens, over the {max_model_len}-token context")
+        raise InvalidRequest(f"prompt is {len(prompt)} tokens, leaving no room in the {max_model_len}-token context")
     if len(prompt) + sampling_params.max_tokens > max_model_len:
         raise InvalidRequest(
             f"prompt ({len(prompt)}) plus max_tokens ({sampling_params.max_tokens}) "
@@ -238,7 +238,8 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+    ) -> list[dict]:
+        """Each prompt's {"text", "token_ids"}, in order."""
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)

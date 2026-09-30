@@ -1,4 +1,4 @@
-"""The attention custom op torch.compile splits on: its schema, fake, and layer lookup by name."""
+"""The opaque attention custom op: its schema, fake, and layer lookup by name."""
 
 import pytest
 import torch

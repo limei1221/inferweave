@@ -127,11 +127,11 @@ gates its KV loop on the `context_lens` each replay refreshes, so a replay with
 shorter, different lengths stays in bounds. lean-vLLM captures at `max_model_len`
 (see `capture_cudagraph` in `lean_vllm/engine/model_runner.py`); a pure-decode
 step that fits a captured batch size replays the whole model, attention included.
-Steps past the largest captured batch size still fall back to piecewise graphs
-with decode attention run eager between the pieces.
+A decode batch past the largest captured size runs eager: the piecewise buckets
+stop at 512 tokens too, so no graph covers it.
 
 MLA caches one compressed latent per token per layer—about 31 KB per token
-across V2-Lite's 27 layers, against the ~6 KB a plain paged cache of its heads
+across V2-Lite's 27 layers, against the ~276 KB a plain paged cache of its heads
 would take. The weights are 31 GB, leaving most of the 80 GB for cache, so
 327,680 tokens fits with wide margin. Raise `KVTOKENS` if a first pass shows the
 cache, not compute, capping concurrency; keep it identical across both engines.

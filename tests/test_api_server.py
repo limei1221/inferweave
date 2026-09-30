@@ -273,7 +273,7 @@ class TestRefusals:
 
     @pytest.mark.parametrize("message", [
         "token id 999999 is outside the 100-token vocabulary",
-        "prompt is 65 tokens, over the 64-token context",
+        "prompt is 65 tokens, leaving no room in the 64-token context",
     ])
     def test_a_prompt_the_engine_rejects_is_a_400_and_not_a_500(self, client, engine, message):
         """Validation lives in the engine, which knows the vocabulary and the context length."""

@@ -36,8 +36,8 @@ class AttentionBackend(ABC):
 
     @staticmethod
     def supports_full_cudagraph_mla_decode() -> bool:
-        """False if mla_decode bakes per-step state a full-graph replay cannot refresh (e.g. a FlashMLA
-        schedule built from cache_seqlens), so decode must stay eager and only piecewise graphs apply."""
+        """False if mla_decode bakes per-step state a full-graph replay cannot refresh (e.g. a schedule built
+        outside the kernel from one step's lengths), so decode must stay eager and only piecewise graphs apply."""
         return True
 
     @staticmethod

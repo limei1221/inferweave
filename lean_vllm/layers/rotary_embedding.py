@@ -21,6 +21,12 @@ def apply_rotary_emb(
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 
+def rope_config(config) -> tuple[float, dict]:
+    """rope_parameters from transformers 5, or rope_theta and rope_scaling before it."""
+    params = getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+    return params.get("rope_theta", getattr(config, "rope_theta", 10000)), params
+
+
 def yarn_get_mscale(scale: float, mscale: float = 1.0) -> float:
     return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
 

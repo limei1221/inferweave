@@ -231,8 +231,8 @@ class ModelRunner:
     @staticmethod
     def _cudagraph_mode(mode: str, mla: bool, backend: type[AttentionBackend]) -> str:
         """The mode these captures can serve. A full graph holds attention, so MLA decode must both attend
-        latents and be safe to replay; FlashMLA bakes a per-step schedule a replay cannot refresh, so it falls
-        back to piecewise (decode runs eager, the rest of the model is still captured)."""
+        latents and be safe to replay; a backend that is not falls back to piecewise (decode runs eager, the rest
+        of the model is still captured)."""
         full_safe = backend.supports_mla_decode() and backend.supports_full_cudagraph_mla_decode()
         if mla and mode in FULL_MODES and not full_safe:
             return "piecewise" if mode in PIECEWISE_MODES else "none"
@@ -247,8 +247,8 @@ class ModelRunner:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
             return "piecewise"
-        # "prefill" is a step past the piecewise grid; "oversized" a decode batch past the full-graph buckets.
-        return "prefill" if is_prefill else "oversized"
+        # No graph covers the step: "prefill" for a prefill or mixed step, "decode" for a pure decode one.
+        return "prefill" if is_prefill else "decode"
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):

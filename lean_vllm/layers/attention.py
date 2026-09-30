@@ -16,7 +16,7 @@ _LAYERS: dict[str, "Attention"] = {}
 
 
 def register_layers(model: nn.Module):
-    """Name every attention layer, so `torch.ops.lean_vllm.attention` can find it. Call before forward."""
+    """Name every attention layer, so the `lean_vllm` attention ops can find it. Call before forward."""
     for name, module in model.named_modules():
         if isinstance(module, Attention):
             module.layer_name = name
@@ -83,7 +83,7 @@ class Attention(nn.Module):
         return (num_tokens, self.num_heads, self.head_dim)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # Through the opaque op, so torch.compile splits the graph here for piecewise capture.
+        # Through an opaque op, so a compiled model would split here; the runner's piecewise capture is manual.
         return torch.ops.lean_vllm.attention(q, k, v, self.layer_name)
 
     def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -234,9 +234,9 @@ class MLAAttention(Attention):
         if cache.numel():
             self.backend.store_latents(latent, cache, context.slot_mapping)
             if not context.is_prefill and self.backend.supports_mla_decode():
-                return self._decode_latents(q, context)
+                return self._decode_latents(q, context)    # pure decode
             if (context.is_prefill and context.prefill_rows is not None
-                    and not all(context.prefill_rows) and self.backend.supports_mla_decode()):
+                    and not all(context.prefill_rows) and self.backend.supports_mla_decode()):    # mixed step, split below
                 out = q.new_empty(self.output_shape(q.size(0)))
                 for tokens, subset in mla_partitions(context):
                     if subset.is_prefill:
@@ -245,7 +245,7 @@ class MLAAttention(Attention):
                         part = self._decode_latents(q[tokens], subset)
                     out.index_copy_(0, tokens, part)
                 return out
-        return self._prefill(q, latent, context)
+        return self._prefill(q, latent, context)    # expanded path
 
     def _prefill(self, q: torch.Tensor, latent: torch.Tensor, context: Context) -> torch.Tensor:
         cache = self.latent_cache

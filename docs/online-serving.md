@@ -175,13 +175,14 @@ The tokens behind a hit are compared before reuse either way.
 `/metrics.json` reports step count and time, batch tokens, the prefill/decode
 split, steps by graph kind, preemptions, prefix-cache hit rate, peak KV usage,
 and counts and means for TTFT, TPOT, queue delay and end-to-end latency. Names
-mirror vLLM's under `lean_vllm:`. Compute percentiles on the client; the
+mirror vLLM's under `lean_vllm:`, except that the prefix-cache counters count
+blocks where vLLM's count tokens. Compute percentiles on the client; the
 histogram buckets are too coarse.
 
 Steps are counted as `graph`, `piecewise`, or an eager reason: `prefill`
-(outside the piecewise range), `oversized` (decode no full graph covers) or
-`enforced` (`none`). Under `piecewise` alone, small decode steps are also
-counted `oversized`.
+(a prefill or mixed step outside the piecewise range), `decode` (a decode step
+no graph covers: past the full-graph sizes, or under `piecewise` alone outside
+its range) or `enforced` (`none`).
 
 `model_busy_fraction`, the share of wall clock inside a forward pass, is the
 utilization to trust; the nvidia-smi figure beside it counts any live kernel as

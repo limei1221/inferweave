@@ -9,7 +9,7 @@ from lean_vllm.engine.sequence import HASH_ALGOS
 logger = logging.getLogger(__name__)
 
 
-# Which steps may replay a graph: full for pure decode, piecewise for prefill and mixed.
+# Which steps may replay a graph: full for pure decode, piecewise for any step within its token buckets.
 FULL_MODES = ("full", "full_and_piecewise")
 PIECEWISE_MODES = ("piecewise", "full_and_piecewise")
 CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)

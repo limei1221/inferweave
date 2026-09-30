@@ -219,8 +219,8 @@ class TestStepKind:
     def test_a_small_decode_batch_replays_a_full_graph(self, runner):
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "graph"
 
-    def test_a_decode_batch_past_the_buckets_is_oversized(self, runner):
-        assert runner._step_kind(is_prefill=False, num_tokens=17) == "oversized"
+    def test_a_decode_batch_past_the_buckets_runs_eager(self, runner):
+        assert runner._step_kind(is_prefill=False, num_tokens=17) == "decode"
 
     def test_a_prefill_step_goes_piecewise(self, runner):
         assert runner._step_kind(is_prefill=True, num_tokens=512) == "piecewise"
@@ -240,6 +240,11 @@ class TestStepKind:
         runner.cudagraph_mode = "piecewise"
         assert runner._step_kind(is_prefill=False, num_tokens=512) == "piecewise"
 
+    def test_a_small_decode_under_piecewise_alone_runs_eager_as_decode(self, runner):
+        """Not oversized: it is under the smallest piecewise bucket, and no full graph exists."""
+        runner.cudagraph_mode = "piecewise"
+        assert runner._step_kind(is_prefill=False, num_tokens=8) == "decode"
+
     def test_none_is_enforced_eager(self, runner):
         runner.cudagraph_mode = "none"
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "enforced"
@@ -249,7 +254,7 @@ class TestStepKind:
         runner.piecewise_bs = []
         assert runner._step_kind(is_prefill=True, num_tokens=512) == "prefill"
         runner.graph_bs = []
-        assert runner._step_kind(is_prefill=False, num_tokens=8) == "oversized"
+        assert runner._step_kind(is_prefill=False, num_tokens=8) == "decode"
 
 
 class TestCudagraphMode:
