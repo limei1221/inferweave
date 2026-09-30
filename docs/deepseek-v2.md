@@ -1,10 +1,13 @@
 # DeepSeek-V2: MLA, MoE and YaRN
 
 Status: `DeepseekV2ForCausalLM` loads DeepSeek-V2-Lite and runs on the torch,
-FlashAttention-3 and FlashMLA backends, with CUDA graphs on. It has been checked
-against transformers on tiny random checkpoints only; neither FlashMLA, the
-Triton MoE nor either graph mode has run on a GPU. It has not yet run on the real 16B weights
-or been benchmarked against vLLM.
+FlashAttention-3 and FlashMLA backends, with CUDA graphs on. It is checked
+against transformers on tiny random checkpoints. On an H100 the Triton MoE
+matches `grouped_mm`, and the real V2-Lite-Chat weights have been served and
+benchmarked against vLLM with both graph modes and FlashMLA decode inside the
+full graph ([20 September report](benchmark-2026-09-20.md)). Not yet recorded:
+FlashMLA decode against the torch reference on the GPU, and greedy output on the
+real weights against vLLM.
 
 ## Running it
 
@@ -23,8 +26,8 @@ The runner picks the model class from `architectures` in `config.json`
 Each token caches `kv_lora_rank + qk_rope_head_dim` values per layer. That is
 the normalized compressed KV plus the shared rope key, with rope already
 applied. Keys and values per head are not cached. For V2-Lite that is 576
-values against the 2 × 16 × 192 = 6144 a plain KV cache would need, about 31 KB
-per token in bf16 across 27 layers.
+values against the 16 × (192 + 128) = 5120 a plain KV cache would need, about
+31 KB per token in bf16 across 27 layers.
 
 `MLAAttention` (`layers/attention.py`) is an `Attention` layer with its own
 layout. The runner asks every layer for `kv_cache_shape` and hands its slice
@@ -51,8 +54,8 @@ vLLM uses a separate workspace of up to 64k tokens and reserves it in its
 profile run instead.
 
 Values are zero-padded from `v_head_dim` (128) to the query/key head size (192),
-so a backend still sees one head size. The softmax scale is passed explicitly,
-so the padding changes nothing, and the output is cut back to 128.
+so a backend still sees one head size. The padding leaves the scores alone and
+yields zero output lanes, and the output is cut back to 128.
 
 Chunking bounds the memory, not the compute: a step that goes this way
 re-expands the prefill context in every layer, one chunk at a time. On a backend
@@ -81,8 +84,9 @@ full-graph path remains for pure decode.
 `FlashMLABackend` runs this with FlashMLA's dense decode kernel and uses
 FlashAttention-3 for every other step. The kernel takes bf16 or fp16, a latent
 of 512 + 64 and 64-token pages, on Hopper only. V2-Lite's latent fits. When the
-backend is selected, `Config` sets `kvcache_block_size` to 64. The kernel's
-schedule is built by the first layer of a step and reused by the rest.
+backend is selected, `Config` sets `kvcache_block_size` to 64. The first layer
+of a step creates the schedule holder, the kernel fills it from `context_lens`,
+and the rest of the step's layers reuse it.
 
 FlashMLA publishes no wheel, and `flash-mla` on PyPI is an empty placeholder.
 Build it into the project's environment from a checkout, against the pinned
@@ -134,8 +138,13 @@ The model reports `supports_cuda_graph = True`, and both modes took a change.
 
 A full graph holds attention, so the step inside it must neither plan chunks on
 the host nor expand latents — that is exactly what `mla_decode` avoids. The
-runner drops full graphs for an MLA model on a backend without one, keeping
-piecewise (`_cudagraph_mode`). A graph also pads its batch to a captured size,
+runner drops full graphs for an MLA model on a backend without one, or whose
+`supports_full_cudagraph_mla_decode` is false, keeping piecewise
+(`_cudagraph_mode`). FlashMLA answers true: its kernel builds the tile schedule
+and split-KV workspace from `context_lens`, so `capture_cudagraph` captures at
+`max_model_len` and each replay gates the KV loop on the lengths it refreshes.
+The warmup's schedule is cleared before capture, so the graph owns its own. A
+graph also pads its batch to a captured size,
 which is why the latent store is a backend call: `store_latents` skips slot -1
 in the kernel, as `store_kvcache` already did, rather than masking on the host.
 
@@ -153,7 +162,8 @@ batch shape instead, an upper bound of one wasted block per expert, and writes
 how many rows survived to a device tensor. The kernel reads that tensor to drop
 the blocks the padding left empty, and masks the rows overhanging the last block
 of a run, so no count reaches the host. Nothing in the `grouped_mm` path syncs
-either. None of this has run on a GPU.
+either. Both graph modes ran in the 20 September benchmark on an H100, with no
+step running as eager decode.
 
 ## Testing
 
@@ -184,19 +194,22 @@ and a one-token cold prompt. It checks logits against transformers, verifies
 that both decode requests use `mla_decode`, and counts expanded tokens to
 ensure their cached context is excluded. It also checks the expanded fallback
 when the backend does not support latent decode. These checks use the torch
-backend; mixed FlashMLA execution still needs GPU validation.
+backend. Mixed FlashMLA steps ran in the H100 benchmark, but their output has
+not been compared against a reference there.
 
 `tests/test_fused_moe.py` covers the Triton path's blocking without a GPU.
 `blocked_moe` writes out in torch what the kernel does with `align_blocks` — the
 same gather, one expert per block, the same masked scatter — and checks it
 against `torch_experts`, at both row block sizes. The alignment itself is
 checked for holding every pair exactly once, for never putting two experts in
-one block, and for giving an expert with no tokens no block. Only the arithmetic
-inside `tl.dot` awaits a GPU.
+one block, and for giving an expert with no tokens no block. On CUDA,
+`test_the_triton_kernel_matches_grouped_mm_on_cuda` runs `fused_experts` in bf16
+against `grouped_mm`, covering the arithmetic inside `tl.dot`; it passes on an
+H100.
 
-The flash backend's `varlen_with_lse` and FlashMLA's decode have not run yet:
-both need a Hopper GPU. `fused_moe_kernel` needs only a CUDA GPU, and has not
-run either.
+`test_mla_decode` covers FlashMLA on Hopper, and the flash backend's
+`varlen_with_lse` has its own test. Both kernels ran in the H100 benchmark, but
+no record says whether their tests ran there or skipped.
 
 Writing it turned up an fp32 bug in `RMSNorm`. `.float()` and `.to()` alias an
 fp32 tensor, so the in-place normalization rewrote the residual. bf16 always
@@ -208,13 +221,11 @@ transformers' `generate` token for token.
 
 ## Next
 
-1. Run the real weights: compare outputs with vLLM, then benchmark.
-2. Run FlashMLA's decode on an H100 against the torch reference, then a Triton
-   MLA decode off Hopper.
-3. Capture both graph modes on an H100, and run the Triton MoE there against
-   `grouped_mm`: first for agreement, then for time at decode and prefill
-   shapes. Its block sizes are a guess until then, where vLLM ships a tuned
-   table per shape and dtype.
+1. Compare greedy output on the real weights with vLLM, and record it.
+2. Record FlashMLA's decode against the torch reference on an H100, then add a
+   Triton MLA decode off Hopper.
+3. Time the Triton MoE at decode and prefill shapes. Its block sizes are a
+   guess until then, where vLLM ships a tuned table per shape and dtype.
 
 ## Closing the gap with vLLM
 
@@ -223,23 +234,19 @@ and YaRN are already implemented. The remaining work is to validate the GPU
 paths, benchmark mixed-batch execution, and measure which kernel
 optimizations matter. Follow this order:
 
-1. Validate the existing GPU paths. On an H100, compare FlashMLA decode with
-   the torch reference and Triton MoE with `grouped_mm`. Check eager, full
-   graph and piecewise graph execution, including padded batches and resumed
-   prefills. Then run the real V2-Lite weights and compare logits and greedy
-   generation with a pinned vLLM version. Record numerical tolerances and
-   mismatches before making performance claims.
-2. Establish a reproducible baseline. Use the same GPU, checkpoint, dtype,
-   context lengths, concurrency and token budgets in both engines. Measure
-   prefill, pure decode and mixed traffic separately, recording time to first
-   token, inter-token latency, throughput and peak memory. Record backend,
-   graph and prefix-cache settings alongside the vLLM commit.
-3. Validate mixed latent decode on GPU. Attention now separates prefill and
-   decode subsets and restores the original token order, as vLLM's MLA path
-   does. The torch regression checks paged-cache correctness and confirms that
-   decode context is not expanded. Check FlashMLA and piecewise graph behavior
-   on an H100, then measure decode latency while prompts arrive. The saved
-   expansion work has not yet been measured as an end-to-end speedup.
+1. Finish validating the GPU paths. The Triton MoE matches `grouped_mm` on an
+   H100, and eager, full graph and piecewise execution all ran in the
+   benchmark. Still to record: FlashMLA decode against the torch reference,
+   and logits and greedy generation on the real V2-Lite weights against a
+   pinned vLLM version, with numerical tolerances and mismatches.
+2. Extend the baseline. The [20 September report](benchmark-2026-09-20.md)
+   measures serving curves against vLLM 0.26.0 on one H100. Still to measure
+   separately: prefill, pure decode and mixed traffic, and peak memory.
+3. Measure mixed latent decode. Attention separates prefill and decode subsets
+   and restores the original token order, as vLLM's MLA path does, and mixed
+   steps ran on FlashMLA in the benchmark. Check their output there, then
+   measure decode latency while prompts arrive. The saved expansion work has
+   not yet been measured as an end-to-end speedup.
 4. Optimize the measured bottlenecks. Profile routing, expert GEMMs, latent
    projections, context gathering and attention merging. Tune the MoE launch
    configuration for actual shapes and dtypes. Evaluate prepared per-head

@@ -9,6 +9,7 @@ Lessons, in order:
 3. MoE: routing and the fused expert GEMMs
 4. YaRN and the attention scale
 5. How it all fits the CUDA-graph capture modes
+
 ## Lesson 1: the latent KV cache
 
 One concept this lesson: in DeepSeek-V2, a token's keys and values are never cached per head. The cache stores one compressed latent per token, and keys/values are derived from it on demand.
@@ -17,12 +18,12 @@ One concept this lesson: in DeepSeek-V2, a token's keys and values are never cac
 
 In the standard MHA you already know, every token writes $K$ and $V$ for each KV head into the cache, and attention reads them back later. The cost scales with `num_kv_heads * head_dim * 2`.
 
-MLA (multi-head latent attention) replaces that with a low-rank compression. For DeepSeek-V2-Lite, the number is 576 values per token per layer against the 6144 a plain cache of 16 heads at 192 dims would need, about 31 KB per token in bf16 across all 27 layers (see `docs/deepseek-v2.md`, "MLA: the cache holds latents"). That roughly tenfold reduction is the reason the attention half of this project exists.
+MLA (multi-head latent attention) replaces that with a low-rank compression. For DeepSeek-V2-Lite, the number is 576 values per token per layer against the 5120 a plain cache of 16 heads would need (192-dim keys plus 128-dim values), about 31 KB per token in bf16 across all 27 layers (see `docs/deepseek-v2.md`, "MLA: the cache holds latents"). That roughly ninefold reduction is the reason the attention half of this project exists.
 
 The 576 splits into two parts:
 
 - **The compressed KV**, `kv_lora_rank = 512` values. This is a shared, head-independent vector.
-- **The rope key**, `qk_rope_head_dim = 64` values. RoPE rotates per-head keys after the up projection, and that rotation does not factor through a shared latent, so it cannot act on the compressed part. This small key part stays outside the compression, is rotated on its own, and is stored with rope already applied.
+- **The rope key**, `qk_rope_head_dim = 64` values, one key shared by all heads (hence `_with_mqa` in the projection's name). If rope rotated keys expanded from the latent, a position-dependent rotation would sit between the query and the up projection, and the up projection could no longer be moved onto the query, the trick lesson 2's decode path relies on. So this small key part stays outside the compression, is rotated on its own, and is stored with rope already applied.
 
 ### Where the latent is produced
 
@@ -99,7 +100,7 @@ def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 Note the asymmetry: the 512-dim compressed part goes through `kv_b_proj` to become per-head nope-key and value, while the 64-dim rope part is repeated across the heads, because it is already final. Keys are `[nope | rope]` = 192 dims, values are 128 dims.
 
-One subtlety, verified in `_pad()` (`lean_vllm/layers/attention.py:287`): values are zero-padded from 128 to 192 so the backend sees a single head size. The softmax scale is passed explicitly, so the padding contributes zeros to the output's extra lanes and is then cut off (`o[..., :self.v_head_dim]` in `_prefill`, `lean_vllm/layers/attention.py:257` and `:274`).
+One subtlety, verified in `_pad()` (`lean_vllm/layers/attention.py:287`): values are zero-padded from 128 to 192 so the backend sees a single head size. The padding leaves the scores alone, and since the output is a weighted sum of values, zero value lanes give zero output lanes, which are then cut off (`o[..., :self.v_head_dim]` in `_prefill`, `lean_vllm/layers/attention.py:257` and `:274`).
 
 ### How the pieces interact
 
@@ -118,14 +119,15 @@ DeepseekV2DecoderLayer.forward                  (models/deepseek_v2.py:207)
 
 Two things to notice about the plumbing:
 
-- `MLAAttention.forward` routes through the custom op `torch.ops.lean_vllm.mla_attention` (`lean_vllm/layers/attention.py:228-229`). The layer is looked up by name because a custom op cannot take modules (`lean_vllm/layers/attention.py:13-14`). The op's comment attributes it to a `torch.compile` split for piecewise capture; the runner's piecewise capture is manual and bypasses the op, so lesson 5 treats that comment as stale.
+- `MLAAttention.forward` routes through the custom op `torch.ops.lean_vllm.mla_attention` (`lean_vllm/layers/attention.py:228-229`). The layer is looked up by name because a custom op cannot take modules (`lean_vllm/layers/attention.py:14`). The base class's comment (`lean_vllm/layers/attention.py:86`) says the op exists so `torch.compile` splits the graph around attention for piecewise capture. Every call goes through the op, but nothing compiles the whole model, so that split never happens here; lesson 5 treats the comment's reason as stale.
 - The backend is chosen with `get_attention_backend(mla=True)` (`lean_vllm/layers/attention.py:212`), so an MLA layer may land on a different backend than a standard one in the same process.
 
 The trade-off that drives everything else is that expansion is compute. A resumed prefill step that expands the whole cached context pays for `kv_b_proj` on every cached token in every layer, chunk by chunk. The next lesson covers how the step actually runs: chunked context merged by log-sum-exp, and the `mla_decode` path that skips expansion entirely for decode rows.
 
 ### Verified vs. not yet run
 
-Per `docs/deepseek-v2.md`, all of the above is implemented and checked against transformers on tiny random checkpoints, on the torch backend, including end-to-end greedy generation. What has **not** been verified on hardware: the FlashMLA decode kernel, the Triton MoE kernel, and both CUDA-graph modes need an H100/H200; the real 16B weights have not been run.
+Per `docs/deepseek-v2.md`, all of the above is implemented and checked against transformers on tiny random checkpoints, on the torch backend, including end-to-end greedy generation. On hardware, the 20 September benchmark (`docs/benchmark-2026-09-20.md`) served the real DeepSeek-V2-Lite-Chat weights on an H100, with FlashMLA decode and both CUDA-graph modes. That was a performance run; a numerical comparison of FlashMLA decode against the torch reference is still not recorded.
+
 ## Lesson 2: running a step over the latent cache
 
 Lesson 1 ended at the store: each step scatters its latents into the paged cache, then attention runs. This lesson covers everything `attend()` does between that store and its return, across three paths: a cold prefill, a resumed prefill, and a decode over raw latents.
@@ -161,7 +163,7 @@ Read the conditions in order: a decode step on a backend with `mla_decode` atten
 When every key the step reads is one it just wrote (`keys_are_new`), the paged cache is irrelevant and so is the page table. `_prefill` (`lean_vllm/layers/attention.py:250`) expands the step's own latents and calls the backend's plain `prefill` with `block_tables=None`:
 
 ```python
-# lean_vllm/layers/attention.py:251-258
+# lean_vllm/layers/attention.py:252-257
 k, v = self.expand(latent)
 if context.keys_are_new or context.block_tables is None:
     unpaged = dataclasses.replace(context, block_tables=None, keys_are_new=True)
@@ -175,10 +177,10 @@ One causal varlen call covers the whole batch. No chunking, no merging.
 
 A resumed row has cached keys behind its new tokens, so the step reads the cache back. `_prefill` splits the work in two:
 
-1. The new tokens attend each other, causally. `varlen_with_lse` (`lean_vllm/layers/attention.py:259-262`) runs over the step's own keys only, with `cu_seqlens_q` passed for both the query and the key side.
+1. The new tokens attend each other, causally. `varlen_with_lse` (`lean_vllm/layers/attention.py:260-262`) runs over the step's own keys only, with `cu_seqlens_q` passed for both the query and the key side, since each new token contributes exactly one key.
 2. Each chunk of cached keys is attended unmasked, and its result is merged into the running output by log-sum-exp.
 
-The backend contract for `varlen_with_lse` (`lean_vllm/attention/abstract.py:90`) says the mask is bottom-right aligned: query $j$ sits at key position $\text{seqlen}_k - \text{seqlen}_q + j$. That alignment is why passing `cu_seqlens_q` for both sides works, and why a one-token row needs no mask at all (`lean_vllm/attention/torch_backend.py:124`, `_causal_mask` returns `None` for it).
+The backend contract (`lean_vllm/attention/abstract.py:83`, `:101`) says the causal mask is bottom-right aligned: query $j$ sits at key position $\text{seqlen}_k - \text{seqlen}_q + j$. In step 1 the two lengths are equal, so the alignment makes no difference there. It matters in `backend.prefill` over paged keys, where $\text{seqlen}_k > \text{seqlen}_q$: a one-token query sits last and sees every key, which is why `_causal_mask` returns `None` for it (`lean_vllm/attention/torch_backend.py:124`).
 
 The cached side is processed in chunks bounded by `max_context_chunk` (`lean_vllm/layers/attention.py:199`), whose value the runner sets to the step token budget. The plan is built once per step by `context_chunks()` (`lean_vllm/layers/attention.py:133`), which wraps `plan_context_chunks()` (`lean_vllm/layers/attention.py:111`). Three properties of the plan:
 
@@ -239,13 +241,15 @@ return torch.einsum("bhl,hvl->bhv", o, w_v)
 
 For V2-Lite a decode query is 576 wide per head in latent space (512 projected + 64 rope), and the value read is 512 wide, so the whole decode touches only the 576-wide cache rows. No `kv_b_proj` on any cached token.
 
+This is not free in arithmetic: each score is now a 576-wide dot product instead of a 192-wide one. The win is memory traffic. Decode is bound by reading the cache, and here all 16 heads read one shared 576-wide row per token rather than their own expanded keys and values.
+
 ### Mixed steps: splitting by phase
 
 A step can carry a resumed prompt beside decode rows. When the backend supports `mla_decode`, `attend()` splits it with `mla_partitions()` (`lean_vllm/layers/attention.py:166`), which builds, once per step, a subset `Context` for each phase and the token indices of its rows. Each subset then takes its own path from above: the prefill subset runs `_prefill`, the decode subset runs `_decode_latents`. Both outputs are scattered back into the original token order with `index_copy_` before the layer returns (`lean_vllm/layers/attention.py:241-246`). Only prefill rows expand anything.
 
 ### The backends behind the contract
 
-`AttentionBackend` (`lean_vllm/attention/abstract.py`) defines the pieces this lesson used. `supports_mla_decode` (`lean_vllm/attention/abstract.py:33`) is the switch `attend()` reads; `store_latents` (`:64`) and `varlen_with_lse` (`:90`) are required of all of them.
+`AttentionBackend` (`lean_vllm/attention/abstract.py`) defines the pieces this lesson used. `supports_mla_decode` (`lean_vllm/attention/abstract.py:33`) is the switch `attend()` reads. `varlen_with_lse` (`:90`) is abstract, so every backend implements it; `store_latents` (`:64`) is not, and its default raises `NotImplementedError`, so only backends that serve MLA implement it.
 
 `TorchAttention` (`lean_vllm/attention/torch_backend.py:9`) implements everything, as the reference. Its `mla_decode` (`lean_vllm/attention/torch_backend.py:101`) gathers each row's latents from the pages and runs SDPA with the latent serving as both the key and, truncated to `v_dim`, the value:
 
@@ -253,10 +257,12 @@ A step can carry a resumed prompt beside decode rows. When the backend supports 
 # lean_vllm/attention/torch_backend.py:106-110, abridged
 latent = self._gather_pages(rearrange(latent_cache, "n p d -> n p 1 d"), block_tables[i], seqlen_k)
 kv = repeat(latent, "l 1 d -> 1 h l d", h=q.size(1))
-o = F.scaled_dot_product_attention(q[i:i+1], kv, kv[..., :v_dim], scale=self.scale)
+o = F.scaled_dot_product_attention(
+    rearrange(q[i:i + 1], "b h d -> 1 h b d"), kv, kv[..., :v_dim], scale=self.scale,
+)
 ```
 
-`FlashMLABackend` (`lean_vllm/attention/flashmla_backend.py:14`) runs the real kernel instead: FlashMLA's dense decode, with FlashAttention-3 inherited for every other call. It requires 64-token pages (`mla_block_size`, `lean_vllm/attention/flashmla_backend.py:40`), which is why the config sets the cache block size to 64 when this backend is chosen. Its `mla_decode` (`lean_vllm/attention/flashmla_backend.py:43`) asks FlashMLA for its schedule on the first layer's call and stashes it in `context.mla_decode_metadata`; the rest of the step's layers reuse it, since they share the step's lengths.
+`FlashMLABackend` (`lean_vllm/attention/flashmla_backend.py:14`) runs the real kernel instead: FlashMLA's dense decode, with FlashAttention-3 inherited for every other call. It requires 64-token pages (`mla_block_size`, `lean_vllm/attention/flashmla_backend.py:40`), which is why the config sets the cache block size to 64 when this backend is chosen. Its `mla_decode` (`lean_vllm/attention/flashmla_backend.py:43`) calls `get_mla_metadata()`, with no arguments, on the first layer's call and stashes the result in `context.mla_decode_metadata`. That object is a holder: in this FlashMLA build the kernel itself computes the tile schedule from `context_lens` and keeps it there, and the rest of the step's layers reuse it, since they share the step's lengths.
 
 ### The cost of each path
 
@@ -264,11 +270,12 @@ o = F.scaled_dot_product_attention(q[i:i+1], kv, kv[..., :v_dim], scale=self.sca
 - Resumed prefill: the same, plus re-expansion of the whole cached context, chunk by chunk, in every layer of the step.
 - Decode over latents: no expansion at all; the query moves to latent space once per step.
 
-That middle cost is why the capability check exists. Chunking bounds the memory, not the compute.
+A decode row is a resumed row with one query, so on the expanded path it would pay that middle cost every step. That is why the capability check exists. Chunking bounds the memory, not the compute.
 
 ### Verified vs. not yet run
 
-The torch reference for every path above is exercised by `tests/test_deepseek_v2.py` against transformers, including the mixed-row regression that counts expanded tokens to confirm decode context is not expanded (see `docs/deepseek-v2.md`, "Testing"). FlashMLA's decode has never run: the kernel needs a Hopper GPU, and mixed FlashMLA execution still needs GPU validation per the doc.
+The torch reference for every path above is exercised by `tests/test_deepseek_v2.py` against transformers, including the mixed-row regression that counts expanded tokens to confirm decode context is not expanded (see `docs/deepseek-v2.md`, "Testing"). FlashMLA's decode has run on an H100 in the 20 September benchmark, mixed steps included, but only as a performance run; no numerical comparison against the torch reference is recorded.
+
 ## Lesson 3: the MoE layer
 
 One concept this lesson: how a token crosses the routed MoE layer. The router picks $k$ of $E$ experts and one weight for each pick, and that pair of tensors is the entire interface between the routing decision and the expert compute. You know the MoE idea conceptually; this lesson is the concrete version of it, in two implementations: a portable one built on `grouped_mm`, and a Triton kernel modeled on vLLM's.
@@ -289,7 +296,7 @@ The first `first_k_dense_replace` layers use the dense MLP; the rest switch. So 
 
 - `gate` (`:133`), a replicated linear from `hidden_size` to `n_routed_experts`: the router.
 - `experts` (`:134`), a `FusedMoE`: all routed experts in one module, this lesson's main subject.
-- `shared_experts` (`:135-137`), a plain dense MLP (`DeepseekV2MLP`, aliased at `lean_vllm/models/deepseek_v2.py:14` to `Qwen3MLP` from `lean_vllm/models/qwen3.py:94`). Shared experts always run for every token, outside the routing, and their output is added at the end (`lean_vllm/models/deepseek_v2.py:159-163`).
+- `shared_experts` (`:135-141`), a plain dense MLP (`DeepseekV2MLP`, aliased at `lean_vllm/models/deepseek_v2.py:14` to `Qwen3MLP` from `lean_vllm/models/qwen3.py:94`). Shared experts always run for every token, outside the routing, and their output is added at the end (`lean_vllm/models/deepseek_v2.py:159-163`).
 
 So a token's feed-forward cost is `top_k` routed experts plus the shared expert, regardless of how many experts exist. The parameter cost is where all $E$ experts are paid.
 
@@ -298,7 +305,7 @@ So a token's feed-forward cost is `top_k` routed experts plus the shared expert,
 An expert is the same gated SiLU MLP the dense layers use, with nothing MoE-specific in it: a merged `gate_up_proj`, `SiluAndMul` (`lean_vllm/layers/activation.py:6`, which computes $\mathrm{silu}(x_1) \cdot x_2$ over the two halves of the stacked projection), then `down_proj`. `FusedMoE` (`lean_vllm/layers/moe.py:12`) just stacks $E$ copies of those weights into two 3D tensors:
 
 ```python
-# lean_vllm/layers/moe.py:30-32
+# lean_vllm/layers/moe.py:31-32
 self.gate_up_proj = nn.Parameter(torch.empty(num_experts, 2 * self.intermediate_size, hidden_size))
 self.down_proj = nn.Parameter(torch.empty(num_experts, hidden_size, self.intermediate_size))
 ```
@@ -314,7 +321,7 @@ The loader (`lean_vllm/layers/moe.py:37`) maps each checkpoint weight `experts.{
 $$p = \mathrm{softmax}(W_g\, x), \qquad p \in \mathbb{R}^{E}$$
 
 2. Selection. `greedy` is a plain top-$k$ over $p$. `group_limited_greedy` first marks the `topk_group` best groups (group score = max score in the group) as eligible and zeroes the rest (`lean_vllm/models/deepseek_v2.py:147-151`), then takes top-$k$ among the survivors. The two asserts at `:125-126` are the whole config surface this layer supports: softmax scoring and one of those two methods.
-3. Weighting (`:153-156`): with `norm_topk_prob` the $k$ weights are renormalized to sum to one; otherwise they are multiplied by `routed_scaling_factor`. An epsilon of 1e-20 guards the division.
+3. Weighting (`:153-156`): with `norm_topk_prob` and $k > 1$, the $k$ weights are renormalized to sum to one; otherwise they are multiplied by `routed_scaling_factor`. An epsilon of 1e-20 guards the division.
 
 The doc's test suite runs one config with each method, so both branches are covered (`docs/deepseek-v2.md`, "Testing").
 
@@ -355,9 +362,9 @@ Three details carry the design:
 
 `fused_moe_kernel` (`lean_vllm/layers/fused_moe.py:21`) is a standard tiled GEMM on top of that layout. The grid is blocks times output-column tiles. A block reads its expert id and its `BLOCK_M` pair indices, gathers the activation rows as `sorted_pairs // top_k` (or as themselves, in the second GEMM, because its input is already one row per pair), and loops the K dimension in `BLOCK_K` tiles into a float32 accumulator. The expert's weight tile is addressed once per block via the expert id, so it is loaded once and reused across the block's rows.
 
-Two launches, one either side of the activation (`lean_vllm/layers/fused_moe.py:145-151`): the first GEMM computes `x @ gate_up_proj` with no routed weight, `SiluAndMul` runs on the pairs, and the second GEMM folds the routing weight into its epilogue via `MUL_ROUTED_WEIGHT`. A final `reduce(..., "sum")` over the $k$ pairs per token replaces the `index_add_`.
+Two launches, one either side of the activation (`lean_vllm/layers/fused_moe.py:146-152`): the first GEMM computes `x @ gate_up_proj` with no routed weight, `SiluAndMul` runs on the pairs, and the second GEMM folds the routing weight into its epilogue via `MUL_ROUTED_WEIGHT`. A final `reduce(..., "sum")` over the $k$ pairs per token replaces the `index_add_`.
 
-`use_triton` (`lean_vllm/layers/fused_moe.py:75`) picks the path: Triton on CUDA when it is importable, `grouped_mm` everywhere else, with `LEAN_VLLM_MOE_BACKEND` forcing either by name. The launch configuration (`config`, `lean_vllm/layers/fused_moe.py:86`) is a guess: `BLOCK_M` 16 for small batches, 64 above 256 pairs. vLLM ships a tuned table per shape and dtype; this one awaits a GPU run to tune against.
+`use_triton` (`lean_vllm/layers/fused_moe.py:75`) picks the path: Triton on CUDA when it is importable, `grouped_mm` everywhere else, with `LEAN_VLLM_MOE_BACKEND` forcing either by name. The launch configuration (`config`, `lean_vllm/layers/fused_moe.py:86`) is a guess: `BLOCK_M` 16 for small batches, 64 from 256 pairs up. vLLM ships a tuned table per shape and dtype; this one awaits a GPU run to tune against.
 
 ### How the pieces interact
 
@@ -365,7 +372,8 @@ The layer's `forward` (`lean_vllm/models/deepseek_v2.py:159`) ties it together: 
 
 ### Verified vs. not yet run
 
-The `grouped_mm` path is the correctness reference and runs in the test suite. The Triton path's blocking is checked without a GPU: `tests/test_fused_moe.py` has `blocked_moe`, a torch transcription of what `align_blocks` and the kernel do with the layout, compared against `torch_experts`, plus checks that the alignment holds every pair exactly once and gives an empty expert no block. Only the arithmetic inside `tl.dot` awaits a GPU, and `fused_moe_kernel` has never run (`docs/deepseek-v2.md`, "Testing").
+The `grouped_mm` path is the correctness reference and runs in the test suite. The Triton path's blocking is checked without a GPU: `tests/test_fused_moe.py` has `blocked_moe`, a torch transcription of what `align_blocks` and the kernel do with the layout, compared against `torch_experts`, plus checks that the alignment holds every pair exactly once and gives an empty expert no block. The arithmetic inside `tl.dot` is covered by `test_the_triton_kernel_matches_grouped_mm_on_cuda`, which runs `fused_experts` in bf16 against `grouped_mm` and passed on an H100 (commit `e7891ce`). The launch configuration is still untuned.
+
 ## Lesson 4: YaRN
 
 One concept this lesson: YaRN stretches the rope past the length it was trained on, and it does so in two places, not one. The rope frequencies change, and the attention softmax scale changes with them. Both live in this repository, split across `lean_vllm/layers/rotary_embedding.py` and the attention layer's constructor.
@@ -374,7 +382,7 @@ One concept this lesson: YaRN stretches the rope past the length it was trained 
 
 Recall rope as you know it: each pair of head dimensions rotates by angle $t \cdot \omega_i$ at position $t$, with $\omega_i = base^{-2i/d}$ falling geometrically from pair to pair, so attention scores depend only on relative position. The frequencies were chosen for a trained length $L$ = `original_max_position_embeddings`.
 
-To serve a context $f$ times longer, the naive fix is position interpolation: divide every angle by $f$, so $f L$ positions map back into the trained range. That warps every frequency band equally, including the high-frequency pairs that encode local token structure, and quality drops. YaRN's fix is to treat frequency bands differently: interpolate only the pairs whose wavelength is long relative to $L$, where position identity matters more than local detail, keep the short-wavelength pairs as they are, and ramp linearly in between.
+To serve a context $f$ times longer, the naive fix is position interpolation: divide every angle by $f$, so $f L$ positions map back into the trained range. That warps every frequency band equally, including the high-frequency pairs that encode local token structure, and quality drops. YaRN's fix is to treat frequency bands differently. A slow pair that never completed a full turn within $L$ would, past $L$, reach angles it never saw in training, so it must be interpolated. A fast pair has already seen every angle many times over, so it can extrapolate and keep its local resolution. YaRN interpolates the slow pairs, keeps the fast ones as they are, and ramps linearly in between.
 
 ### The frequencies, in code
 
@@ -390,15 +398,15 @@ Pairs below the `beta_fast` (32 rotations) boundary stay untouched; pairs above 
 
 $$\hat\omega_i = \frac{ramp_i}{f \, \theta_i} + \frac{1 - ramp_i}{\theta_i}$$
 
-so `ramp` is 1 for the slow pairs (divided by the factor, i.e. interpolated) and 0 for the fast ones (kept). A pair whose wavelength barely fits in the original context gets stretched; a pair that rotates many times per token is left unchanged.
+so `ramp` is 1 for the slow pairs (divided by the factor, i.e. interpolated) and 0 for the fast ones (kept). A pair that completes at most one turn over the original context, i.e. whose wavelength is at least $L$, is fully stretched; a pair that turns 32 or more times over it is left unchanged.
 
 ### The pairing: GPT-J style
 
-`apply_rotary_emb` (`lean_vllm/layers/rotary_embedding.py:8`) has two layouts. NeoX style rotates the first half against the second half of the vector; GPT-J style rotates adjacent elements, `x[..., ::2]` against `x[..., 1::2]`, which is what DeepSeek's checkpoints use. `DeepseekV2Attention` therefore builds the rope with `is_neox_style=False` (`lean_vllm/models/deepseek_v2.py:64`). The two layouts produce different cos/sin arrangements, so the flag has to match the checkpoint, or every rotation lands on the wrong pairs.
+`apply_rotary_emb` (`lean_vllm/layers/rotary_embedding.py:8`) has two layouts. NeoX style rotates the first half against the second half of the vector; GPT-J style rotates adjacent elements, `x[..., ::2]` against `x[..., 1::2]`, which is what DeepSeek's checkpoints use. `DeepseekV2Attention` therefore builds the rope with `is_neox_style=False` (`lean_vllm/models/deepseek_v2.py:64`). Both layouts use the same cos/sin table; they differ only in which elements are paired, so the flag has to match the checkpoint, or every rotation lands on the wrong pairs.
 
 ### The cache
 
-`RotaryEmbedding` (`lean_vllm/layers/rotary_embedding.py:44`) precomputes, once at construction: the outer product of positions $0 \dots L_{max}$ with the adjusted frequencies, then `cos` and `sin` tables from it. Its `forward` (`lean_vllm/layers/rotary_embedding.py:78`, under `@torch.compile`) gathers a row per position from the cache and rotates the query and key through `apply_rotary_emb`. `get_rope` (`lean_vllm/layers/rotary_embedding.py:91`) memoizes instances per config; a dict cannot key the cache, so its sorted items do.
+`RotaryEmbedding` (`lean_vllm/layers/rotary_embedding.py:44`) precomputes, once at construction: the outer product of positions $0 \dots L_{max}$ with the adjusted frequencies, then `cos` and `sin` tables from it. Its `forward` (`lean_vllm/layers/rotary_embedding.py:78`, under `@torch.compile`) gathers a row per position from the cache and rotates the query and key through `apply_rotary_emb`. `get_rope` (`lean_vllm/layers/rotary_embedding.py:91`) memoizes the instance with `lru_cache(1)`, so every layer shares one table and a different config replaces it; a dict cannot key the cache, so its sorted items do.
 
 In this model the rope's `rotary_dim` is `qk_rope_head_dim` = 64, not the full 192-dim head (`lean_vllm/models/deepseek_v2.py:60`). You know from lesson 1 why: only the shared rope key carries positions, and only that slice is rotated, in `project()` (`lean_vllm/models/deepseek_v2.py:109`), before the latent is cached. YaRN therefore adjusts 64 of the 576 cached values per token.
 
@@ -427,7 +435,9 @@ if rope_scaling.get("mscale_all_dim"):    # YaRN also sharpens the softmax
 
 The base scale is the usual $1/\sqrt{d}$ with $d = 192$, and the YaRN factor multiplies it by $m^2$. The doc gives the number: about 1.59 at V2-Lite's factor of 40. This `scaling` is what `MLAAttention` passes to its backend as the softmax scale, so every attention call in lessons 1 and 2 uses it, including the `mla_decode` path.
 
-The exact `mscale` and `mscale_all_dim` values are checkpoint config fields, in the model's `config.json`; I have not loaded V2-Lite's config in this session, so the two numbers above are the design doc's, marked as such.
+That last case is worth a second look. In latent space the query is 576 wide, yet the scale stays $m^2/\sqrt{192}$ rather than being recomputed from 576. It must: $(W_k^{\top} q_{nope}) \cdot c + q_{pe} \cdot k_{pe}$ is the same number as the original 192-dim $q \cdot k$, so it takes the same scale.
+
+The numbers come from V2-Lite's `config.json`: `factor` 40, `mscale` and `mscale_all_dim` both 0.707. The ratio in the cos/sin tables is therefore 1, and $m = 1 + 0.1 \cdot 0.707 \cdot \ln 40 \approx 1.261$, so $m^2 \approx 1.59$.
 
 ### Verified vs. not yet run
 
@@ -449,13 +459,13 @@ if mla and mode in FULL_MODES and not full_safe:
 return mode
 ```
 
-The second flag is newer than the design doc. `supports_full_cudagraph_mla_decode` (`lean_vllm/attention/abstract.py:38-41`, default true) is false when an `mla_decode` bakes per-step state a replay cannot refresh. FlashMLA answers true (`lean_vllm/attention/flashmla_backend.py:31-38`): the current build computes its tile schedule and split-KV workspace inside the kernel from `context_lens`, so the capture runs with worst-case lengths and each replay re-gates the KV loop on the tensors it refreshes. No backend currently answers false; the flag exists for builds where that schedule was computed outside the kernel, as the comments describe.
+The second flag is the finer switch. `supports_full_cudagraph_mla_decode` (`lean_vllm/attention/abstract.py:38-41`, default true) is false when an `mla_decode` bakes per-step state a replay cannot refresh. FlashMLA answers true (`lean_vllm/attention/flashmla_backend.py:31-38`): the current build computes its tile schedule and split-KV workspace inside the kernel from `context_lens`, so the capture runs with worst-case lengths and each replay re-gates the KV loop on the tensors it refreshes. No backend currently answers false; the flag exists for builds where that schedule was computed outside the kernel, as the comments describe.
 
 One inconsistency to know about: `_cudagraph_mode`'s own docstring still says FlashMLA falls back to piecewise because a baked schedule cannot refresh. The backend's flag says otherwise, and the code follows the flag. Treat the docstring as stale.
 
 ### Which steps replay where
 
-`_step_kind` (`lean_vllm/engine/model_runner.py:241`) picks per step. A full graph serves only pure decode, when `not is_prefill` and the batch fits a captured size. A piecewise graph serves any step whose token count lands in a bucket. Everything else runs eager, recorded as "prefill" or "oversized". Lesson 2's rule that a one-token prefill is still a prefill matters here: it keeps such rows off the full-graph path, whose captured attention assumes decode.
+`_step_kind` (`lean_vllm/engine/model_runner.py:241`) picks per step. A full graph serves only pure decode, when `not is_prefill` and the batch fits a captured size. A piecewise graph serves any step whose token count lands in a bucket, 64 to 512 tokens. Everything else runs eager, recorded as "prefill" or "oversized"; that includes small prefill and mixed steps under 64 tokens, which fall below the smallest bucket. Lesson 2's rule that a one-token prefill is still a prefill matters here: it keeps such rows off the full-graph path, whose captured attention assumes decode.
 
 ### The full graph: attention inside the replay
 
@@ -483,10 +493,10 @@ buffers["attn_out"][:num_tokens] = attn_out
 post.replay()
 ```
 
-Because attention is eager, all of lesson 2 applies unchanged, chunked context and mixed steps included. Because the MoE sits inside `post_attention`, this mode is what pushed lesson 3's design: block counts from shapes, the surviving-row count kept on the device, the early return inside the kernel. Nothing the MoE runs reads a tensor's contents on the host.
+Because attention is eager, all of lesson 2 applies unchanged, chunked context and mixed steps included. The MoE sits inside `post_attention`, which both graph modes capture: the full graph records it with the rest of the model, and piecewise records it as the `post` piece. That is what pushed lesson 3's design: block counts from shapes, the surviving-row count kept on the device, the early return inside the kernel. Nothing the MoE runs reads a tensor's contents on the host.
 
-One thing the eager call bypasses: it goes to `MLAAttention.attn` directly, not through `torch.ops.lean_vllm.mla_attention`. The op still exists in the model's plain forward path (`lean_vllm/layers/attention.py:228-229`), with a comment saying it exists so `torch.compile` splits a graph around attention for piecewise capture (`:86`). The runner never compiles the model, and its piecewise capture is manual. That comment is stale as well, and lesson 1's plumbing note has been corrected accordingly.
+The eager call still goes through the custom op: `layer.self_attn.attn(...)` calls the `MLAAttention` module, whose `forward` is `torch.ops.lean_vllm.mla_attention` (`lean_vllm/layers/attention.py:228-229`). What is stale is the reason given for the op (`:86`): that it exists so `torch.compile` splits the graph around attention for piecewise capture. The runner never compiles the whole model, and its piecewise capture is manual, so that split never happens here.
 
 ### Verified vs. not yet run
 
-Nothing in this lesson has run on a GPU: per the design doc both graph modes await a Hopper, and FlashMLA's full-graph safety argument is intent, not measurement. What is regression-checked on the torch backend is the eager path those modes fall back from, the mixed-row partition of lesson 2 included. When reading this subsystem, trust the code over three stale texts: `_cudagraph_mode`'s docstring, the custom op's `torch.compile` comment, and the design doc's account of the runner dropping full graphs, which predates the finer `supports_full_cudagraph_mla_decode` flag.
+Both graph modes have run on an H100: the 20 September benchmark (`docs/benchmark-2026-09-20.md`) served V2-Lite in `full_and_piecewise` mode with FlashMLA decode inside the full graph, and no step ran as eager decode. That run measured speed, not numerical agreement with the torch reference. What is regression-checked on the torch backend is the eager path those modes fall back from, the mixed-row partition of lesson 2 included. When reading this subsystem, trust the code over two stale comments: `_cudagraph_mode`'s docstring and the custom op's `torch.compile` reason.
