@@ -261,7 +261,7 @@ class MLAAttention(Attention):
             q, k, self._pad(v), cu_seqlens_q, cu_seqlens_q, max_seqlen_q, max_seqlen_q, causal=True,
         )
         del k, v
-        latents = rearrange(cache, "b p d -> (b p) d")
+        latents = cache.view(-1, self.latent_dim)
         for chunk in context_chunks(context, cache.size(1), self.max_context_chunk):
             k, v = self.expand(latents[chunk.slots])
             rows = chunk.queries
@@ -278,11 +278,16 @@ class MLAAttention(Attention):
 
         q . W_k c = W_k^T q . c moves the query into latent space; W_v applies after, as attention is linear in values.
         """
-        w_k, w_v = self.latent_projections()
-        q_nope, q_pe = q.split([w_k.size(1), self.head_dim - w_k.size(1)], dim=-1)
-        q = torch.cat([torch.einsum("bhn,hnl->bhl", q_nope, w_k), q_pe], dim=-1)
-        o = self.backend.mla_decode(q, self.latent_cache, w_k.size(2), context)
-        return torch.einsum("bhl,hvl->bhv", o, w_v)
+        W_UK_T, W_UV = self.latent_projections()
+        N, P, L = W_UK_T.shape
+        q_nope, q_pe = q.split([P, self.head_dim - P], dim=-1)
+        # Multiply (N, B, P) x (N, P, L) -> (N, B, L), then back to (B, N, L)
+        ql_nope = torch.bmm(q_nope.transpose(0, 1), W_UK_T).transpose(0, 1)
+        o = self.backend.mla_decode(torch.cat([ql_nope, q_pe], dim=-1), self.latent_cache, L, context)
+        # Multiply + Transpose (N, B, L) x (N, L, V) -> (N, B, V) -> (B, N, V)
+        out = o.new_empty(o.size(0), N, self.v_head_dim)
+        torch.bmm(o.transpose(0, 1), W_UV, out=out.transpose(0, 1))
+        return out
 
     def _pad(self, v: torch.Tensor) -> torch.Tensor:
         # Backends take one head size, so values pad up to the keys' and are cut back after.

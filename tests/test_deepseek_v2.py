@@ -3,7 +3,6 @@
 Paged steps go through the runner's real batch preparation, so mixed batches are compared too.
 """
 
-from einops import rearrange
 import pytest
 import torch
 import torch.distributed as dist
@@ -219,13 +218,12 @@ def unsplit(layer, positions, hidden_states, residual, attend):
         q = attn.q_proj(hidden_states)
     else:
         q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hidden_states)))
-    q = rearrange(q, "n (h d) -> n h d", h=attn.num_heads)
-    q_nope, q_pe = q.split([attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1)
+    q = q.view(-1, attn.num_heads, attn.qk_head_dim)
     kv_c, k_pe = attn.kv_a_proj_with_mqa(hidden_states).split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
-    kv_c = attn.kv_a_layernorm(kv_c)
-    q_pe, k_pe = attn.rotary_emb(positions, q_pe, rearrange(k_pe, "n d -> n 1 d"))
-    o = attend(torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, rearrange(k_pe, "n 1 d -> n d")], dim=-1))
-    hidden_states = attn.o_proj(rearrange(o, "n h d -> n (h d)"))
+    kv_c_normed = attn.kv_a_layernorm(kv_c)
+    q[..., attn.qk_nope_head_dim:], k_pe = attn.rotary_emb(positions, q[..., attn.qk_nope_head_dim:], k_pe.unsqueeze(1))
+    o = attend(q, torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1))
+    hidden_states = attn.o_proj(o.view(-1, attn.num_heads * attn.v_head_dim))
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
     return layer.mlp(hidden_states), residual
 

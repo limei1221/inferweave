@@ -1,4 +1,3 @@
-from einops import rearrange, reduce, repeat
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -74,17 +73,22 @@ class DeepseekV2Attention(nn.Module):
 
     def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Keys and values, [n, heads, dim] each, from cached latents [n, kv_lora_rank + qk_rope_head_dim]."""
-        kv_c, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv = rearrange(self.kv_b_proj(kv_c), "n (h d) -> n h d", h=self.num_heads)
-        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.cat([k_nope, repeat(k_pe, "n d -> n h d", h=self.num_heads)], dim=-1)
+        kv_c_normed, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_nope = self.kv_b_proj(kv_c_normed).view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k = k_nope.new_empty((*k_nope.shape[:-1], self.qk_head_dim))
+        k[..., :self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim:] = k_pe.unsqueeze(1)    # broadcast the shared rope key to every head
         return k, v
 
     def latent_projections(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """kv_b_proj per head: key [heads, qk_nope_head_dim, kv_lora_rank] and value [heads, v_head_dim, kv_lora_rank]."""
-        weight = rearrange(self.kv_b_proj.weight, "(h d) r -> h d r", h=self.num_heads)
-        w_k, w_v = weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
-        return w_k, w_v
+        """kv_b_proj per head: W_UK_T [heads, qk_nope_head_dim, kv_lora_rank] and W_UV [heads, kv_lora_rank, v_head_dim]."""
+        kv_b_proj_weight = self.kv_b_proj.weight.T.view(
+            self.kv_lora_rank, self.num_heads, self.qk_nope_head_dim + self.v_head_dim,
+        )
+        W_UK, W_UV = kv_b_proj_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # (L, N, P) -> (N, P, L) and (L, N, V) -> (N, L, V)
+        return W_UK.permute(1, 2, 0), W_UV.transpose(0, 1)
 
     def project(
         self,
@@ -96,17 +100,17 @@ class DeepseekV2Attention(nn.Module):
             q = self.q_proj(hidden_states)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = rearrange(q, "n (h d) -> n h d", h=self.num_heads)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c = self.kv_a_layernorm(kv_c)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, rearrange(k_pe, "n d -> n 1 d"))
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        k_pe = k_pe.unsqueeze(1)    # add head dim of 1
+        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(positions, q[..., self.qk_nope_head_dim:], k_pe)
         # The latent is cached normalized and with rope applied, so a read needs only kv_b_proj.
-        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, rearrange(k_pe, "n 1 d -> n d")], dim=-1)
+        return q, torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1)
 
     def combine(self, o: torch.Tensor) -> torch.Tensor:
         """From attention's output back to the residual stream."""
-        return self.o_proj(rearrange(o, "n h d -> n (h d)"))
+        return self.o_proj(o.view(-1, self.num_heads * self.v_head_dim))
 
 
 class DeepseekV2MoE(nn.Module):
@@ -140,13 +144,19 @@ class DeepseekV2MoE(nn.Module):
         # scores: [N, config.n_routed_experts]
         if self.topk_method == "group_limited_greedy":
             # Only experts in the topk_group best groups stay eligible.
-            groups = reduce(scores, "n (g e) -> n g", "max", g=self.num_group)
-            kept = torch.zeros_like(groups, dtype=torch.bool).scatter_(1, groups.topk(self.topk_group, dim=-1).indices, True)
-            scores = scores.masked_fill(~repeat(kept, "n g -> n (g e)", e=scores.size(-1) // self.num_group), 0.0)
-        topk_weights, topk_ids = scores.topk(self.top_k, dim=-1, sorted=False)
-        if self.top_k > 1 and self.norm_topk_prob:
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-        else:
+            num_token = scores.size(0)
+            group_scores = scores.view(num_token, self.num_group, -1).max(dim=-1).values    # [N, n_group]
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]    # [N, topk_group]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_idx, 1)
+            score_mask = (group_mask.unsqueeze(-1)
+                          .expand(num_token, self.num_group, scores.size(-1) // self.num_group)
+                          .reshape(num_token, -1))    # [N, n_routed_experts]
+            scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+        topk_weights, topk_ids = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if self.routed_scaling_factor != 1.0:
             topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights, topk_ids
 

@@ -27,10 +27,10 @@ The 576 splits into two parts:
 
 ### Where the latent is produced
 
-`DeepseekV2Attention` (`lean_vllm/models/deepseek_v2.py:17`) owns the projections:
+`DeepseekV2Attention` (`lean_vllm/models/deepseek_v2.py:16`) owns the projections:
 
 ```python
-# lean_vllm/models/deepseek_v2.py:43-49
+# lean_vllm/models/deepseek_v2.py:42-48
 self.kv_a_proj_with_mqa = ReplicatedLinear(hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias)
 self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 self.kv_b_proj = ColumnParallelLinear(
@@ -43,15 +43,17 @@ self.kv_b_proj = ColumnParallelLinear(
 - `kv_a_proj_with_mqa` (the "a" projections) is the *down* projection: hidden state to the latent, 512 + 64 wide.
 - `kv_b_proj` (the "b" projection) is the *up* projection: latent back out to per-head keys and values. It runs only when reading, never before caching. That choice is what makes the cache small.
 
-The per-step production happens in `project()` (`lean_vllm/models/deepseek_v2.py:89`). It returns exactly two tensors: the query and the latent to cache. The lines that matter:
+The per-step production happens in `project()` (`lean_vllm/models/deepseek_v2.py:93`). It returns exactly two tensors: the query and the latent to cache. The lines that matter:
 
 ```python
-# lean_vllm/models/deepseek_v2.py:101-105
+# lean_vllm/models/deepseek_v2.py:104-109
+q = q.view(-1, self.num_heads, self.qk_head_dim)
 kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states).split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-kv_c = self.kv_a_layernorm(kv_c)
-q_pe, k_pe = self.rotary_emb(positions, q_pe, rearrange(k_pe, "n d -> n 1 d"))
+kv_c_normed = self.kv_a_layernorm(kv_c)
+k_pe = k_pe.unsqueeze(1)    # add head dim of 1
+q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(positions, q[..., self.qk_nope_head_dim:], k_pe)
 # The latent is cached normalized and with rope applied, so a read needs only kv_b_proj.
-return torch.cat([q_nope, q_pe], dim=-1), torch.cat([kv_c, rearrange(k_pe, "n 1 d -> n d")], dim=-1)
+return q, torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1)
 ```
 
 Two facts to hold on to:
@@ -59,7 +61,7 @@ Two facts to hold on to:
 1. The compressed part is normalized before caching (`kv_a_layernorm`), so the cached latent is the final form. Nothing downstream re-normalizes.
 2. RoPE is applied to the 64-dim key part before caching. The cache therefore holds `norm(W_DV h)` concatenated with `rope(k_pe)`.
 
-A detail from the same method: the query is also split into a nope part (128 dims per head for V2-Lite) and a rope part (64 dims); only the rope part is rotated. V2-Lite does not compress the query. `q_lora_rank` is `None`, so `q_proj` goes straight from hidden state to heads (`lean_vllm/models/deepseek_v2.py:37-38`). The code keeps a second branch with `q_a_proj`/`q_b_proj` for checkpoints that do compress the query.
+A detail from the same method: the query is also split into a nope part (128 dims per head for V2-Lite) and a rope part (64 dims); only the rope part is rotated. V2-Lite does not compress the query. `q_lora_rank` is `None`, so `q_proj` goes straight from hidden state to heads (`lean_vllm/models/deepseek_v2.py:36-37`). The code keeps a second branch with `q_a_proj`/`q_b_proj` for checkpoints that do compress the query.
 
 ### Where the cache lives and what shape it has
 
@@ -86,31 +88,33 @@ That is the whole write path: one 576-wide row per token per layer.
 
 ### Reading the cache back: expansion
 
-When attention needs actual keys and values, they are regenerated from the latents by `expand()` (`lean_vllm/models/deepseek_v2.py:75`), passed into `MLAAttention` as a callable at construction (`lean_vllm/models/deepseek_v2.py:65-73`):
+When attention needs actual keys and values, they are regenerated from the latents by `expand()` (`lean_vllm/models/deepseek_v2.py:74`), passed into `MLAAttention` as a callable at construction (`lean_vllm/models/deepseek_v2.py:64-72`):
 
 ```python
-# lean_vllm/models/deepseek_v2.py:75-81
+# lean_vllm/models/deepseek_v2.py:74-82
 def expand(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    kv_c, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-    kv = rearrange(self.kv_b_proj(kv_c), "n (h d) -> n h d", h=self.num_heads)
-    k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    k = torch.cat([k_nope, repeat(k_pe, "n d -> n h d", h=self.num_heads)], dim=-1)
+    kv_c_normed, k_pe = latent.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    kv_nope = self.kv_b_proj(kv_c_normed).view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+    k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+    k = k_nope.new_empty((*k_nope.shape[:-1], self.qk_head_dim))
+    k[..., :self.qk_nope_head_dim] = k_nope
+    k[..., self.qk_nope_head_dim:] = k_pe.unsqueeze(1)    # broadcast the shared rope key to every head
     return k, v
 ```
 
-Note the asymmetry: the 512-dim compressed part goes through `kv_b_proj` to become per-head nope-key and value, while the 64-dim rope part is repeated across the heads, because it is already final. Keys are `[nope | rope]` = 192 dims, values are 128 dims.
+Note the asymmetry: the 512-dim compressed part goes through `kv_b_proj` to become per-head nope-key and value, while the 64-dim rope part is broadcast across the heads, because it is already final. Keys are `[nope | rope]` = 192 dims, values are 128 dims.
 
-One subtlety, verified in `_pad()` (`lean_vllm/layers/attention.py:287`): values are zero-padded from 128 to 192 so the backend sees a single head size. The padding leaves the scores alone, and since the output is a weighted sum of values, zero value lanes give zero output lanes, which are then cut off (`o[..., :self.v_head_dim]` in `_prefill`, `lean_vllm/layers/attention.py:257` and `:274`).
+One subtlety, verified in `_pad()` (`lean_vllm/layers/attention.py:292`): values are zero-padded from 128 to 192 so the backend sees a single head size. The padding leaves the scores alone, and since the output is a weighted sum of values, zero value lanes give zero output lanes, which are then cut off (`o[..., :self.v_head_dim]` in `_prefill`, `lean_vllm/layers/attention.py:257` and `:274`).
 
 ### How the pieces interact
 
 The data flow across the two files:
 
 ```text
-DeepseekV2DecoderLayer.pre_attention            (models/deepseek_v2.py:178)
-  └─ DeepseekV2Attention.project                (models/deepseek_v2.py:89)
+DeepseekV2DecoderLayer.pre_attention            (models/deepseek_v2.py:188)
+  └─ DeepseekV2Attention.project                (models/deepseek_v2.py:93)
        returns (query, latent), the latent already normalized and rope-applied
-DeepseekV2DecoderLayer.forward                  (models/deepseek_v2.py:201)
+DeepseekV2DecoderLayer.forward                  (models/deepseek_v2.py:211)
   └─ MLAAttention(q, latent)                    via torch.ops.lean_vllm.mla_attention
        └─ attend                                (layers/attention.py:231)
             ├─ store_latents into the paged latent cache
@@ -226,15 +230,18 @@ $$q_{nope} \cdot (W_k c) = (W_k^{\top} q_{nope}) \cdot c$$
 So the query's nope part is projected by the key half of `kv_b_proj`, concatenated back onto the untouched rope part, and attention then runs against the raw cached latents as one key head shared by all query heads:
 
 ```python
-# lean_vllm/layers/attention.py:276-285, abridged
-w_k, w_v = self.latent_projections()
-q_nope, q_pe = q.split([w_k.size(1), self.head_dim - w_k.size(1)], dim=-1)
-q = torch.cat([torch.einsum("bhn,hnl->bhl", q_nope, w_k), q_pe], dim=-1)
-o = self.backend.mla_decode(q, self.latent_cache, w_k.size(2), context)
-return torch.einsum("bhl,hvl->bhv", o, w_v)
+# lean_vllm/layers/attention.py:276-290, abridged
+W_UK_T, W_UV = self.latent_projections()
+N, P, L = W_UK_T.shape
+q_nope, q_pe = q.split([P, self.head_dim - P], dim=-1)
+ql_nope = torch.bmm(q_nope.transpose(0, 1), W_UK_T).transpose(0, 1)
+o = self.backend.mla_decode(torch.cat([ql_nope, q_pe], dim=-1), self.latent_cache, L, context)
+out = o.new_empty(o.size(0), N, self.v_head_dim)
+torch.bmm(o.transpose(0, 1), W_UV, out=out.transpose(0, 1))
+return out
 ```
 
-`latent_projections` (`lean_vllm/models/deepseek_v2.py:83`) hands over `kv_b_proj`'s weight reshaped per head, split into its key rows `w_k` and value rows `w_v`. Two facts complete the picture:
+`latent_projections` (`lean_vllm/models/deepseek_v2.py:84`) hands over `kv_b_proj`'s weight reshaped per head, split into its key half `W_UK_T` `[heads, qk_nope_head_dim, kv_lora_rank]` and value half `W_UV` `[heads, kv_lora_rank, v_head_dim]`, laid out as vLLM stores them for `torch.bmm`. Two facts complete the picture:
 
 - The values are the first $kv\_lora\_rank$ entries of each latent, per the backend contract (`lean_vllm/attention/abstract.py:113`). The latent was built as `norm(kv_c)` concatenated with `rope(k_pe)`, and the first 512 entries are the compressed KV, so they are the right values.
 - Attention is linear in the values, so applying $W_v$ after the weighted sum equals applying it before. The output is `[batch, heads, v_head_dim]`, the same shape the expanded path returns after cutting the padding.
@@ -282,21 +289,21 @@ One concept this lesson: how a token crosses the routed MoE layer. The router pi
 
 ### Where the MoE sits in the model
 
-`DeepseekV2DecoderLayer.__init__` (`lean_vllm/models/deepseek_v2.py:169`) picks the layer's MLP once, at build time:
+`DeepseekV2DecoderLayer.__init__` (`lean_vllm/models/deepseek_v2.py:179`) picks the layer's MLP once, at build time:
 
 ```python
-# lean_vllm/models/deepseek_v2.py:169-170
+# lean_vllm/models/deepseek_v2.py:179-180
 is_moe = (config.n_routed_experts is not None and layer_idx >= config.first_k_dense_replace
           and layer_idx % (getattr(config, "moe_layer_freq", None) or 1) == 0)
 ```
 
 The first `first_k_dense_replace` layers use the dense MLP; the rest switch. So "MoE model" really means "MoE from some layer onward".
 
-`DeepseekV2MoE` (`lean_vllm/models/deepseek_v2.py:112`) holds three pieces:
+`DeepseekV2MoE` (`lean_vllm/models/deepseek_v2.py:116`) holds three pieces:
 
-- `gate` (`:127`), a replicated linear from `hidden_size` to `n_routed_experts`: the router.
-- `experts` (`:128`), a `FusedMoE`: all routed experts in one module, this lesson's main subject.
-- `shared_experts` (`:129-135`), a plain dense MLP (`DeepseekV2MLP`, aliased at `lean_vllm/models/deepseek_v2.py:14` to `Qwen3MLP` from `lean_vllm/models/qwen3.py:94`). Shared experts always run for every token, outside the routing, and their output is added at the end (`lean_vllm/models/deepseek_v2.py:153-157`).
+- `gate` (`:131`), a replicated linear from `hidden_size` to `n_routed_experts`: the router.
+- `experts` (`:132`), a `FusedMoE`: all routed experts in one module, this lesson's main subject.
+- `shared_experts` (`:133-139`), a plain dense MLP (`DeepseekV2MLP`, aliased at `lean_vllm/models/deepseek_v2.py:13` to `Qwen3MLP` from `lean_vllm/models/qwen3.py:94`). Shared experts always run for every token, outside the routing, and their output is added at the end (`lean_vllm/models/deepseek_v2.py:163-167`).
 
 So a token's feed-forward cost is `top_k` routed experts plus the shared expert, regardless of how many experts exist. The parameter cost is where all $E$ experts are paid.
 
@@ -314,14 +321,14 @@ The loader (`lean_vllm/layers/moe.py:37`) maps each checkpoint weight `experts.{
 
 ### Routing
 
-`route()` (`lean_vllm/models/deepseek_v2.py:137`) turns the hidden state into $k$ expert ids and $k$ weights. Three steps, matching the original V2 code:
+`route()` (`lean_vllm/models/deepseek_v2.py:141`) turns the hidden state into $k$ expert ids and $k$ weights. Three steps, matching the original V2 code:
 
 1. Scores, in float32 for stability:
 
 $$p = \mathrm{softmax}(W_g\, x), \qquad p \in \mathbb{R}^{E}$$
 
-2. Selection. `greedy` is a plain top-$k$ over $p$. `group_limited_greedy` first marks the `topk_group` best groups (group score = max score in the group) as eligible and zeroes the rest (`lean_vllm/models/deepseek_v2.py:141-145`), then takes top-$k$ among the survivors. The two asserts at `:119-120` are the whole config surface this layer supports: softmax scoring and one of those two methods.
-3. Weighting (`:147-150`): with `norm_topk_prob` and $k > 1$, the $k$ weights are renormalized to sum to one; otherwise they are multiplied by `routed_scaling_factor`. An epsilon of 1e-20 guards the division.
+2. Selection. `greedy` is a plain top-$k$ over $p$. `group_limited_greedy` first marks the `topk_group` best groups (group score = max score in the group) as eligible and masks the rest to $-\infty$ (`lean_vllm/models/deepseek_v2.py:145-153`), then takes top-$k$ among the survivors. The two asserts at `:123-124` are the whole config surface this layer supports: softmax scoring and one of those two methods.
+3. Weighting (`:155-158`): with `norm_topk_prob`, the $k$ weights are renormalized to sum to one; then, if `routed_scaling_factor` is not 1, they are multiplied by it. This follows vLLM's `grouped_topk`; for V2 and V2-Lite, where `norm_topk_prob` is false, it matches the HF reference.
 
 The doc's test suite runs one config with each method, so both branches are covered (`docs/deepseek-v2.md`, "Testing").
 
@@ -368,7 +375,7 @@ Two launches, one either side of the activation (`lean_vllm/layers/fused_moe.py:
 
 ### How the pieces interact
 
-The layer's `forward` (`lean_vllm/models/deepseek_v2.py:153`) ties it together: `route` produces the picks, `FusedMoE.forward` (`lean_vllm/layers/moe.py:58`) consumes them on whichever path is active, and the shared experts add their output on top. Since `route` runs inside `post_attention` (`lean_vllm/models/deepseek_v2.py:191`), the whole MoE sits in the capturable part of the layer, which is why both paths above avoid every host-side read of a tensor's contents.
+The layer's `forward` (`lean_vllm/models/deepseek_v2.py:163`) ties it together: `route` produces the picks, `FusedMoE.forward` (`lean_vllm/layers/moe.py:58`) consumes them on whichever path is active, and the shared experts add their output on top. Since `route` runs inside `post_attention` (`lean_vllm/models/deepseek_v2.py:201`), the whole MoE sits in the capturable part of the layer, which is why both paths above avoid every host-side read of a tensor's contents.
 
 ### Verified vs. not yet run
 
@@ -402,13 +409,13 @@ so `ramp` is 1 for the slow pairs (divided by the factor, i.e. interpolated) and
 
 ### The pairing: GPT-J style
 
-`apply_rotary_emb` (`lean_vllm/layers/rotary_embedding.py:8`) has two layouts. NeoX style rotates the first half against the second half of the vector; GPT-J style rotates adjacent elements, `x[..., ::2]` against `x[..., 1::2]`, which is what DeepSeek's checkpoints use. `DeepseekV2Attention` therefore builds the rope with `is_neox_style=False` (`lean_vllm/models/deepseek_v2.py:58`). Both layouts use the same cos/sin table; they differ only in which elements are paired, so the flag has to match the checkpoint, or every rotation lands on the wrong pairs.
+`apply_rotary_emb` (`lean_vllm/layers/rotary_embedding.py:8`) has two layouts. NeoX style rotates the first half against the second half of the vector; GPT-J style rotates adjacent elements, `x[..., ::2]` against `x[..., 1::2]`, which is what DeepSeek's checkpoints use. `DeepseekV2Attention` therefore builds the rope with `is_neox_style=False` (`lean_vllm/models/deepseek_v2.py:57`). Both layouts use the same cos/sin table; they differ only in which elements are paired, so the flag has to match the checkpoint, or every rotation lands on the wrong pairs.
 
 ### The cache
 
 `RotaryEmbedding` (`lean_vllm/layers/rotary_embedding.py:50`) precomputes, once at construction: the outer product of positions $0 \dots L_{max}$ with the adjusted frequencies, then `cos` and `sin` tables from it. Its `forward` (`lean_vllm/layers/rotary_embedding.py:84`, under `@torch.compile`) gathers a row per position from the cache and rotates the query and key through `apply_rotary_emb`. `get_rope` (`lean_vllm/layers/rotary_embedding.py:97`) memoizes the instance with `lru_cache(1)`, so every layer shares one table and a different config replaces it; a dict cannot key the cache, so its sorted items do.
 
-In this model the rope's `rotary_dim` is `qk_rope_head_dim` = 64, not the full 192-dim head (`lean_vllm/models/deepseek_v2.py:54`). You know from lesson 1 why: only the shared rope key carries positions, and only that slice is rotated, in `project()` (`lean_vllm/models/deepseek_v2.py:103`), before the latent is cached. YaRN therefore adjusts 64 of the 576 cached values per token.
+In this model the rope's `rotary_dim` is `qk_rope_head_dim` = 64, not the full 192-dim head (`lean_vllm/models/deepseek_v2.py:54`). You know from lesson 1 why: only the shared rope key carries positions, and only that slice is rotated, in `project()` (`lean_vllm/models/deepseek_v2.py:107`), before the latent is cached. YaRN therefore adjusts 64 of the 576 cached values per token.
 
 ### mscale, twice
 
@@ -426,7 +433,7 @@ The two touchpoints:
 2. The softmax scale, in the attention layer:
 
 ```python
-# lean_vllm/models/deepseek_v2.py:61-64
+# lean_vllm/models/deepseek_v2.py:60-63
 scaling = self.qk_head_dim ** -0.5
 if rope_scaling.get("mscale_all_dim"):    # YaRN also sharpens the softmax
     mscale = yarn_get_mscale(rope_scaling["factor"], rope_scaling["mscale_all_dim"])
@@ -449,7 +456,7 @@ One concept this lesson: the same model runs in three modes, chosen per step, an
 
 ### Choosing the mode
 
-At startup (`lean_vllm/engine/model_runner.py:47-50`) the runner forces eager when any of these hold: `enforce_eager` is configured, the device is not CUDA, the backend answers `supports_cuda_graph()` false (the torch reference does, `lean_vllm/attention/torch_backend.py:21-22`), or the model class does. `DeepseekV2ForCausalLM` answers true (`lean_vllm/models/deepseek_v2.py:236`). Otherwise the configured mode stands: `none`, `full`, `piecewise`, or `full_and_piecewise`, the default (`lean_vllm/config.py:13-15`, `:29`), after one MLA-specific filter, `_cudagraph_mode` (`lean_vllm/engine/model_runner.py:232`):
+At startup (`lean_vllm/engine/model_runner.py:47-50`) the runner forces eager when any of these hold: `enforce_eager` is configured, the device is not CUDA, the backend answers `supports_cuda_graph()` false (the torch reference does, `lean_vllm/attention/torch_backend.py:21-22`), or the model class does. `DeepseekV2ForCausalLM` answers true (`lean_vllm/models/deepseek_v2.py:246`). Otherwise the configured mode stands: `none`, `full`, `piecewise`, or `full_and_piecewise`, the default (`lean_vllm/config.py:13-15`, `:29`), after one MLA-specific filter, `_cudagraph_mode` (`lean_vllm/engine/model_runner.py:232`):
 
 ```python
 # lean_vllm/engine/model_runner.py:236-239, abridged

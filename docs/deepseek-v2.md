@@ -107,9 +107,9 @@ same way.
 `FusedMoE` (`layers/moe.py`) stacks the routed experts into one `gate_up_proj`
 of shape `[E, 2I, H]` and one `down_proj` of shape `[E, H, I]`. The loader maps
 each checkpoint weight `experts.{e}.{proj}.weight` into its expert's row.
-Routing follows the original V2 code: softmax scores, `greedy` or
-`group_limited_greedy` selection, then either `routed_scaling_factor` or
-`norm_topk_prob`. Tensor parallelism shards each expert's intermediate size.
+Routing follows vLLM's `grouped_topk`: softmax scores, `greedy` or
+`group_limited_greedy` selection, then `norm_topk_prob` renormalization and
+`routed_scaling_factor`. Tensor parallelism shards each expert's intermediate size.
 Shared experts reuse the dense gated MLP.
 
 Two paths run the experts, and both sort the token-expert pairs by expert with
