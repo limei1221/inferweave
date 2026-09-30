@@ -59,7 +59,8 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
 
-        dist.init_process_group(dev.dist_backend(self.device), "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group(
+            dev.dist_backend(self.device), f"tcp://localhost:{config.dist_port}", world_size=self.world_size, rank=rank)
         if self.world_size > 1:
             # Calls go to the workers on the host, whatever device the default group runs on.
             self.call_group = dist.new_group(backend="gloo", timeout=CALL_TIMEOUT)
@@ -120,7 +121,26 @@ class ModelRunner:
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
         self.run(seqs)
+        self._dummy_sampler_run()
         dev.empty_cache(self.device)
+
+    @torch.inference_mode()
+    def _dummy_sampler_run(self):
+        """As vLLM does: a step samples up to one row per sequence, far more than the warmup prefill, so measure that too."""
+        num_rows = min(self.config.max_num_seqs, self.config.max_num_batched_tokens)
+        # Random, as vLLM's: dummy hidden states could hold values that break the sampler.
+        hidden_states = torch.rand(num_rows, self.config.hf_config.hidden_size)
+        with set_context(False):    # no logits_indices, so every row samples
+            logits = self.model.compute_logits(hidden_states)
+        if self.rank != 0:
+            return    # only rank 0 gathers logits and samples
+        try:
+            self.sampler(logits, torch.full((num_rows,), 0.5, dtype=torch.float32))    # non-greedy, the costlier path
+        except torch.OutOfMemoryError as error:
+            raise RuntimeError(
+                f"out of memory warming up the sampler with {num_rows} rows; "
+                "lower max_num_seqs or gpu_memory_utilization"
+            ) from error
 
     def allocate_kv_cache(self):
         config = self.config

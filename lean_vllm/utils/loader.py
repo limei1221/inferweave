@@ -16,13 +16,16 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    loaded: set[str] = set()
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
                 if expert := EXPERT_WEIGHT.fullmatch(weight_name):
                     prefix, expert_id, proj = expert.groups()
-                    param = model.get_parameter(f"{prefix}.{STACKED_EXPERT_PARAMS[proj]}")
+                    param_name = f"{prefix}.{STACKED_EXPERT_PARAMS[proj]}"
+                    param = model.get_parameter(param_name)
                     param.weight_loader(param, f.get_tensor(weight_name), (int(expert_id), proj))
+                    loaded.add(param_name)
                     continue
                 for k in packed_modules_mapping:
                     if k in weight_name:
@@ -31,8 +34,23 @@ def load_model(model: nn.Module, path: str):
                         param = model.get_parameter(param_name)
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        loaded.add(param_name)
                         break
                 else:
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+                    loaded.add(weight_name)
+    check_loaded(model, loaded, path)
+
+
+def check_loaded(model: nn.Module, loaded: set[str], path: str):
+    """A parameter no weight reached would run on uninitialized memory. A tied one shares a loaded one's storage."""
+    loaded_storage = {model.get_parameter(name).data_ptr() for name in loaded}
+    missing = [
+        name for name, param in model.named_parameters()
+        if name not in loaded and param.data_ptr() not in loaded_storage
+    ]
+    if missing:
+        shown = ", ".join(missing[:5]) + (", ..." if len(missing) > 5 else "")
+        raise ValueError(f"{path} has no weights for {len(missing)} parameters: {shown}")

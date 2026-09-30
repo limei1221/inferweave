@@ -32,7 +32,7 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
+        x = x.float() + residual.float()    # not add_, which would rewrite an fp32 x in place
         residual = x.to(orig_dtype, copy=True)    # or, in fp32, the mul_ below rewrites it
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))

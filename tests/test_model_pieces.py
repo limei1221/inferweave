@@ -1,6 +1,6 @@
 """The decoder layer either side of attention, which is what piecewise capture takes.
 
-bf16 throughout, as in the runner: in fp32 RMSNorm's in-place arithmetic rewrites its input.
+bf16 throughout, as in the runner.
 """
 
 from einops import rearrange
@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from transformers import Qwen3Config
 
+from lean_vllm.layers.layernorm import RMSNorm
 from lean_vllm.layers.rotary_embedding import RotaryEmbedding
 from lean_vllm.models.qwen3 import Qwen3DecoderLayer
 from lean_vllm.utils.context import reset_context
@@ -132,3 +133,11 @@ def test_a_yarn_config_reaches_the_rope(process_group):
 
     assert torch.equal(rope.cos_sin_cache, want.cos_sin_cache)
     assert not torch.equal(rope.cos_sin_cache, plain.cos_sin_cache)
+
+
+def test_rmsnorm_leaves_an_fp32_input_alone():
+    norm = RMSNorm(HIDDEN)
+    x, residual = torch.randn(TOKENS, HIDDEN), torch.randn(TOKENS, HIDDEN)
+    original = x.clone()
+    norm(x, residual)
+    assert torch.equal(x, original)

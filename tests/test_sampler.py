@@ -35,3 +35,15 @@ def test_a_peaked_distribution_still_samples_its_peak():
     x[:, 3] = 20.0
     tokens = Sampler()(x, torch.ones(2))
     assert torch.equal(tokens, torch.tensor([3, 3]))
+
+
+def test_a_new_batch_size_does_not_recompile():
+    """Warmup samples a couple of rows; serving any other count must not stall on a compile."""
+    from torch._dynamo.utils import counters
+    torch._dynamo.reset()    # forget the sizes earlier tests compiled
+    sampler = Sampler()
+    sampler(logits(batch=2), torch.ones(2))
+    before = counters["stats"]["unique_graphs"]
+    for batch in (3, 7):
+        sampler(logits(batch=batch), torch.ones(batch))
+    assert counters["stats"]["unique_graphs"] == before

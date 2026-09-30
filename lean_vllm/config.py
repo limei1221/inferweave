@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 from dataclasses import dataclass
 from transformers import AutoConfig
 
@@ -13,6 +14,12 @@ logger = logging.getLogger(__name__)
 FULL_MODES = ("full", "full_and_piecewise")
 PIECEWISE_MODES = ("piecewise", "full_and_piecewise")
 CUDAGRAPH_MODES = ("none",) + FULL_MODES + ("piecewise",)
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 @dataclass(slots=True)
@@ -39,6 +46,7 @@ class Config:
     max_waiting_requests: int = 0      # 0 is unlimited
     request_timeout: float = 0.0       # seconds a request may wait unscheduled; 0 is none
     long_prefill_token_threshold: int = 0    # per-step token cap for one prompt; 0 is none
+    dist_port: int = 0    # rendezvous port for the ranks; 0 picks a free one
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -51,6 +59,8 @@ class Config:
             # Ranks above zero never see the sampled tokens, so they could not follow.
             logger.warning("async_scheduling is off: tensor_parallel_size > 1 does not support it")
             self.async_scheduling = False
+        if not self.dist_port:    # resolved here, so spawned workers get the same one
+            self.dist_port = _free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "kv_lora_rank", None) is not None:    # an MLA model

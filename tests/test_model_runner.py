@@ -352,3 +352,40 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
     assert seq.finish_reason == "length"
     assert engine.is_finished()
     assert not engine.scheduler.block_manager.used_block_ids
+
+
+class TestDummySamplerRun:
+    """Warmup must reach the peak of sampling one row per sequence, as vLLM's profile run does."""
+
+    @pytest.fixture
+    def sampling_runner(self, runner):
+        from types import SimpleNamespace
+        runner.config = SimpleNamespace(
+            max_num_seqs=6, max_num_batched_tokens=1024, hf_config=SimpleNamespace(hidden_size=8))
+        runner.model = SimpleNamespace(compute_logits=lambda hidden: torch.zeros(hidden.size(0), 32))
+        runner.sampled = []
+        runner.sampler = lambda logits, temperatures: runner.sampled.append((logits.shape, temperatures))
+        return runner
+
+    def test_it_samples_one_row_per_sequence_off_the_greedy_path(self, sampling_runner):
+        sampling_runner._dummy_sampler_run()
+        (shape, temperatures), = sampling_runner.sampled
+        assert shape == (6, 32)
+        assert (temperatures > 0).all()
+
+    def test_a_token_budget_under_max_num_seqs_caps_the_rows(self, sampling_runner):
+        sampling_runner.config.max_num_batched_tokens = 4
+        sampling_runner._dummy_sampler_run()
+        assert sampling_runner.sampled[0][0] == (4, 32)
+
+    def test_only_rank_zero_samples(self, sampling_runner):
+        sampling_runner.rank = 1
+        sampling_runner._dummy_sampler_run()
+        assert sampling_runner.sampled == []
+
+    def test_running_out_of_memory_names_the_knobs(self, sampling_runner):
+        def oom(logits, temperatures):
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        sampling_runner.sampler = oom
+        with pytest.raises(RuntimeError, match="lower max_num_seqs or gpu_memory_utilization"):
+            sampling_runner._dummy_sampler_run()
