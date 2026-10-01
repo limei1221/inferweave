@@ -1,6 +1,5 @@
 """Backends checked against dense_attention, an independent oracle using no SDPA or paging."""
 
-from einops import rearrange, repeat
 import pytest
 import torch
 
@@ -263,10 +262,7 @@ def test_mla_decode(backend_cls):
     out = backend.mla_decode(q, cache, LATENT_V_DIM, context)
 
     expected = torch.cat([
-        rearrange(
-            dense_scores(q[i:i + 1], rearrange(latent, "l d -> l 1 d")).softmax(-1) @ latent[:, :LATENT_V_DIM].float(),
-            "h b d -> b h d",
-        )
+        (dense_scores(q[i:i + 1], latent.unsqueeze(1)).softmax(-1) @ latent[:, :LATENT_V_DIM].float()).transpose(0, 1)
         for i, latent in enumerate(latents)
     ]).to(dtype)
     tol = TOLERANCE[dtype]
@@ -286,7 +282,7 @@ def test_store_latents_skips_negative_slots(backend_cls):
     backend.store_latents(latent, cache, torch.tensor(
         [written[0], -1, written[1]], dtype=torch.int32, device=device))
 
-    flat = rearrange(cache, "b p d -> (b p) d")
+    flat = cache.flatten(0, 1)
     torch.testing.assert_close(flat[written[0]], latent[0], atol=0, rtol=0)
     torch.testing.assert_close(flat[written[1]], latent[2], atol=0, rtol=0)
     untouched = [i for i in range(2 * MLA_BLOCK_SIZE) if i not in written]
@@ -335,7 +331,7 @@ def test_store_kvcache_skips_negative_slots(backend, device, block_size, dtype):
     slot_mapping = torch.tensor([0, -1, 5], dtype=torch.int32, device=device)
     backend.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
-    flat_k = rearrange(k_cache, "b p h d -> (b p) h d")
+    flat_k = k_cache.flatten(0, 1)
     torch.testing.assert_close(flat_k[0], key[0])
     torch.testing.assert_close(flat_k[5], key[2])
     assert (flat_k[1:5] == 7.0).all(), "untouched slots were overwritten"
@@ -389,12 +385,12 @@ def test_top_left_causal_alignment_would_be_wrong(backend, device, block_size, d
     torch.testing.assert_close(out, dense_attention(q, k_full, v_full), atol=tol, rtol=tol)
 
     top_left = torch.nn.functional.scaled_dot_product_attention(
-        rearrange(q, "l h d -> 1 h l d"),
-        repeat(k_full, "l h d -> 1 (h r) l d", r=NUM_HEADS // NUM_KV_HEADS),
-        repeat(v_full, "l h d -> 1 (h r) l d", r=NUM_HEADS // NUM_KV_HEADS),
+        q.transpose(0, 1),
+        k_full.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1).transpose(0, 1),
+        v_full.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1).transpose(0, 1),
         is_causal=True, scale=SCALE,
     )
-    top_left = rearrange(top_left, "1 h l d -> l h d")
+    top_left = top_left.transpose(0, 1)
     # well clear of the noise floor the assert_close above already allows
     assert not torch.allclose(out, top_left, atol=5 * tol), \
         "top-left and bottom-right masks agree; test is not discriminating"
@@ -450,8 +446,8 @@ def test_low_precision_cache_roundtrip_is_exact(backend, device, block_size, dty
     backend.store_kvcache(key, value, k_cache, v_cache,
                           torch.tensor(slots, dtype=torch.int32, device=device))
 
-    torch.testing.assert_close(rearrange(k_cache, "b p h d -> (b p) h d")[slots], key, atol=0, rtol=0)
-    torch.testing.assert_close(rearrange(v_cache, "b p h d -> (b p) h d")[slots], value, atol=0, rtol=0)
+    torch.testing.assert_close(k_cache.flatten(0, 1)[slots], key, atol=0, rtol=0)
+    torch.testing.assert_close(v_cache.flatten(0, 1)[slots], value, atol=0, rtol=0)
 
 
 def _mixed_batch(device, block_size, dtype, num_cached, num_new, block_tables_list, num_blocks):

@@ -3,7 +3,6 @@
 bf16 throughout, as in the runner.
 """
 
-from einops import rearrange
 import pytest
 import torch
 import torch.distributed as dist
@@ -68,14 +67,14 @@ def reference(layer, positions, hidden_states, residual):
     attn = layer.self_attn
     qkv = attn.qkv_proj(hidden_states)
     q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-    q = rearrange(q, "n (h d) -> n h d", d=attn.head_dim)
-    k = rearrange(k, "n (h d) -> n h d", d=attn.head_dim)
-    v = rearrange(v, "n (h d) -> n h d", d=attn.head_dim)
+    q = q.view(-1, attn.num_heads, attn.head_dim)
+    k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+    v = v.view(-1, attn.num_kv_heads, attn.head_dim)
     if not attn.qkv_bias:
         q = attn.q_norm(q)
         k = attn.k_norm(k)
     q, k = attn.rotary_emb(positions, q, k)
-    hidden_states = attn.o_proj(rearrange(fake_attention(q, k, v), "n h d -> n (h d)"))
+    hidden_states = attn.o_proj(fake_attention(q, k, v).flatten(1))
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
     return layer.mlp(hidden_states), residual
 

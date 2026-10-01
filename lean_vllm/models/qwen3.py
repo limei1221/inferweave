@@ -1,4 +1,3 @@
-from einops import rearrange
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -78,17 +77,17 @@ class Qwen3Attention(nn.Module):
         """Up to attention: qkv, the per-head norms, and rope."""
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = rearrange(q, "n (h d) -> n h d", d=self.head_dim)
-        k = rearrange(k, "n (h d) -> n h d", d=self.head_dim)
-        v = rearrange(v, "n (h d) -> n h d", d=self.head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
         return self.rotary_emb(positions, q, k) + (v,)
 
-    def combine(self, o: torch.Tensor) -> torch.Tensor:
+    def combine(self, attn_output: torch.Tensor) -> torch.Tensor:
         """From attention's output back to the residual stream."""
-        return self.o_proj(rearrange(o, "n h d -> n (h d)"))
+        return self.o_proj(attn_output.flatten(1))
 
 
 class Qwen3MLP(nn.Module):

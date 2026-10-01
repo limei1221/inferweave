@@ -217,13 +217,15 @@ def unsplit(layer, positions, hidden_states, residual, attend):
     if attn.q_lora_rank is None:
         q = attn.q_proj(hidden_states)
     else:
-        q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hidden_states)))
-    q = q.view(-1, attn.num_heads, attn.qk_head_dim)
-    kv_c, k_pe = attn.kv_a_proj_with_mqa(hidden_states).split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
+        q_c = attn.q_a_layernorm(attn.q_a_proj(hidden_states))
+        q = attn.q_b_proj(q_c)
+    q = q.view(-1, attn.num_local_heads, attn.qk_head_dim)
+    kv_lora = attn.kv_a_proj_with_mqa(hidden_states)
+    kv_c, k_pe = kv_lora.split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
     kv_c_normed = attn.kv_a_layernorm(kv_c)
     q[..., attn.qk_nope_head_dim:], k_pe = attn.rotary_emb(positions, q[..., attn.qk_nope_head_dim:], k_pe.unsqueeze(1))
     o = attend(q, torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1))
-    hidden_states = attn.o_proj(o.view(-1, attn.num_heads * attn.v_head_dim))
+    hidden_states = attn.o_proj(o.view(-1, attn.num_local_heads * attn.v_head_dim))
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
     return layer.mlp(hidden_states), residual
 
@@ -258,7 +260,7 @@ def test_the_pieces_need_no_attention_context(models):
         q, latent, residual = layer.pre_attention(torch.arange(5), torch.randn(5, hidden_size), None)
         hidden_states, residual = layer.post_attention(attend(q, latent), residual)
 
-    assert q.shape == (5, attn.num_heads, attn.qk_head_dim)
+    assert q.shape == (5, attn.num_local_heads, attn.qk_head_dim)
     assert latent.shape == (5, attn.kv_lora_rank + attn.qk_rope_head_dim)
     assert hidden_states.shape == residual.shape == (5, hidden_size)
 
@@ -267,7 +269,7 @@ def test_forward_still_runs_the_pieces(models, monkeypatch):
     """forward is the composition, so the captured path cannot drift from it."""
     _, model = models
     layer, attend, hidden_size = pieces(model)
-    monkeypatch.setattr(layer.self_attn, "attn", attend)
+    monkeypatch.setattr(layer.self_attn, "mla_attn", attend)
     positions, hidden_states = torch.arange(5), torch.randn(5, hidden_size)
 
     with torch.inference_mode():

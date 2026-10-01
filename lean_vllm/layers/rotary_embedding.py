@@ -1,6 +1,5 @@
 import math
 from functools import lru_cache
-from einops import rearrange
 import torch
 from torch import nn
 
@@ -14,7 +13,7 @@ def apply_rotary_emb(
     if not is_neox_style:
         # GPT-J style: rotate adjacent pairs rather than the two halves.
         x1, x2 = x.float()[..., ::2], x.float()[..., 1::2]
-        return rearrange(torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1), "... d r -> ... (d r)").to(x.dtype)
+        return torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1).flatten(-2).to(x.dtype)
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin

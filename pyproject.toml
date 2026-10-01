@@ -12,7 +12,6 @@ readme = "README.md"
 description = "a lightweight vLLM implementation for prototyping inference techniques and benchmarking them against vLLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "einops",
     "safetensors",
     "tokenizers>=0.22",    # DecodeStream(ids=), for the fast detokenizer
     "torch>=2.10",    # F.grouped_mm, which the routed experts fall back on, is public from 2.10

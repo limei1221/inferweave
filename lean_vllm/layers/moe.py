@@ -1,4 +1,3 @@
-from einops import rearrange
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -21,14 +20,14 @@ def torch_experts(
 ) -> torch.Tensor:
     """The portable path: one row per token-expert pair, two grouped matrix multiplies, scatter back."""
     num_experts, top_k = gate_up_proj.size(0), topk_ids.size(1)
-    expert_ids, order = rearrange(topk_ids, "n k -> (n k)").sort()
+    expert_ids, order = topk_ids.flatten().sort()
     token_ids = order // top_k
     # Where each expert's run of sorted rows ends; searchsorted, unlike bincount, does not sync.
     experts = torch.arange(num_experts, device=x.device, dtype=expert_ids.dtype)
     offsets = torch.searchsorted(expert_ids, experts, right=True).to(torch.int32)
-    h = F.grouped_mm(x[token_ids], rearrange(gate_up_proj, "e o i -> e i o"), offs=offsets)
-    h = F.grouped_mm(silu_and_mul(h), rearrange(down_proj, "e o i -> e i o"), offs=offsets)
-    h = h * rearrange(topk_weights, "n k -> (n k) 1")[order].to(h.dtype)
+    h = F.grouped_mm(x[token_ids], gate_up_proj.transpose(1, 2), offs=offsets)
+    h = F.grouped_mm(silu_and_mul(h), down_proj.transpose(1, 2), offs=offsets)
+    h = h * topk_weights.flatten()[order].unsqueeze(1).to(h.dtype)
     return torch.zeros_like(x).index_add_(0, token_ids, h)
 
 

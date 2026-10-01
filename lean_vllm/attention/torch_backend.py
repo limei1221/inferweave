@@ -1,4 +1,3 @@
-from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
 
@@ -37,8 +36,8 @@ class TorchAttention(AttentionBackend):
             key = key[keep]
             value = value[keep]
 
-        k_cache.view(-1, dim).index_copy_(0, slots, rearrange(key, "n h d -> n (h d)"))
-        v_cache.view(-1, dim).index_copy_(0, slots, rearrange(value, "n h d -> n (h d)"))
+        k_cache.view(-1, dim).index_copy_(0, slots, key.flatten(1))
+        v_cache.view(-1, dim).index_copy_(0, slots, value.flatten(1))
 
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
         dim = latent_cache.size(-1)
@@ -78,15 +77,15 @@ class TorchAttention(AttentionBackend):
         repeats = self.num_heads // self.num_kv_heads
         outputs, lses = [], []
         for i in range(len(cu_seqlens_q) - 1):
-            q_i = rearrange(q[cu_seqlens_q[i]:cu_seqlens_q[i + 1]], "l h d -> h l d").float()    # [H, Lq, D]
-            k_i = repeat(k[cu_seqlens_k[i]:cu_seqlens_k[i + 1]], "l h d -> (h r) l d", r=repeats).float()
-            v_i = repeat(v[cu_seqlens_k[i]:cu_seqlens_k[i + 1]], "l h d -> (h r) l d", r=repeats).float()
-            scores = q_i @ rearrange(k_i, "h l d -> h d l") * self.scale    # [H, Lq, Lk]
+            q_i = q[cu_seqlens_q[i]:cu_seqlens_q[i + 1]].transpose(0, 1).float()    # [H, Lq, D]
+            k_i = k[cu_seqlens_k[i]:cu_seqlens_k[i + 1]].repeat_interleave(repeats, dim=1).transpose(0, 1).float()
+            v_i = v[cu_seqlens_k[i]:cu_seqlens_k[i + 1]].repeat_interleave(repeats, dim=1).transpose(0, 1).float()
+            scores = q_i @ k_i.transpose(1, 2) * self.scale    # [H, Lq, Lk]
             mask = self._causal_mask(q_i.size(1), k_i.size(1), q.device) if causal else None
             if mask is not None:
                 scores = scores.masked_fill(~mask, float("-inf"))
-            outputs.append(rearrange(scores.softmax(dim=-1) @ v_i, "h l d -> l h d").to(q.dtype))
-            lses.append(rearrange(scores.logsumexp(dim=-1), "h l -> l h"))
+            outputs.append((scores.softmax(dim=-1) @ v_i).transpose(0, 1).to(q.dtype))
+            lses.append(scores.logsumexp(dim=-1).transpose(0, 1))
         return torch.cat(outputs), torch.cat(lses)
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
@@ -103,37 +102,33 @@ class TorchAttention(AttentionBackend):
         block_tables = context.block_tables
         outputs = []
         for i, seqlen_k in enumerate(context.context_lens.tolist()):
-            latent = self._gather_pages(rearrange(latent_cache, "n p d -> n p 1 d"), block_tables[i], seqlen_k)    # [Lk, 1, D]
-            kv = repeat(latent, "l 1 d -> 1 h l d", h=q.size(1))    # [1, H, Lk, D]
-            o = F.scaled_dot_product_attention(
-                rearrange(q[i:i + 1], "b h d -> 1 h b d"), kv, kv[..., :v_dim], scale=self.scale,
-            ) # [1, H, 1, v_dim]
-            outputs.append(rearrange(o, "1 h b d -> b h d")) # (1, H, v_dim)
+            latent = self._gather_pages(latent_cache, block_tables[i], seqlen_k)    # [Lk, D]
+            kv = latent.expand(q.size(1), -1, -1)    # [H, Lk, D]
+            o = F.scaled_dot_product_attention(q[i].unsqueeze(1), kv, kv[..., :v_dim], scale=self.scale)    # [H, 1, v_dim]
+            outputs.append(o.transpose(0, 1))    # [1, H, v_dim]
         return torch.cat(outputs, dim=0) # [B, H, v_dim]
 
     @staticmethod
     def _gather_pages(cache: torch.Tensor, block_table: torch.Tensor, seqlen: int) -> torch.Tensor:
-        block_size = cache.size(1) # [num_blocks, block_size, num_kv_heads, head_dim]
+        block_size = cache.size(1) # [num_blocks, block_size, ...]
         num_blocks = (seqlen + block_size - 1) // block_size
         blocks = block_table[:num_blocks].long()
-        return rearrange(cache[blocks], "b p h d -> (b p) h d")[:seqlen] # [seq_len, num_kv_heads, head_dim]
+        return cache[blocks].flatten(0, 1)[:seqlen] # [seq_len, ...]
 
     @staticmethod
     def _causal_mask(seqlen_q: int, seqlen_k: int, device: torch.device) -> torch.Tensor | None:
         # Bottom-right aligned, unlike SDPA's is_causal=True: query j sits at seqlen_k - seqlen_q + j.
         if seqlen_q == 1:
             return None
-        q_pos = rearrange(torch.arange(seqlen_k - seqlen_q, seqlen_k, device=device), "q -> q 1")
-        k_pos = rearrange(torch.arange(seqlen_k, device=device), "k -> 1 k")
+        q_pos = torch.arange(seqlen_k - seqlen_q, seqlen_k, device=device).unsqueeze(1)
+        k_pos = torch.arange(seqlen_k, device=device).unsqueeze(0)
         return q_pos >= k_pos
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-        q = rearrange(q, "l h d -> 1 h l d") # [1, H, Lq, D]
-        k = rearrange(k, "l h d -> 1 h l d") # [1, H_kv, Lk, D]
-        v = rearrange(v, "l h d -> 1 h l d") # [1, H_kv, Lk, D]
-        if mask is not None:
-            mask = rearrange(mask, "q k -> 1 1 q k")
+        q = q.transpose(0, 1) # [H, Lq, D]
+        k = k.transpose(0, 1) # [H_kv, Lk, D]
+        v = v.transpose(0, 1) # [H_kv, Lk, D]
 
         gqa = self.num_heads != self.num_kv_heads
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, enable_gqa=gqa) # [1, H, Lq, D]
-        return rearrange(o, "1 h l d -> l h d")
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, enable_gqa=gqa) # [H, Lq, D]
+        return o.transpose(0, 1)

@@ -1,4 +1,3 @@
-from einops import rearrange
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -38,7 +37,7 @@ class VocabParallelEmbedding(nn.Module):
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
-            y = rearrange(mask, "n -> n 1") * y
+            y = mask.unsqueeze(-1) * y
             dist.all_reduce(y)
         return y
 

@@ -1,4 +1,3 @@
-from einops import rearrange
 import torch
 
 from lean_vllm.attention.abstract import AttentionBackend
@@ -115,12 +114,12 @@ class FlashAttention3Backend(AttentionBackend):
             max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale, causal=causal, return_attn_probs=True,
         )
-        return o, rearrange(lse, "h n -> n h")    # FA3's varlen lse is [heads, tokens]
+        return o, lse.transpose(0, 1)    # FA3's varlen lse is [heads, tokens]
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         o = flash_attn_with_kvcache(
-            rearrange(q, "b h d -> b 1 h d"), k_cache, v_cache,
+            q.unsqueeze(1), k_cache, v_cache,
             cache_seqlens=context.context_lens, page_table=context.block_tables,
             softmax_scale=self.scale, causal=True,
         )
-        return rearrange(o, "b 1 h d -> b h d")    # match the [batch, heads, dim] contract
+        return o.squeeze(1)    # match the [batch, heads, dim] contract
