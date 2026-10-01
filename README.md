@@ -64,7 +64,8 @@ outputs[0]["text"]
 The attention backend is picked automatically and can be forced with
 `LEAN_VLLM_ATTENTION_BACKEND`. A MoE model's routed experts run a Triton kernel
 on CUDA, as vLLM's do, and `grouped_mm` elsewhere; `LEAN_VLLM_MOE_BACKEND`
-forces either.
+forces either. The kernel's tile sizes come from a config tuned offline by
+`benchmarks/tune_moe.py`, or from vLLM's defaults.
 
 Qwen3 and DeepSeek-V2 checkpoints load, picked by `architectures` in
 `config.json`. [docs/deepseek-v2.md](docs/deepseek-v2.md) covers DeepSeek-V2-Lite:

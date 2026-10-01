@@ -44,7 +44,9 @@ reads. On a non-Hopper GPU only `torch` is available, so there is no fast MLA
 path there yet.
 
 The routed experts run a Triton kernel on CUDA and `F.grouped_mm` elsewhere.
-Set `LEAN_VLLM_MOE_BACKEND=triton|torch` to force one.
+Set `LEAN_VLLM_MOE_BACKEND=triton|torch` to force one. The kernel's tile sizes
+come from a tuned config file when one matches the shape and GPU, and from
+vLLM's defaults otherwise; see [Tuning the MoE kernel](#tuning-the-moe-kernel).
 
 ### Engine features
 
@@ -159,6 +161,35 @@ whole blocks, so a block reads one expert's weights, as vLLM's fused MoE does.
 Elsewhere, two `F.grouped_mm` calls do the same work. That path is the
 reference the kernel is tested against.
 
+### Tuning the MoE kernel
+
+As in vLLM, tile sizes are tuned offline, not at runtime. For each batch size,
+`benchmarks/tune_moe.py --tune` times vLLM's 1,920-config search space
+(`BLOCK_SIZE_M/N/K`, `GROUP_SIZE_M`, warps, stages) on random routing, each
+config as 10 calls in one CUDA graph, and keeps the fastest. It writes
+`E={experts},N={intermediate size},device_name={GPU}.json`, with the shape as
+one rank holds it under `--tp-size` and `--enable-expert-parallel`.
+
+```bash
+uv run python benchmarks/tune_moe.py --model ~/workspace/huggingface/DeepSeek-V2-Lite-Chat --tune
+uv run python benchmarks/tune_moe.py --model ~/workspace/huggingface/DeepSeek-V2-Lite-Chat    # time what the runtime picks
+```
+
+At runtime the layer looks in `$LEAN_VLLM_TUNED_CONFIG_FOLDER`, then in
+`lean_vllm/layers/moe_configs/`, and uses the entry for the nearest batch size
+in tokens. With no file it logs a warning and falls back to vLLM's bf16
+defaults. File names and keys are vLLM's, so a file vLLM's tuner wrote works
+here too.
+
+No tuned file ships yet. vLLM ships none for V2-Lite on an H100 either
+(`E=64,N=1408` has only a B200 file), so the 20 September comparison ran both
+engines on defaults; lean-vLLM's own defaults then were a fixed 16 or 64-row
+tile, not vLLM's table.
+
+`GROUP_SIZE_M` orders the launch as vLLM's kernel does: that many row blocks
+take each column tile in turn, so they read the same weight tile while it is
+in L2.
+
 ### Expert parallelism
 
 `--enable-expert-parallel` with `--tensor-parallel-size N` follows vLLM with
@@ -204,9 +235,8 @@ rotates adjacent pairs (GPT-J style), so its rope uses `is_neox_style=False`.
    output against a pinned vLLM version.
 2. Measure prefill, pure decode, mixed traffic and peak memory separately, and
    the end-to-end gain of latent decode in mixed batches.
-3. Profile and optimize: prefill cost, Triton MoE block sizes (vLLM ships a
-   tuned table per shape and dtype), routing, latent projections and context
-   gathering. For models with `q_lora_rank`, try fusing `q_a_proj` with
+3. Profile and optimize: prefill cost, routing, latent projections and context
+   gathering. Tune the Triton MoE on an H100 and ship the file. For models with `q_lora_rank`, try fusing `q_a_proj` with
    `kv_a_proj_with_mqa`, as vLLM does.
 4. Add features when a workload needs them: an MLA decode kernel beyond Hopper,
    quantization, pipeline parallelism, and data parallelism with all-to-all

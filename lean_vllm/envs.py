@@ -16,6 +16,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LEAN_VLLM_ATTENTION_BACKEND": lambda: os.getenv("LEAN_VLLM_ATTENTION_BACKEND") or None,
     # Forces "triton" or "torch" for the routed experts; unset takes Triton where it runs.
     "LEAN_VLLM_MOE_BACKEND": lambda: os.getenv("LEAN_VLLM_MOE_BACKEND") or None,
+    # A folder of tuned MoE launch configs, searched before the shipped ones; as vLLM's VLLM_TUNED_CONFIG_FOLDER.
+    "LEAN_VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("LEAN_VLLM_TUNED_CONFIG_FOLDER") or None,
     # Enables the step-loop profiler, which writes its trace here.
     "LEAN_PROFILE_DIR": lambda: os.getenv("LEAN_PROFILE_DIR") or None,
     # Steps skipped, then steps captured.

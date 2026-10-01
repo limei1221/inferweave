@@ -81,3 +81,6 @@ flash-attn-3 = { url = "https://github.com/mjun0812/flash-attention-prebuild-whe
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lean_vllm*"]
+
+[tool.setuptools.package-data]
+"lean_vllm.layers" = ["moe_configs/*.json"]    # tuned MoE launch configs, written by benchmarks/tune_moe.py

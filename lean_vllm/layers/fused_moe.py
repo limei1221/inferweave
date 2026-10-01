@@ -2,11 +2,23 @@
 
 Pairs are sorted by expert and padded to whole row blocks, so each block reads one expert's weight.
 No shape is decided on the host, so the layer stays capturable.
+Tile sizes come from a tuned JSON file per shape and GPU, as vLLM's, or vLLM's defaults; benchmarks/tune_moe.py writes them.
 """
+
+import functools
+import json
+import logging
+import os
+import re
 
 import torch
 
 from lean_vllm import envs
+
+logger = logging.getLogger(__name__)
+
+# Shipped tuned configs; $LEAN_VLLM_TUNED_CONFIG_FOLDER is searched first.
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "moe_configs")
 
 _IMPORT_ERROR: ImportError | None = None
 try:
@@ -28,6 +40,7 @@ else:
         N,
         K,
         num_valid_pairs,
+        num_blocks,
         stride_am,
         stride_ak,
         stride_be,
@@ -37,39 +50,45 @@ else:
         stride_cn,
         TOP_K: tl.constexpr,
         MUL_ROUTED_WEIGHT: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
     ):
         """One block of padded rows against one expert: C[pair] = A[pair // TOP_K] @ B[expert]."""
         pid = tl.program_id(0)
-        num_pid_n = tl.cdiv(N, BLOCK_N)
-        pid_m, pid_n = pid // num_pid_n, pid % num_pid_n
-        if pid_m * BLOCK_M >= tl.load(num_rows_ptr): return    # a block the padding left empty
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        # Grouped order, as vLLM's: GROUP_SIZE_M row blocks in turn take each column tile, sharing it in L2.
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
+        group_size_m = min(num_blocks - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+        pid_n = (pid % num_pid_in_group) // group_size_m
+        if pid_m * BLOCK_SIZE_M >= tl.load(num_rows_ptr): return    # a block the padding left empty
 
-        offs_pair = tl.load(sorted_pairs_ptr + pid_m * BLOCK_M + tl.arange(0, BLOCK_M))
+        offs_pair = tl.load(sorted_pairs_ptr + pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
         pair_mask = offs_pair < num_valid_pairs    # the tail of an expert's run overhangs its last block
-        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + offs_pair[:, None] * stride_cm + offs_cn[None, :] * stride_cn
         c_mask = pair_mask[:, None] & (offs_cn < N)[None, :]
         expert = tl.load(block_experts_ptr + pid_m)
         if expert == -1:    # another EP rank's expert: its pairs add zero here, as in vLLM
-            tl.store(c_ptrs, tl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.dtype.element_ty), mask=c_mask)
+            tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty), mask=c_mask)
             return
 
-        offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N    # wrapped, so only the store masks N
-        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N    # wrapped, so only the store masks N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
         a_ptrs = a_ptr + (offs_pair // TOP_K)[:, None] * stride_am + offs_k[None, :] * stride_ak
         b_ptrs = b_ptr + expert * stride_be + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k in range(tl.cdiv(K, BLOCK_K)):
-            k_mask = offs_k < K - k * BLOCK_K
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
+            k_mask = offs_k < K - k * BLOCK_SIZE_K
             a = tl.load(a_ptrs, mask=pair_mask[:, None] & k_mask[None, :], other=0.0)
             b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
             acc = tl.dot(a, b, acc=acc)
-            a_ptrs += BLOCK_K * stride_ak
-            b_ptrs += BLOCK_K * stride_bk
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
         if MUL_ROUTED_WEIGHT:
             acc *= tl.load(topk_weights_ptr + offs_pair, mask=pair_mask, other=0.0)[:, None]
@@ -87,9 +106,52 @@ def use_triton(x: torch.Tensor) -> bool:
     return available and name != "torch"
 
 
-def config(num_pairs: int) -> dict:
-    """vLLM tunes this per shape and dtype; a decode batch is a few rows, so the row block matters most."""
-    return dict(BLOCK_M=16 if num_pairs < 256 else 64, BLOCK_N=64, BLOCK_K=32, num_warps=4, num_stages=4)
+def get_config_file_name(E: int, N: int, device_name: str | None = None) -> str:
+    """vLLM's name for bf16, so its tuned files load here too. N is the intermediate size per expert, after TP."""
+    if device_name is None:
+        device_name = re.sub(r"[\s/]+", "_", torch.cuda.get_device_name())
+    if "H200" in device_name.split("_"):    # one file serves the H200 family, as in vLLM
+        device_name = "NVIDIA_H200"
+    return f"E={E},N={N},device_name={device_name}.json"
+
+
+@functools.lru_cache
+def get_moe_configs(E: int, N: int) -> dict[int, dict] | None:
+    """Batch size -> launch config, from the first file found; None if there is none."""
+    file_name = get_config_file_name(E, N)
+    folders = [envs.LEAN_VLLM_TUNED_CONFIG_FOLDER, CONFIG_DIR]
+    for path in (os.path.join(folder, file_name) for folder in folders if folder):
+        if os.path.exists(path):
+            logger.info("MoE launch configs from %s", path)
+            with open(path) as f:
+                configs = json.load(f)
+            configs.pop("triton_version", None)
+            return {int(m): config for m, config in configs.items()}
+    logger.warning("no tuned MoE config %s, so vLLM's defaults; benchmarks/tune_moe.py writes one", file_name)
+    return None
+
+
+def get_default_config(M: int, E: int) -> dict:
+    """vLLM's bf16 defaults: small batches are memory-bound and take tall K tiles, large ones big tiles and more warps."""
+    block_m = 16 if M <= 32 else 32 if M <= 96 else 64 if M <= 512 else 128
+    return dict(
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=64 if M <= 64 else 128,
+        BLOCK_SIZE_K=128 if M <= 64 else 64,
+        # Grouping only pays when an expert has enough row blocks to share a weight tile.
+        GROUP_SIZE_M=16 if M // max(E, 1) > 128 else 1,
+        num_warps=4 if M <= 128 else 8,
+        num_stages=4 if M <= 32 else 3,
+    )
+
+
+def try_get_optimal_moe_config(E: int, N: int, M: int) -> dict:
+    """The tuned config for the nearest batch size M (tokens, not pairs), else the default."""
+    configs = get_moe_configs(E, N)
+    if configs:
+        config = configs[min(configs, key=lambda m: abs(m - M))]
+        return {k: v for k, v in config.items() if k != "SPLIT_K"}    # vLLM writes it; the kernel has no split
+    return get_default_config(M, E)
 
 
 def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tuple[torch.Tensor, ...]:
@@ -126,29 +188,31 @@ def fused_experts(
     topk_ids: torch.Tensor,
     act_fn: torch.nn.Module,
     expert_map: torch.Tensor | None = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     """x through its top-k experts: sort into blocks, a GEMM either side of the activation, then sum.
 
     With expert_map, the weights hold this rank's experts, and blocks of other ranks' experts write zeros.
+    config overrides the looked-up launch config, for the tuner.
     """
     num_tokens, _ = x.shape    # [T, D]
     num_experts, gate_up_size, hidden_size = gate_up_proj.shape    # [E, 2I, D]
+    launch = config or try_get_optimal_moe_config(num_experts, down_proj.size(2), num_tokens)
     if expert_map is not None:
         num_experts = expert_map.numel()    # blocked by global id, as vLLM's moe_align_block_size
     top_k = topk_ids.size(1)
     num_pairs = num_tokens * top_k
-    launch = config(num_pairs)
-    sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, num_experts, launch["BLOCK_M"])
+    sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, num_experts, launch["BLOCK_SIZE_M"])
     if expert_map is not None:
         block_experts = expert_map[block_experts]
     topk_weights = topk_weights.flatten().to(x.dtype)
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pairs_per_row: int, mul_routed_weight: bool):
         n, k = b.shape[1], b.shape[2]
-        grid = (block_experts.numel() * triton.cdiv(n, launch["BLOCK_N"]),)
+        grid = (block_experts.numel() * triton.cdiv(n, launch["BLOCK_SIZE_N"]),)
         fused_moe_kernel[grid](
             a, b, c, sorted_pairs, block_experts, num_rows, topk_weights,
-            n, k, num_pairs,
+            n, k, num_pairs, block_experts.numel(),
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1), b.stride(2),
             c.stride(0), c.stride(1),

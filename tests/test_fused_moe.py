@@ -3,11 +3,16 @@
 `blocked_moe` writes the kernel's indexing out in torch, so only the `tl.dot` arithmetic needs a GPU.
 """
 
+import json
+
 import pytest
 import torch
 import torch.distributed as dist
 
-from lean_vllm.layers.fused_moe import align_blocks, fused_experts, use_triton
+from lean_vllm.layers.fused_moe import (
+    align_blocks, fused_experts, get_config_file_name, get_default_config, get_moe_configs,
+    try_get_optimal_moe_config, use_triton,
+)
 from lean_vllm.layers.moe import FusedMoE, determine_expert_map, silu_and_mul, torch_experts
 
 HIDDEN, INTERMEDIATE = 32, 16
@@ -220,6 +225,92 @@ def test_the_triton_kernel_matches_grouped_mm_on_cuda(moe, batch, dtype):
         got = fused_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids, silu_and_mul)
         want = torch_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids)
     # bf16: reduction order differs between the kernel and grouped_mm, so allow bf16 rounding.
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+def grouped_order(num_blocks: int, num_pid_n: int, group_size_m: int) -> list[tuple[int, int]]:
+    """The kernel's pid -> (row block, column tile), in Python."""
+    order = []
+    for pid in range(num_blocks * num_pid_n):
+        num_pid_in_group = group_size_m * num_pid_n
+        first_pid_m = (pid // num_pid_in_group) * group_size_m
+        size_m = min(num_blocks - first_pid_m, group_size_m)
+        order.append((first_pid_m + (pid % num_pid_in_group) % size_m, (pid % num_pid_in_group) // size_m))
+    return order
+
+
+@pytest.mark.parametrize("group_size_m", [1, 4, 16, 64])
+def test_grouped_order_covers_every_tile_once(group_size_m):
+    """Any group size, including one past the block count or not dividing it, launches each tile exactly once."""
+    order = grouped_order(num_blocks=13, num_pid_n=3, group_size_m=group_size_m)
+    assert sorted(order) == [(m, n) for m in range(13) for n in range(3)]
+
+
+def test_grouped_order_walks_a_column_tile_down_the_group():
+    """Consecutive programs share a weight tile, which is the point of grouping."""
+    assert grouped_order(num_blocks=4, num_pid_n=2, group_size_m=2)[:4] == [(0, 0), (1, 0), (0, 1), (1, 1)]
+    assert grouped_order(num_blocks=4, num_pid_n=2, group_size_m=1)[:2] == [(0, 0), (0, 1)]    # the old order
+
+
+def test_config_file_names_match_vllm():
+    assert get_config_file_name(64, 1408, "NVIDIA_H100_80GB_HBM3") == "E=64,N=1408,device_name=NVIDIA_H100_80GB_HBM3.json"
+    assert get_config_file_name(64, 1408, "NVIDIA_H200_141GB") == "E=64,N=1408,device_name=NVIDIA_H200.json"
+
+
+@pytest.fixture
+def tuned_folder(tmp_path, monkeypatch):
+    """A folder in $LEAN_VLLM_TUNED_CONFIG_FOLDER holding one vLLM-format file, on a pretend H100."""
+    monkeypatch.setenv("LEAN_VLLM_TUNED_CONFIG_FOLDER", str(tmp_path))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "NVIDIA H100 80GB HBM3")
+    get_moe_configs.cache_clear()
+    yield tmp_path
+    get_moe_configs.cache_clear()
+
+
+def tile(block_m: int) -> dict:
+    return dict(BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=64, BLOCK_SIZE_K=128, GROUP_SIZE_M=1, num_warps=4, num_stages=3)
+
+
+def test_a_tuned_file_maps_each_batch_to_its_nearest_entry(tuned_folder):
+    configs = {"triton_version": "3.5.0", "1": tile(16), "64": tile(32), "512": {**tile(64), "SPLIT_K": 1}}
+    (tuned_folder / "E=8,N=16,device_name=NVIDIA_H100_80GB_HBM3.json").write_text(json.dumps(configs))
+    assert sorted(get_moe_configs(8, 16)) == [1, 64, 512]
+    assert try_get_optimal_moe_config(8, 16, 3) == tile(16)
+    assert try_get_optimal_moe_config(8, 16, 100) == tile(32)
+    assert try_get_optimal_moe_config(8, 16, 4096) == tile(64)    # SPLIT_K dropped: the kernel has none
+
+
+def test_no_file_falls_back_to_vllm_defaults(tuned_folder):
+    assert get_moe_configs(8, 16) is None
+    assert try_get_optimal_moe_config(8, 16, 7) == get_default_config(7, 8)
+
+
+@pytest.mark.parametrize("M, E, want", [
+    (1, 64, (16, 64, 128, 1, 4, 4)),
+    (48, 64, (32, 64, 128, 1, 4, 3)),
+    (256, 64, (64, 128, 64, 1, 8, 3)),
+    (4096, 8, (128, 128, 64, 16, 8, 3)),    # 512 tokens per expert, so grouping pays
+])
+def test_defaults_are_vllms_bf16_table(M, E, want):
+    config = get_default_config(M, E)
+    keys = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "num_warps", "num_stages")
+    assert tuple(config[key] for key in keys) == want
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("config", [
+    dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=1, num_warps=4, num_stages=2),
+    dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=16, num_warps=8, num_stages=3),
+    dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, GROUP_SIZE_M=64, num_warps=8, num_stages=2),
+], ids=["small", "grouped", "large"])
+def test_any_tuned_config_computes_the_same_layer(moe, batch, config):
+    """Tiles and grouping change the schedule, never the result: what lets the tuner pick freely."""
+    layer = moe.to("cuda", torch.bfloat16)
+    x, topk_weights, topk_ids = batch
+    x, topk_weights, topk_ids = x.to("cuda", torch.bfloat16), topk_weights.to("cuda", torch.bfloat16), topk_ids.cuda()
+    with torch.inference_mode():
+        got = fused_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids, silu_and_mul, config=config)
+        want = torch_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids)
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
 
 

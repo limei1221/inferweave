@@ -73,6 +73,13 @@ land and decode would expand latents every step—correct, but not the path bein
 measured. The second must print `triton`; `torch` means the Triton import failed
 and the experts would fall back to `grouped_mm`.
 
+Neither engine ships a tuned MoE config for V2-Lite on an H100, so both run
+vLLM's default tiles. To compare tuned against tuned, tune both on this GPU
+first: `benchmarks/tune_moe.py --tune` for lean-vLLM (see
+[deepseek-v2.md](deepseek-v2.md#tuning-the-moe-kernel)), and vLLM's
+`benchmarks/kernels/benchmark_moe.py --tune` with `VLLM_TUNED_CONFIG_FOLDER`
+for vLLM. Each server logs which config file it loaded.
+
 Keep vLLM in a separate environment because it manages its own PyTorch
 dependencies. Version `0.26.0` is the last one that pins torch `2.11.0`, what the
 `cuda` extra pins, so the curves compare engines rather than PyTorch releases:
