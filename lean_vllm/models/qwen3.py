@@ -205,6 +205,7 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(nn.Module):
     supports_cuda_graph = True
+    supports_expert_parallel = False    # dense: no experts to place
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),

@@ -27,6 +27,17 @@ def test_tensor_parallelism_turns_async_scheduling_off(make_config, caplog):
     assert "async_scheduling is off" in caplog.text
 
 
+@pytest.mark.parametrize("architecture, supported", [("DeepseekV2ForCausalLM", True), ("Qwen3ForCausalLM", False)])
+def test_expert_parallelism_needs_a_moe_model(make_config, monkeypatch, architecture, supported):
+    monkeypatch.setattr(FakeHFConfig, "architectures", [architecture], raising=False)
+    assert make_config().enable_expert_parallel is False    # off by default, as in vLLM
+    if supported:
+        assert make_config(enable_expert_parallel=True).enable_expert_parallel
+    else:
+        with pytest.raises(ValueError, match="enable_expert_parallel needs a MoE model"):
+            make_config(enable_expert_parallel=True)
+
+
 def test_an_mla_model_takes_the_page_size_of_its_decode_kernel(make_config, monkeypatch, caplog):
     from lean_vllm.attention import FlashMLABackend
     monkeypatch.setattr(config_module, "get_attention_backend", lambda mla: FlashMLABackend)

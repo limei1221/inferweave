@@ -70,6 +70,7 @@ client that disconnects frees its KV blocks straight away.
 | Admission control, queue timeout | Off | `--max-waiting-requests`, `--request-timeout` |
 | Preemption | Recompute | The sequence goes back to the head of the queue; there is no swapping to CPU |
 | Tensor parallelism | 1 | Up to 8 GPUs |
+| Expert parallelism | Off | MoE models, over the tensor-parallel GPUs |
 
 Not supported: serving several models from one server, restarting the engine in
 place, and the sampling features refused above.
@@ -123,6 +124,7 @@ time to first token.
 | `--cudagraph-mode` | `full_and_piecewise` | Or `full`, `piecewise`, `none`; see [CUDA graphs](#cuda-graphs) |
 | `--enforce-eager` | off | Same as `--cudagraph-mode none` |
 | `--tensor-parallel-size` | 1 | GPUs per model, up to 8 |
+| `--enable-expert-parallel` | off | MoE models: each GPU holds whole experts, not a slice of each ([deepseek-v2.md](deepseek-v2.md#expert-parallelism)) |
 
 Admission control is off by default, as in vLLM, so overload shows up as p99
 latency rather than rejections. Read goodput alongside p99.

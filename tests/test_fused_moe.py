@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from lean_vllm.layers.fused_moe import align_blocks, fused_experts, use_triton
-from lean_vllm.layers.moe import FusedMoE, silu_and_mul, torch_experts
+from lean_vllm.layers.moe import FusedMoE, determine_expert_map, silu_and_mul, torch_experts
 
 HIDDEN, INTERMEDIATE = 32, 16
 NUM_EXPERTS, TOP_K, TOKENS = 8, 3, 20
@@ -41,22 +41,28 @@ def batch():
     return x, topk_weights / topk_weights.sum(dim=-1, keepdim=True), topk_ids
 
 
-def blocked_moe(moe: FusedMoE, x, topk_weights, topk_ids, block_m: int) -> torch.Tensor:
+def blocked_moe(gate_up_proj, down_proj, x, topk_weights, topk_ids, block_m: int, expert_map=None) -> torch.Tensor:
     """What the kernel computes, in torch: a block reads one expert, a row reads one pair."""
-    sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, moe.num_experts, block_m)
-    num_pairs, weights = topk_ids.numel(), topk_weights.flatten()
-    h = torch.empty(num_pairs, 2 * moe.intermediate_size)
+    num_experts = gate_up_proj.size(0) if expert_map is None else expert_map.numel()
+    sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, num_experts, block_m)
+    if expert_map is not None:
+        block_experts = expert_map[block_experts]
+    num_pairs, weights, top_k = topk_ids.numel(), topk_weights.flatten(), topk_ids.size(1)
+    h = torch.empty(num_pairs, gate_up_proj.size(1))
     out = torch.empty(num_pairs, x.size(1))
     for gate_up in (True, False):
         # h is one row per pair already, so the second gemm reads it without dividing.
-        a, b, c, per = (x, moe.gate_up_proj, h, moe.top_k) if gate_up else (silu_and_mul(h), moe.down_proj, out, 1)
+        a, b, c, per = (x, gate_up_proj, h, top_k) if gate_up else (silu_and_mul(h), down_proj, out, 1)
         for block, expert in enumerate(block_experts.tolist()):
             if block * block_m >= num_rows: break
             pairs = sorted_pairs[block * block_m:(block + 1) * block_m]
             pairs = pairs[pairs < num_pairs].long()    # the mask the kernel applies to an overhanging block
+            if expert == -1:    # another rank's expert
+                c[pairs] = 0
+                continue
             acc = a[pairs // per] @ b[expert].T
             c[pairs] = acc if gate_up else acc * weights[pairs].unsqueeze(1)
-    return out.view(-1, moe.top_k, x.size(1)).sum(dim=1)
+    return out.view(-1, top_k, x.size(1)).sum(dim=1)
 
 
 def test_the_blocking_holds_every_pair_exactly_once(batch):
@@ -99,7 +105,7 @@ def test_the_blocked_path_matches_grouped_mm(moe, batch, block_m):
     """The kernel's indexing against the reference: a wrong gather, expert or scatter shows up here."""
     x, topk_weights, topk_ids = batch
     with torch.inference_mode():
-        got = blocked_moe(moe, x, topk_weights, topk_ids, block_m)
+        got = blocked_moe(moe.gate_up_proj, moe.down_proj, x, topk_weights, topk_ids, block_m)
         want = torch_experts(x, moe.gate_up_proj, moe.down_proj, topk_weights, topk_ids)
     torch.testing.assert_close(got, want)
 
@@ -108,6 +114,99 @@ requires_triton_gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or use_triton.__globals__["_IMPORT_ERROR"] is not None,
     reason="the Triton MoE kernel needs a CUDA device and a Triton build",
 )
+
+
+@pytest.mark.parametrize("ep_size", [2, 3])    # 3 does not divide 8 experts
+def test_placement_matches_vllm_linear(ep_size):
+    """Contiguous runs, the remainder on the first ranks, and every expert on exactly one rank."""
+    maps = [determine_expert_map(ep_size, rank, NUM_EXPERTS) for rank in range(ep_size)]
+    counts = [count for count, _ in maps]
+    assert counts == [NUM_EXPERTS // ep_size + (rank < NUM_EXPERTS % ep_size) for rank in range(ep_size)]
+    owners = torch.stack([expert_map >= 0 for _, expert_map in maps]).int()
+    assert owners.sum(0).tolist() == [1] * NUM_EXPERTS
+    owned = [torch.nonzero(expert_map >= 0).flatten().tolist() for _, expert_map in maps]
+    assert sum(owned, []) == list(range(NUM_EXPERTS))    # rank order is expert order
+    for (count, expert_map), experts in zip(maps, owned):
+        assert expert_map[experts].tolist() == list(range(count))
+
+
+def test_one_rank_needs_no_map():
+    assert determine_expert_map(1, 0, NUM_EXPERTS) == (NUM_EXPERTS, None)
+
+
+def shards(moe: FusedMoE, ep_size: int):
+    """Each rank's map and the experts it would hold, cut from one full layer."""
+    for rank in range(ep_size):
+        _, expert_map = determine_expert_map(ep_size, rank, NUM_EXPERTS)
+        local = (expert_map >= 0).to(moe.gate_up_proj.device)
+        yield expert_map, moe.gate_up_proj[local], moe.down_proj[local]
+
+
+@pytest.mark.parametrize("ep_size", [2, 3])
+@pytest.mark.parametrize("path", ["grouped_mm", "blocked"])
+def test_expert_shards_sum_to_the_full_layer(moe, batch, ep_size, path):
+    """What the all-reduce adds up: each rank's own experts, zeros for the rest."""
+    x, topk_weights, topk_ids = batch
+    with torch.inference_mode():
+        want = torch_experts(x, moe.gate_up_proj, moe.down_proj, topk_weights, topk_ids)
+        parts = [
+            torch_experts(x, gate_up, down, topk_weights, topk_ids, expert_map) if path == "grouped_mm"
+            else blocked_moe(gate_up, down, x, topk_weights, topk_ids, BLOCK_M, expert_map)
+            for expert_map, gate_up, down in shards(moe, ep_size)
+        ]
+    torch.testing.assert_close(sum(parts), want)
+
+
+def test_a_rank_with_no_routed_pairs_returns_zeros(moe, batch):
+    x, topk_weights, _ = batch
+    topk_ids = torch.zeros(TOKENS, TOP_K, dtype=torch.long)    # every pair on rank 0's expert
+    expert_map, gate_up, down = list(shards(moe, 2))[1]
+    with torch.inference_mode():
+        assert torch.equal(torch_experts(x, gate_up, down, topk_weights, topk_ids, expert_map), torch.zeros_like(x))
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_expert_parallel_loads_whole_experts_for_its_rank(process_group, monkeypatch, rank):
+    """EP replaces TP inside the layer: full intermediate size, and only this rank's experts."""
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    layer = FusedMoE(NUM_EXPERTS, TOP_K, HIDDEN, INTERMEDIATE, enable_expert_parallel=True)
+    assert (layer.tp_size, layer.ep_size, layer.ep_rank) == (1, 2, rank)
+    assert layer.gate_up_proj.shape == (NUM_EXPERTS // 2, 2 * INTERMEDIATE, HIDDEN)
+    layer.gate_up_proj.data.fill_(-1)
+    for expert in range(NUM_EXPERTS):
+        for proj in ("gate_proj", "up_proj"):
+            weight = torch.full((INTERMEDIATE, HIDDEN), float(expert) + (proj == "up_proj") / 2)
+            layer.weight_loader(layer.gate_up_proj, weight, (expert, proj))
+    held = range(rank * NUM_EXPERTS // 2, (rank + 1) * NUM_EXPERTS // 2)
+    for local, expert in enumerate(held):
+        gate, up = layer.gate_up_proj[local].split(INTERMEDIATE)
+        assert (gate == expert).all() and (up == expert + 0.5).all()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tensor_parallel_still_slices_every_expert(process_group, monkeypatch, rank):
+    monkeypatch.setattr(dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    layer = FusedMoE(NUM_EXPERTS, TOP_K, HIDDEN, INTERMEDIATE)
+    assert (layer.tp_size, layer.ep_size, layer.expert_map) == (2, 1, None)
+    assert layer.gate_up_proj.shape == (NUM_EXPERTS, INTERMEDIATE, HIDDEN)
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
+def test_the_triton_kernel_matches_grouped_mm_under_expert_parallel(moe, batch, dtype):
+    """The kernel's zero blocks for other ranks' experts, with real arithmetic: shards must still sum to the layer."""
+    layer = moe.to("cuda", dtype)
+    x, topk_weights, topk_ids = batch
+    x, topk_weights, topk_ids = x.to("cuda", dtype), topk_weights.to("cuda", dtype), topk_ids.cuda()
+    with torch.inference_mode():
+        want = torch_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids)
+        got = sum(
+            fused_experts(x, gate_up, down, topk_weights, topk_ids, silu_and_mul, expert_map.cuda())
+            for expert_map, gate_up, down in shards(layer, 3)
+        )
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
 
 
 @requires_triton_gpu

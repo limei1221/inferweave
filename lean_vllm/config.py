@@ -6,6 +6,7 @@ from transformers import AutoConfig
 
 from lean_vllm.attention import get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
+from lean_vllm.models import get_model_class
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     kvcache_memory_gb: float = 2.0    # cpu/mps only; cuda uses gpu_memory_utilization
     tensor_parallel_size: int = 1
+    enable_expert_parallel: bool = False    # MoE layers hold whole experts per rank, not slices of each; as vLLM
     enforce_eager: bool = False
     cudagraph_mode: str = "full_and_piecewise"    # none | full | piecewise | full_and_piecewise
     hf_config: AutoConfig | None = None
@@ -62,6 +64,8 @@ class Config:
         if not self.dist_port:    # resolved here, so spawned workers get the same one
             self.dist_port = _free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.enable_expert_parallel and not get_model_class(self.hf_config).supports_expert_parallel:
+            raise ValueError(f"enable_expert_parallel needs a MoE model, and {self.hf_config.architectures} has none")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "kv_lora_rank", None) is not None:    # an MLA model
             block_size = get_attention_backend(mla=True).mla_block_size()

@@ -69,7 +69,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
-        self.model = model_cls(hf_config)
+        model_kwargs = {"enable_expert_parallel": True} if config.enable_expert_parallel else {}
+        self.model = model_cls(hf_config, **model_kwargs)
         register_layers(self.model)    # before warmup_model, which runs the op
         for module in self.model.modules():
             if isinstance(module, MLAAttention):

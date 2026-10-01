@@ -49,11 +49,18 @@ else:
 
         offs_pair = tl.load(sorted_pairs_ptr + pid_m * BLOCK_M + tl.arange(0, BLOCK_M))
         pair_mask = offs_pair < num_valid_pairs    # the tail of an expert's run overhangs its last block
+        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + offs_pair[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+        c_mask = pair_mask[:, None] & (offs_cn < N)[None, :]
+        expert = tl.load(block_experts_ptr + pid_m)
+        if expert == -1:    # another EP rank's expert: its pairs add zero here, as in vLLM
+            tl.store(c_ptrs, tl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.dtype.element_ty), mask=c_mask)
+            return
+
         offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N    # wrapped, so only the store masks N
         offs_k = tl.arange(0, BLOCK_K)
         a_ptrs = a_ptr + (offs_pair // TOP_K)[:, None] * stride_am + offs_k[None, :] * stride_ak
-        b_ptrs = (b_ptr + tl.load(block_experts_ptr + pid_m) * stride_be
-                  + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+        b_ptrs = b_ptr + expert * stride_be + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in range(tl.cdiv(K, BLOCK_K)):
@@ -66,9 +73,7 @@ else:
 
         if MUL_ROUTED_WEIGHT:
             acc *= tl.load(topk_weights_ptr + offs_pair, mask=pair_mask, other=0.0)[:, None]
-        offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        c_ptrs = c_ptr + offs_pair[:, None] * stride_cm + offs_cn[None, :] * stride_cn
-        tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=pair_mask[:, None] & (offs_cn < N)[None, :])
+        tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=c_mask)
 
 
 def use_triton(x: torch.Tensor) -> bool:
@@ -120,14 +125,22 @@ def fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     act_fn: torch.nn.Module,
+    expert_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """x through its top-k experts: sort into blocks, a GEMM either side of the activation, then sum."""
+    """x through its top-k experts: sort into blocks, a GEMM either side of the activation, then sum.
+
+    With expert_map, the weights hold this rank's experts, and blocks of other ranks' experts write zeros.
+    """
     num_tokens, _ = x.shape    # [T, D]
     num_experts, gate_up_size, hidden_size = gate_up_proj.shape    # [E, 2I, D]
+    if expert_map is not None:
+        num_experts = expert_map.numel()    # blocked by global id, as vLLM's moe_align_block_size
     top_k = topk_ids.size(1)
     num_pairs = num_tokens * top_k
     launch = config(num_pairs)
     sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, num_experts, launch["BLOCK_M"])
+    if expert_map is not None:
+        block_experts = expert_map[block_experts]
     topk_weights = topk_weights.flatten().to(x.dtype)
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pairs_per_row: int, mul_routed_weight: bool):

@@ -54,8 +54,9 @@ Set `LEAN_VLLM_MOE_BACKEND=triton|torch` to force one.
 | Prefix caching (resuming from cached latents) | Supported |
 | OpenAI-compatible server, streaming, metrics | Supported, as for Qwen3 ([online-serving.md](online-serving.md)) |
 | bf16 | Used on GPU; fp32 is used in the tests |
-| Tensor parallelism | Implemented (attention heads and expert width are sharded), but only run at TP=1 |
-| Expert or pipeline parallelism, expert load balancing | Not supported |
+| Tensor parallelism | Implemented (attention heads and expert width are sharded); checked at TP=2 on CPU, only run at TP=1 on a GPU |
+| Expert parallelism | `--enable-expert-parallel`: each rank holds whole experts, as vLLM does without DP; checked at 2 ranks on CPU, not yet run on GPUs |
+| Pipeline parallelism, data parallelism, all-to-all dispatch, expert load balancing | Not supported |
 | Weight or KV-cache quantization | Not supported |
 
 ## Running it
@@ -158,6 +159,24 @@ whole blocks, so a block reads one expert's weights, as vLLM's fused MoE does.
 Elsewhere, two `F.grouped_mm` calls do the same work. That path is the
 reference the kernel is tested against.
 
+### Expert parallelism
+
+`--enable-expert-parallel` with `--tensor-parallel-size N` follows vLLM with
+no data parallelism: the expert-parallel group is the TP group. Attention, the
+dense layers and the shared experts stay tensor-parallel. The routed experts
+are not sliced; each rank holds a contiguous run of whole experts, vLLM's
+`linear` placement, with the first ranks taking one extra when N does not divide
+the expert count.
+
+Every rank still sees every token and routes it with the replicated gate.
+`expert_map` takes a global expert id to the rank's local one, or -1. Pairs are
+blocked by global id, as in vLLM's `moe_align_block_size`, and a block whose
+expert is -1 writes zeros. The ranks' partial sums meet in the all-reduce that
+TP already does, so communication is unchanged; what changes is that each rank
+runs full-width GEMMs for 1/N of the experts instead of 1/N-width GEMMs for all
+of them. Without data parallelism there are no other ranks' tokens to exchange,
+so vLLM's all-to-all backends do not apply.
+
 ### YaRN
 
 `layers/rotary_embedding.py` computes YaRN's frequencies and cos/sin scaling.
@@ -190,7 +209,8 @@ rotates adjacent pairs (GPT-J style), so its rope uses `is_neox_style=False`.
    gathering. For models with `q_lora_rank`, try fusing `q_a_proj` with
    `kv_a_proj_with_mqa`, as vLLM does.
 4. Add features when a workload needs them: an MLA decode kernel beyond Hopper,
-   quantization, and expert or pipeline parallelism.
+   quantization, pipeline parallelism, and data parallelism with all-to-all
+   expert dispatch.
 
 Upstream references, tracking vLLM `main`:
 [DeepSeek model and MoE](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/deepseek_v2.py),

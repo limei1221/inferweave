@@ -122,6 +122,7 @@ class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
         assert getattr(config, "scoring_func", "softmax") == "softmax"
@@ -133,7 +134,8 @@ class DeepseekV2MoE(nn.Module):
         self.renormalize = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = ReplicatedLinear(config.hidden_size, config.n_routed_experts, bias=False)
-        self.experts = FusedMoE(config.n_routed_experts, self.top_k, config.hidden_size, config.moe_intermediate_size)
+        self.experts = FusedMoE(config.n_routed_experts, self.top_k, config.hidden_size, config.moe_intermediate_size,
+                                enable_expert_parallel)
         self.shared_experts = None
         if config.n_shared_experts:
             self.shared_experts = DeepseekV2MLP(
@@ -178,6 +180,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_idx: int,
+        enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = DeepseekV2Attention(config)
@@ -185,7 +188,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_moe_layer = (config.n_routed_experts is not None and layer_idx >= config.first_k_dense_replace
                         and layer_idx % moe_layer_freq == 0)
         if is_moe_layer:
-            self.mlp = DeepseekV2MoE(config)
+            self.mlp = DeepseekV2MoE(config, enable_expert_parallel)
         else:
             self.mlp = DeepseekV2MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -229,10 +232,13 @@ class DeepseekV2Model(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([DeepseekV2DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            DeepseekV2DecoderLayer(config, i, enable_expert_parallel) for i in range(config.num_hidden_layers)
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -250,6 +256,7 @@ class DeepseekV2Model(nn.Module):
 
 class DeepseekV2ForCausalLM(nn.Module):
     supports_cuda_graph = True
+    supports_expert_parallel = True
     packed_modules_mapping = {
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
@@ -258,9 +265,10 @@ class DeepseekV2ForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.model = DeepseekV2Model(config)
+        self.model = DeepseekV2Model(config, enable_expert_parallel)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
