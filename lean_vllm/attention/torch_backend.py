@@ -36,8 +36,9 @@ class TorchAttention(AttentionBackend):
             key = key[keep]
             value = value[keep]
 
-        k_cache.view(-1, dim).index_copy_(0, slots, key.flatten(1))
-        v_cache.view(-1, dim).index_copy_(0, slots, value.flatten(1))
+        # Indexed assignment, as index_copy_ on MPS costs the whole cache's size per call.
+        k_cache.view(-1, dim)[slots] = key.flatten(1)
+        v_cache.view(-1, dim)[slots] = value.flatten(1)
 
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
         dim = latent_cache.size(-1)
@@ -49,86 +50,97 @@ class TorchAttention(AttentionBackend):
             slots = slots[keep]
             latent = latent[keep]
 
-        latent_cache.view(-1, dim).index_copy_(0, slots, latent)
+        latent_cache.view(-1, dim)[slots] = latent
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
-        cu_seqlens_q = context.cu_seqlens_q.tolist()
-        cu_seqlens_k = context.cu_seqlens_k.tolist()
-        block_tables = context.block_tables
-
-        outputs = []
-        for i in range(len(cu_seqlens_q) - 1):
-            seqlen_q = cu_seqlens_q[i + 1] - cu_seqlens_q[i]
-            seqlen_k = cu_seqlens_k[i + 1] - cu_seqlens_k[i]
-            q_i = q[cu_seqlens_q[i]:cu_seqlens_q[i + 1]]
-            if block_tables is not None:    # read every key back from the pages
-                k_i = self._gather_pages(k_cache, block_tables[i], seqlen_k)
-                v_i = self._gather_pages(v_cache, block_tables[i], seqlen_k)
-            else:
-                k_i = k[cu_seqlens_k[i]:cu_seqlens_k[i + 1]]
-                v_i = v[cu_seqlens_k[i]:cu_seqlens_k[i + 1]]
-            mask = self._causal_mask(seqlen_q, seqlen_k, q.device)
-            outputs.append(self._sdpa(q_i, k_i, v_i, mask))
-        return torch.cat(outputs, dim=0)
+        cu_seqlens_q, cu_seqlens_k = context.cu_seqlens_q, context.cu_seqlens_k
+        max_seqlen_q, max_seqlen_k = context.max_seqlen_q, context.max_seqlen_k
+        q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q)    # [B, Lq, H, D]
+        if context.block_tables is not None:    # read every key back from the pages
+            k_pad = self._gather_pages(k_cache, context.block_tables, max_seqlen_k)
+            v_pad = self._gather_pages(v_cache, context.block_tables, max_seqlen_k)
+        else:
+            k_pad = self._pad_rows(k, cu_seqlens_k, max_seqlen_k)
+            v_pad = self._pad_rows(v, cu_seqlens_k, max_seqlen_k)
+        mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True)
+        return self._unpad_rows(self._sdpa(q_pad, k_pad, v_pad, mask), cu_seqlens_q, q.size(0))
 
     def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
         # Written out, since SDPA does not return the log-sum-exp.
-        cu_seqlens_q, cu_seqlens_k = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
         repeats = self.num_heads // self.num_kv_heads
-        outputs, lses = [], []
-        for i in range(len(cu_seqlens_q) - 1):
-            q_i = q[cu_seqlens_q[i]:cu_seqlens_q[i + 1]].transpose(0, 1).float()    # [H, Lq, D]
-            k_i = k[cu_seqlens_k[i]:cu_seqlens_k[i + 1]].repeat_interleave(repeats, dim=1).transpose(0, 1).float()
-            v_i = v[cu_seqlens_k[i]:cu_seqlens_k[i + 1]].repeat_interleave(repeats, dim=1).transpose(0, 1).float()
-            scores = q_i @ k_i.transpose(1, 2) * self.scale    # [H, Lq, Lk]
-            mask = self._causal_mask(q_i.size(1), k_i.size(1), q.device) if causal else None
-            if mask is not None:
-                scores = scores.masked_fill(~mask, float("-inf"))
-            outputs.append((scores.softmax(dim=-1) @ v_i).transpose(0, 1).to(q.dtype))
-            lses.append(scores.logsumexp(dim=-1).transpose(0, 1))
-        return torch.cat(outputs), torch.cat(lses)
+        q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q).transpose(1, 2).float()    # [B, H, Lq, D]
+        k_pad = self._pad_rows(k, cu_seqlens_k, max_seqlen_k).repeat_interleave(repeats, dim=2).transpose(1, 2).float()
+        v_pad = self._pad_rows(v, cu_seqlens_k, max_seqlen_k).repeat_interleave(repeats, dim=2).transpose(1, 2).float()
+        scores = q_pad @ k_pad.transpose(-1, -2) * self.scale    # [B, H, Lq, Lk]
+        mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        o = (scores.softmax(dim=-1) @ v_pad).transpose(1, 2).to(q.dtype)    # [B, Lq, H, D]
+        lse = scores.logsumexp(dim=-1).transpose(1, 2)    # [B, Lq, H]
+        return self._unpad_rows(o, cu_seqlens_q, q.size(0)), self._unpad_rows(lse, cu_seqlens_q, q.size(0))
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         block_tables = context.block_tables
-        outputs = []
-        for i, seqlen_k in enumerate(context.context_lens.tolist()):
-            k_i = self._gather_pages(k_cache, block_tables[i], seqlen_k)
-            v_i = self._gather_pages(v_cache, block_tables[i], seqlen_k)
-            outputs.append(self._sdpa(q[i:i + 1], k_i, v_i, None))
-        return torch.cat(outputs, dim=0)
+        seqlen = block_tables.size(1) * k_cache.size(1)    # the table's width, so no length is read back
+        k = self._gather_pages(k_cache, block_tables, seqlen)
+        v = self._gather_pages(v_cache, block_tables, seqlen)
+        mask = self._key_mask(context.context_lens, seqlen)
+        return self._sdpa(q.unsqueeze(1), k, v, mask).squeeze(1)
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
         # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
         block_tables = context.block_tables
-        outputs = []
-        for i, seqlen_k in enumerate(context.context_lens.tolist()):
-            latent = self._gather_pages(latent_cache, block_tables[i], seqlen_k)    # [Lk, D]
-            kv = latent.expand(q.size(1), -1, -1)    # [H, Lk, D]
-            o = F.scaled_dot_product_attention(q[i].unsqueeze(1), kv, kv[..., :v_dim], scale=self.scale)    # [H, 1, v_dim]
-            outputs.append(o.transpose(0, 1))    # [1, H, v_dim]
-        return torch.cat(outputs, dim=0) # [B, H, v_dim]
+        seqlen = block_tables.size(1) * latent_cache.size(1)
+        latent = self._gather_pages(latent_cache, block_tables, seqlen)    # [B, Lk, D]
+        kv = latent.unsqueeze(1).expand(-1, q.size(1), -1, -1)    # [B, H, Lk, D]
+        mask = self._key_mask(context.context_lens, seqlen)
+        o = F.scaled_dot_product_attention(q.unsqueeze(2), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale)
+        return o.squeeze(2)[..., :v_dim]    # [B, H, v_dim]; MPS returns the keys' width for one query
 
     @staticmethod
-    def _gather_pages(cache: torch.Tensor, block_table: torch.Tensor, seqlen: int) -> torch.Tensor:
+    def _pad_rows(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
+        """Packed rows [N, ...] to [B, max_seqlen, ...]. Past a row's end are other tokens, for the mask to hide."""
+        index = cu_seqlens[:-1].long().unsqueeze(1) + torch.arange(max_seqlen, device=x.device)
+        return x[index.clamp(max=x.size(0) - 1)]
+
+    @staticmethod
+    def _unpad_rows(x: torch.Tensor, cu_seqlens: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """[B, max_seqlen, ...] back to packed rows [num_tokens, ...]."""
+        tokens = torch.arange(num_tokens, device=x.device, dtype=cu_seqlens.dtype)
+        rows = torch.searchsorted(cu_seqlens, tokens, right=True) - 1
+        return x[rows, tokens - cu_seqlens[rows]]
+
+    @staticmethod
+    def _gather_pages(cache: torch.Tensor, block_tables: torch.Tensor, seqlen: int) -> torch.Tensor:
+        """Each row's first seqlen cached tokens, [B, seqlen, ...]. A table's -1 padding reads block 0, for the mask to hide."""
         block_size = cache.size(1) # [num_blocks, block_size, ...]
         num_blocks = (seqlen + block_size - 1) // block_size
-        blocks = block_table[:num_blocks].long()
-        return cache[blocks].flatten(0, 1)[:seqlen] # [seq_len, ...]
+        blocks = block_tables[:, :num_blocks].long().clamp(min=0)
+        return cache[blocks].flatten(1, 2)[:, :seqlen]
 
     @staticmethod
-    def _causal_mask(seqlen_q: int, seqlen_k: int, device: torch.device) -> torch.Tensor | None:
-        # Bottom-right aligned, unlike SDPA's is_causal=True: query j sits at seqlen_k - seqlen_q + j.
-        if seqlen_q == 1:
-            return None
-        q_pos = torch.arange(seqlen_k - seqlen_q, seqlen_k, device=device).unsqueeze(1)
-        k_pos = torch.arange(seqlen_k, device=device).unsqueeze(0)
-        return q_pos >= k_pos
+    def _key_mask(seqlens_k: torch.Tensor, max_seqlen_k: int) -> torch.Tensor:
+        """[B, 1, 1, Lk]: each row's own keys."""
+        k_pos = torch.arange(max_seqlen_k, device=seqlens_k.device)
+        return (k_pos < seqlens_k.unsqueeze(1)).view(-1, 1, 1, max_seqlen_k)
 
-    def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-        q = q.transpose(0, 1) # [H, Lq, D]
-        k = k.transpose(0, 1) # [H_kv, Lk, D]
-        v = v.transpose(0, 1) # [H_kv, Lk, D]
+    @classmethod
+    def _mask(cls, cu_seqlens_q, cu_seqlens_k, max_seqlen_q: int, max_seqlen_k: int, causal: bool) -> torch.Tensor:
+        """[B, 1, Lq, Lk]. Causal is bottom-right aligned, unlike SDPA's is_causal=True: query j sits at lk - lq + j."""
+        seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        mask = cls._key_mask(seqlens_k, max_seqlen_k)
+        if not causal:
+            return mask
+        device = mask.device
+        q_pos = (seqlens_k - seqlens_q).view(-1, 1, 1, 1) + torch.arange(max_seqlen_q, device=device).view(-1, 1)
+        return mask & (torch.arange(max_seqlen_k, device=device) <= q_pos)
 
-        gqa = self.num_heads != self.num_kv_heads
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=self.scale, enable_gqa=gqa) # [H, Lq, D]
-        return o.transpose(0, 1)
+    def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # Each key head's query heads fold into its query axis, so keys are never repeated and no enable_gqa
+        # is needed, which takes a slow path on MPS once batched. Query head h reads key head h // group.
+        B, Lq, _, D = q.shape
+        group = self.num_heads // self.num_kv_heads
+        q = q.view(B, Lq, self.num_kv_heads, group, D).permute(0, 2, 3, 1, 4).reshape(B, self.num_kv_heads, group * Lq, D)
+        mask = mask.unsqueeze(2).expand(-1, -1, group, -1, -1).reshape(B, 1, group * Lq, -1)
+        o = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=self.scale)
+        return o.view(B, self.num_kv_heads, group, Lq, -1).permute(0, 3, 1, 2, 4).reshape(B, Lq, self.num_heads, -1)

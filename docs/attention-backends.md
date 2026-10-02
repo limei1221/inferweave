@@ -186,17 +186,18 @@ size. FA2 required multiples of 256.
 
 ### Trade-offs of the torch backend
 
-`TorchAttention` loops over sequences in Python and gathers each one's pages
-into a contiguous tensor before calling SDPA. That costs host syncs every
-forward pass and memory traffic that grows with context length, and it makes
-decode data-dependent, so the backend cannot be captured in a CUDA graph. That
-is the right trade for a reference and for laptop development, and the wrong
-one for speed.
+`TorchAttention` pads every row to the step's longest, gathers all rows' pages
+into one contiguous tensor, and makes one masked SDPA call, with no host sync.
+Decode gathers the block table's full width, so it reads no lengths back either.
+The padding and the gathered copy cost memory traffic that grows with batch
+size and context length, and a step that mixes long chunks with decode rows
+spends compute on padding. Each key head's query heads fold into its query axis
+rather than going through `enable_gqa`, which takes a slow path on MPS once
+batched. The backend still reports no CUDA graph support. That is the right
+trade for a reference and for laptop development, and the wrong one for speed.
 
 ## Next steps
 
-1. Batch `TorchAttention`'s per-sequence loop before publishing any
-   torch-versus-flash comparison, which would otherwise measure the Python
-   loop.
-2. Add a FlashInfer backend, then choose backends per layer (by head count,
-   dtype, sequence length, or prefill versus decode) behind the same call.
+1. Add a FlashInfer backend, then choose a backend per layer at init (by head
+   size, head count, dtype, or layer kind), and split each step into decode and
+   prefill kernels inside the backend, as vLLM does.
