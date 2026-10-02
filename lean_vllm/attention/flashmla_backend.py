@@ -1,5 +1,6 @@
 import torch
 
+from lean_vllm.attention.abstract import LayerSpec
 from lean_vllm.attention.flash_backend import FlashAttention3Backend
 from lean_vllm.utils.context import Context
 
@@ -13,6 +14,8 @@ except ImportError as e:    # built from source, Hopper only
 class FlashMLABackend(FlashAttention3Backend):
     """FlashMLA's dense decode over MLA latents, and FlashAttention-3 for everything else. Hopper only."""
 
+    supported_kinds = ("mla",)
+
     @staticmethod
     def get_name() -> str:
         return "flashmla"
@@ -21,6 +24,13 @@ class FlashMLABackend(FlashAttention3Backend):
     def is_available() -> bool:
         # sm90 only, as FA3 is.
         return _IMPORT_ERROR is None and FlashAttention3Backend.is_available()
+
+    @classmethod
+    def validate(cls, spec: LayerSpec) -> list[str]:
+        reasons = super().validate(spec)    # FA3's, which runs the expanded prefill
+        if spec.latent_dim and spec.latent_dim != 576:
+            reasons.append(f"latent width {spec.latent_dim} is not the 512 + 64 FlashMLA decodes")
+        return reasons
 
     @staticmethod
     def supports_mla_decode() -> bool:

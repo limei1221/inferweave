@@ -8,6 +8,8 @@ from lean_vllm.utils.context import Context
 class TorchAttention(AttentionBackend):
     """SDPA reference backend. Runs anywhere; optimized for clarity, not speed."""
 
+    supported_dtypes = (torch.float32, torch.float16, torch.bfloat16)
+
     @staticmethod
     def get_name() -> str:
         return "torch"
@@ -23,6 +25,10 @@ class TorchAttention(AttentionBackend):
     @staticmethod
     def supports_mla_decode() -> bool:
         return True
+
+    @staticmethod
+    def split_decodes() -> bool:
+        return True    # so decode rows skip prefill's padding to the step's longest query
 
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         num_tokens = key.size(0)
@@ -128,12 +134,13 @@ class TorchAttention(AttentionBackend):
         """[B, 1, Lq, Lk]. Causal is bottom-right aligned, unlike SDPA's is_causal=True: query j sits at lk - lq + j."""
         seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        mask = cls._key_mask(seqlens_k, max_seqlen_k)
+        mask = cls._key_mask(seqlens_k, max_seqlen_k)    # [B, 1, 1, Lk]
         if not causal:
             return mask
         device = mask.device
+        # [B, 1, 1, 1] + [Lq, 1] -> [B, 1, Lq, 1]
         q_pos = (seqlens_k - seqlens_q).view(-1, 1, 1, 1) + torch.arange(max_seqlen_q, device=device).view(-1, 1)
-        return mask & (torch.arange(max_seqlen_k, device=device) <= q_pos)
+        return mask & (torch.arange(max_seqlen_k, device=device) <= q_pos)    # [B, 1, Lq, Lk]
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # Each key head's query heads fold into its query axis, so keys are never repeated and no enable_gqa

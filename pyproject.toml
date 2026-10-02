@@ -35,6 +35,9 @@ cuda = [
     # A prebuilt wheel, pinned by URL below. Scoped to the one platform that
     # wheel is built for, so nothing else can resolve the squatted PyPI name.
     "flash-attn-3; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # The flashinfer backend, for Ampere and newer. It compiles its kernels on
+    # first use, so the machine needs nvcc.
+    "flashinfer-python; sys_platform == 'linux'",
 ]
 
 [project.scripts]

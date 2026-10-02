@@ -6,9 +6,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from lean_vllm.attention import AttentionBackend, get_attention_backend
+from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend
 from lean_vllm.utils import device as dev
-from lean_vllm.utils.context import Context, get_context
+from lean_vllm.utils.context import Context, get_context, split_decodes_and_prefills
 
 # A custom op cannot take modules, so layers are looked up by name. One per process.
 _LAYERS: dict[str, "Attention"] = {}
@@ -59,7 +59,7 @@ def _(q: torch.Tensor, latent: torch.Tensor, out: torch.Tensor, layer_name: str)
 
 
 class Attention(nn.Module):
-    """Paged causal attention for one layer, executed by the selected backend."""
+    """Paged causal attention for one layer, executed by the backend chosen for it."""
 
     def __init__(
         self,
@@ -74,7 +74,9 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        backend_cls = backend or get_attention_backend()
+        # The default dtype is the model's while the runner builds it.
+        backend_cls = backend or get_attention_backend(
+            LayerSpec(head_dim, num_heads, num_kv_heads, torch.get_default_dtype()))
         self.backend = backend_cls(num_heads, head_dim, scale, num_kv_heads)
         self.k_cache = self.v_cache = torch.tensor([])
         self.layer_name = ""
@@ -90,6 +92,10 @@ class Attention(nn.Module):
         """What attend returns for this many tokens; forward sizes the op's output with it."""
         return (num_tokens, self.num_heads, self.head_dim)
 
+    def supports_full_cudagraph(self) -> bool:
+        """Whether a full graph may hold this layer's decode."""
+        return self.backend.supports_full_cudagraph()
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # Through an opaque op, so the compiled model splits here and attention runs eager between the pieces.
         out = q.new_empty(self.output_shape(q.size(0)))
@@ -102,9 +108,7 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             self.backend.store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
-            return self.backend.prefill(q, k, v, k_cache, v_cache, context)
-        return self.backend.decode(q, k_cache, v_cache, context)
+        return self.backend.forward(q, k, v, k_cache, v_cache, context)
 
 
 @dataclasses.dataclass(slots=True)
@@ -173,37 +177,11 @@ def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]
     return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
 
 
-def mla_partitions(context: Context) -> list[tuple[torch.Tensor, Context]]:
-    """Build each phase's metadata once, without reading lengths back from the device."""
-    if context.mla_partitions is None:
-        cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
-        device = context.block_tables.device
-        context.mla_partitions = []
-        for is_prefill in (False, True):
-            rows = [i for i, phase in enumerate(context.prefill_rows) if phase == is_prefill]
-            q_lens = [cu_q[i + 1] - cu_q[i] for i in rows]
-            k_lens = [cu_k[i + 1] - cu_k[i] for i in rows]
-            tokens = dev.make_tensor([t for i in rows for t in range(cu_q[i], cu_q[i + 1])], torch.int64, device)
-            row_indices = dev.make_tensor(rows, torch.int64, device)
-            sub_q, sub_k = [0, *accumulate(q_lens)], [0, *accumulate(k_lens)]
-            subset = Context(
-                is_prefill=is_prefill,
-                cu_seqlens_q=dev.make_tensor(sub_q, torch.int32, device),
-                cu_seqlens_k=dev.make_tensor(sub_k, torch.int32, device),
-                cu_seqlens_q_host=sub_q, cu_seqlens_k_host=sub_k,
-                max_seqlen_q=max(q_lens), max_seqlen_k=max(k_lens),
-                keys_are_new=sub_q == sub_k,
-                block_tables=context.block_tables[row_indices],
-                context_lens=context.context_lens[row_indices],
-            )
-            context.mla_partitions.append((tokens, subset))
-    return context.mla_partitions
-
-
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
     Cached latents expand max_context_chunk at a time, merged by log-sum-exp; MLA decode backends skip expanding.
+    This plays vLLM's MLACommonImpl, so it splits a step into decode and prefill itself.
     """
 
     max_context_chunk = 8192    # the runner sets its step token budget
@@ -219,7 +197,9 @@ class MLAAttention(Attention):
         latent_projections: Callable[[], tuple[torch.Tensor, torch.Tensor]],
         backend: type[AttentionBackend] | None = None,
     ):
-        super().__init__(num_heads, qk_head_dim, scale, num_heads, backend or get_attention_backend(mla=True))
+        backend = backend or get_attention_backend(
+            LayerSpec(qk_head_dim, num_heads, num_heads, torch.get_default_dtype(), latent_dim))
+        super().__init__(num_heads, qk_head_dim, scale, num_heads, backend)
         self.v_head_dim = v_head_dim
         self.latent_dim = latent_dim
         self.expand = expand    # methods of the owning layer, so not a registered submodule
@@ -235,6 +215,10 @@ class MLAAttention(Attention):
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
         return (num_tokens, self.num_heads, self.v_head_dim)
 
+    def supports_full_cudagraph(self) -> bool:
+        # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.
+        return self.backend.supports_mla_decode() and self.backend.supports_full_cudagraph_mla_decode()
+
     def forward(self, q: torch.Tensor, latent: torch.Tensor):
         out = q.new_empty(self.output_shape(q.size(0)))
         torch.ops.lean_vllm.mla_attention(q, latent, out, self.layer_name)
@@ -243,21 +227,22 @@ class MLAAttention(Attention):
     def attend(self, q: torch.Tensor, latent: torch.Tensor):
         context = get_context()
         cache = self.latent_cache
-        if cache.numel():
-            self.backend.store_latents(latent, cache, context.slot_mapping)
-            if not context.is_prefill and self.backend.supports_mla_decode():
-                return self._decode_latents(q, context)    # pure decode
-            if (context.is_prefill and context.prefill_rows is not None
-                    and not all(context.prefill_rows) and self.backend.supports_mla_decode()):    # mixed step, split below
-                out = q.new_empty(self.output_shape(q.size(0)))
-                for tokens, subset in mla_partitions(context):
-                    if subset.is_prefill:
-                        part = self._prefill(q[tokens], latent[tokens], subset)
-                    else:
-                        part = self._decode_latents(q[tokens], subset)
-                    out.index_copy_(0, tokens, part)
-                return out
-        return self._prefill(q, latent, context)    # expanded path
+        if not cache.numel():
+            return self._prefill(q, latent, context)    # warmup: no cache yet, so every key is new
+        self.backend.store_latents(latent, cache, context.slot_mapping)
+        if not self.backend.supports_mla_decode():
+            return self._prefill(q, latent, context)    # decode rows expand like prompt rows
+        if not context.is_prefill:
+            return self._decode_latents(q, context)    # pure decode
+        n, decodes, prefills = split_decodes_and_prefills(context)
+        if decodes is None:
+            return self._prefill(q, latent, prefills)
+        if prefills is None:
+            return self._decode_latents(q, decodes)
+        out = q.new_empty(self.output_shape(q.size(0)))
+        out[:n] = self._decode_latents(q[:n], decodes)
+        out[n:] = self._prefill(q[n:], latent[n:], prefills)
+        return out
 
     def _prefill(self, q: torch.Tensor, latent: torch.Tensor, context: Context) -> torch.Tensor:
         cache = self.latent_cache

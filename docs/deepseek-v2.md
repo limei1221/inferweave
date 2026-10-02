@@ -29,9 +29,9 @@ transformers ≥ 4.56 and need no `trust_remote_code`.
 
 ### Hardware and attention backends
 
-The backend is chosen automatically. For an MLA model the preference is
-`flashmla`, then `flash_attn_3`, then `torch`. Set
-`LEAN_VLLM_ATTENTION_BACKEND` to force one.
+Each MLA layer chooses its backend at init. The preference is `flashmla`, then
+`flash_attn_3`, then `torch`; `flashinfer` serves no MLA layer, as it has no
+`varlen_with_lse`. Set `LEAN_VLLM_ATTENTION_BACKEND` to force one.
 
 | Backend | Runs on | How decode reads the cache | CUDA graphs |
 |---|---|---|---|
@@ -146,10 +146,11 @@ as one shared key head. The value projection is applied after attention. vLLM
 does the same with `W_UK_T` and `W_UV`. `flashmla` and `torch` implement this
 as `mla_decode`. On `flash_attn_3`, decode rows are expanded like prefill.
 
-**Mixed batches** split into a decode subset, which uses `mla_decode`, and a
-prefill subset, which expands. The outputs are put back in the original token
-order before the output projection. The split and the chunk plan are computed
-once per step and reused by every layer.
+**Mixed batches** split into decode rows, which use `mla_decode`, and the rest,
+which expand. The runner puts one-query rows first, so the split is a slice, as
+in vLLM's MLA backends; a one-token prompt chunk decodes too, which attention
+cannot tell apart. The split and the chunk plan are computed once per step and
+reused by every layer.
 
 ### MoE
 

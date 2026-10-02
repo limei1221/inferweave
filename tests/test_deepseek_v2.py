@@ -100,7 +100,9 @@ def step(runner, model, seqs: list[Sequence]) -> list[torch.Tensor]:
     context["logits_indices"] = None
     with torch.inference_mode(), set_context(**context):
         logits = model.compute_logits(model(input_ids, positions))
-    return list(logits.split([seq.num_scheduled_tokens for seq in seqs]))
+    batch = ModelRunner.decodes_first(seqs)    # the batch's row order, decode rows first
+    by_row = dict(zip(map(id, batch), logits.split([seq.num_scheduled_tokens for seq in batch])))
+    return [by_row[id(seq)] for seq in seqs]
 
 
 def test_a_prompt_matches_transformers(models, runner):
@@ -152,7 +154,10 @@ def test_context_chunks_split_long_rows_and_skip_empty_ones():
 
 @pytest.mark.parametrize("latent_decode", [True, False])
 def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkeypatch, latent_decode):
-    """Decode must not expand its history when interleaved with resumed and cold prompts."""
+    """Decode must not expand its history when interleaved with resumed and cold prompts.
+
+    The runner moves one-query rows first, and a one-token prompt is one of them.
+    """
     reference, model = models
     monkeypatch.setattr(TorchAttention, "supports_mla_decode", staticmethod(lambda: latent_decode))
     layers = [module for module in model.modules() if isinstance(module, MLAAttention)]
@@ -184,10 +189,10 @@ def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkey
     for seq, tokens, got in zip(seqs, [c, a, d, b], step(runner, model, seqs)):
         want = reference_logits(reference, tokens)[seq.num_cached_tokens:]
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
-    assert decoded == ([[10, 7]] * len(layers) if latent_decode else [])
+    assert decoded == ([[10, 1, 7]] * len(layers) if latent_decode else [])
     if latent_decode:
-        # Three new prefill tokens and six cached prefill tokens per layer.
-        assert sum(expanded) == 9 * len(layers)
+        # c's two new tokens and six cached ones, per layer.
+        assert sum(expanded) == 8 * len(layers)
 
 
 class FakeAttention(torch.nn.Module):

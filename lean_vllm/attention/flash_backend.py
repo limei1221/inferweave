@@ -1,56 +1,14 @@
 import torch
 
+from lean_vllm.attention import triton_cache
 from lean_vllm.attention.abstract import AttentionBackend
 from lean_vllm.utils.context import Context
 
 _IMPORT_ERROR: ImportError | None = None
 try:
-    import triton
-    import triton.language as tl
     from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 except ImportError as e:    # Hopper only, and built by the cuda extra
     _IMPORT_ERROR = e
-else:
-
-    @triton.jit
-    def store_kvcache_kernel(
-        key_ptr,
-        key_stride,
-        value_ptr,
-        value_stride,
-        k_cache_ptr,
-        v_cache_ptr,
-        slot_mapping_ptr,
-        D: tl.constexpr,
-    ):
-        idx = tl.program_id(0)
-        slot = tl.load(slot_mapping_ptr + idx)
-        if slot == -1: return
-        key_offsets = idx * key_stride + tl.arange(0, D)
-        value_offsets = idx * value_stride + tl.arange(0, D)
-        key = tl.load(key_ptr + key_offsets)
-        value = tl.load(value_ptr + value_offsets)
-        cache_offsets = slot * D + tl.arange(0, D)
-        tl.store(k_cache_ptr + cache_offsets, key)
-        tl.store(v_cache_ptr + cache_offsets, value)
-
-
-    @triton.jit
-    def store_latents_kernel(
-        latent_ptr,
-        latent_stride,
-        cache_ptr,
-        slot_mapping_ptr,
-        D: tl.constexpr,
-        BLOCK: tl.constexpr,
-    ):
-        idx = tl.program_id(0)
-        slot = tl.load(slot_mapping_ptr + idx)
-        if slot == -1: return
-        offsets = tl.arange(0, BLOCK)
-        mask = offsets < D    # a latent is 576 wide for V2-Lite, so the block overhangs it
-        latent = tl.load(latent_ptr + idx * latent_stride + offsets, mask=mask)
-        tl.store(cache_ptr + slot * D + offsets, latent, mask=mask)
 
 
 class FlashAttention3Backend(AttentionBackend):
@@ -63,31 +21,22 @@ class FlashAttention3Backend(AttentionBackend):
     @staticmethod
     def is_available() -> bool:
         # FA3 is built for Hopper (sm90) only.
-        return (_IMPORT_ERROR is None and torch.cuda.is_available()
+        return (_IMPORT_ERROR is None and triton_cache._IMPORT_ERROR is None and torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] == 9)
 
     @staticmethod
     def supports_cuda_graph() -> bool:
         return True
 
+    @staticmethod
+    def supports_head_size(head_size: int) -> bool:
+        return head_size % 8 == 0 and head_size <= 256    # as vLLM's FlashAttention backend
+
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
-        num_tokens, num_heads, head_dim = key.shape
-        dim = num_heads * head_dim
-        assert key.stride(-1) == 1 and value.stride(-1) == 1
-        assert key.stride(1) == head_dim and value.stride(1) == head_dim
-        assert k_cache.stride(1) == dim and v_cache.stride(1) == dim
-        assert slot_mapping.numel() == num_tokens
-        store_kvcache_kernel[(num_tokens,)](
-            key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, dim
-        )
+        triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
-        num_tokens, dim = latent.shape
-        assert latent.stride(-1) == 1 and latent_cache.stride(-2) == dim
-        assert slot_mapping.numel() == num_tokens
-        store_latents_kernel[(num_tokens,)](
-            latent, latent.stride(0), latent_cache, slot_mapping, dim, triton.next_power_of_2(dim)
-        )
+        triton_cache.store_latents(latent, latent_cache, slot_mapping)
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         if context.keys_are_new or context.block_tables is None:

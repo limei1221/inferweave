@@ -4,7 +4,7 @@ import socket
 from dataclasses import dataclass
 from transformers import AutoConfig
 
-from lean_vllm.attention import get_attention_backend
+from lean_vllm.attention import LayerSpec, get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
 from lean_vllm.models import get_model_class
 
@@ -68,7 +68,16 @@ class Config:
             raise ValueError(f"enable_expert_parallel needs a MoE model, and {self.hf_config.architectures} has none")
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "kv_lora_rank", None) is not None:    # an MLA model
-            block_size = get_attention_backend(mla=True).mla_block_size()
+            block_size = get_attention_backend(self._mla_layer_spec()).mla_block_size()
             if block_size and block_size != self.kvcache_block_size:
                 logger.warning("kvcache_block_size is %d: the MLA decode kernel reads no other page size", block_size)
                 self.kvcache_block_size = block_size
+
+    def _mla_layer_spec(self) -> LayerSpec:
+        """What each MLA layer of one rank will ask of a backend, so the page size follows the one it gets."""
+        hf_config = self.hf_config
+        num_heads = hf_config.num_attention_heads // self.tensor_parallel_size
+        return LayerSpec(
+            hf_config.qk_nope_head_dim + hf_config.qk_rope_head_dim, num_heads, num_heads, hf_config.dtype,
+            latent_dim=hf_config.kv_lora_rank + hf_config.qk_rope_head_dim,
+        )

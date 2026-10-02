@@ -7,7 +7,9 @@ import torch
 
 from lean_vllm.engine.model_runner import (
     ModelRunner, PIECEWISE_MAX_PAD, PIECEWISE_MAX_TOKENS, PIECEWISE_MIN_TOKENS)
+from lean_vllm.attention import TorchAttention
 from lean_vllm.engine.sequence import Sequence
+from lean_vllm.layers.attention import Attention, MLAAttention
 from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.utils.context import Context, get_context
 
@@ -160,6 +162,25 @@ def test_keys_are_new_follows_the_cached_tokens(runner):
     assert not context["keys_are_new"]
 
 
+def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner):
+    """A splitting backend slices decode rows off the front; the scheduler reads tokens back by its own order."""
+    prompt = Sequence([10, 11, 12], SamplingParams(temperature=0.5))
+    prompt.num_scheduled_tokens = 3
+    decoding = Sequence([20, 21], SamplingParams(temperature=0.25))
+    decoding.append_token(22)
+    decoding.num_cached_tokens, decoding.num_scheduled_tokens, decoding.is_prefill = 2, 1, False
+    decoding.block_table = prompt.block_table = [0]    # any table, so the batch carries one
+
+    ids, positions, temperatures, context = runner.prepare_batch([prompt, decoding])
+
+    assert ids.tolist() == [22, 10, 11, 12]
+    assert positions.tolist() == [2, 0, 1, 2]
+    assert context["cu_seqlens_q_host"] == [0, 1, 4]
+    assert context["logits_indices"].tolist() == [3, 0]
+    assert temperatures.tolist() == [0.5, 0.25]
+    assert runner._sampling_rows == [prompt, decoding]
+
+
 def test_a_failed_step_leaves_no_context_behind(runner):
     """The next step, or a graph capture, must not read this one's layout."""
     seq = Sequence([10, 11, 12], SamplingParams())
@@ -258,30 +279,55 @@ class TestStepKind:
 
 
 class TestCudagraphMode:
-    """What an MLA model's backend leaves capturable. Pure: config and backend."""
+    """What the layers' backends leave capturable. Pure: config and layers."""
 
-    def mode(self, mode, decodes_latents, mla=True, full_safe=True):
-        backend = type("FakeBackend", (), {
+    def mode(self, mode, *full_safe):
+        layers = [type("FakeLayer", (), {"supports_full_cudagraph": lambda self, safe=safe: safe})() for safe in full_safe]
+        return ModelRunner._cudagraph_mode(mode, layers)
+
+    def test_one_layer_that_cannot_be_captured_costs_the_full_graphs(self):
+        """A full graph holds every layer's attention, so one host-planned decode rules it out."""
+        assert self.mode("full_and_piecewise", True, False) == "piecewise"
+        assert self.mode("full", True, False) == "none"
+
+    def test_capturable_layers_keep_the_mode(self):
+        assert self.mode("full_and_piecewise", True, True) == "full_and_piecewise"
+        assert self.mode("piecewise", False) == "piecewise"
+
+
+class TestFullCudagraphSupport:
+    """Which layers a full graph may hold, by kind and backend."""
+
+    @staticmethod
+    def backend(decodes_latents=True, full_safe=True, full=True):
+        return type("FakeBackend", (), {
             "supports_mla_decode": staticmethod(lambda: decodes_latents),
             "supports_full_cudagraph_mla_decode": staticmethod(lambda: full_safe),
+            "supports_full_cudagraph": staticmethod(lambda: full),
         })
-        return ModelRunner._cudagraph_mode(mode, mla, backend)
 
-    def test_a_backend_without_mla_decode_loses_its_full_graphs(self):
-        """They would capture attention expanding latents, which needs the step's host plan."""
-        assert self.mode("full_and_piecewise", decodes_latents=False) == "piecewise"
-        assert self.mode("full", decodes_latents=False) == "none"
+    @staticmethod
+    def mla_layer(backend):
+        layer = MLAAttention.__new__(MLAAttention)
+        torch.nn.Module.__init__(layer)
+        layer.backend = backend
+        return layer
 
-    def test_a_decode_that_bakes_a_schedule_loses_its_full_graphs(self):
-        """A backend that attends latents but bakes per-step state a replay cannot refresh."""
-        assert self.mode("full_and_piecewise", decodes_latents=True, full_safe=False) == "piecewise"
-        assert self.mode("full", decodes_latents=True, full_safe=False) == "none"
+    def test_an_mla_layer_without_latent_decode_cannot_be_captured(self):
+        """It would capture attention expanding latents, which needs the step's host plan."""
+        assert not self.mla_layer(self.backend(decodes_latents=False)).supports_full_cudagraph()
 
-    def test_a_backend_with_replay_safe_mla_decode_keeps_the_mode(self):
-        assert self.mode("full_and_piecewise", decodes_latents=True) == "full_and_piecewise"
+    def test_an_mla_decode_that_bakes_a_schedule_cannot_be_captured(self):
+        assert not self.mla_layer(self.backend(full_safe=False)).supports_full_cudagraph()
 
-    def test_a_model_without_mla_is_never_downgraded(self):
-        assert self.mode("full", decodes_latents=False, mla=False) == "full"
+    def test_a_replay_safe_mla_decode_can_be_captured(self):
+        assert self.mla_layer(self.backend()).supports_full_cudagraph()
+
+    def test_a_plain_layer_asks_its_backend(self):
+        for full in (True, False):
+            layer = Attention(2, 8, 0.5, 1, backend=TorchAttention)
+            layer.backend = self.backend(full=full)
+            assert layer.supports_full_cudagraph() is full
 
 
 @pytest.mark.parametrize("chunked", [False, True])

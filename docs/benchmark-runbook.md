@@ -64,7 +64,7 @@ VIRTUAL_ENV=~/workspace/lean-vllm/.venv uv pip install --no-build-isolation -v ~
 Confirm both device paths the sweep will take:
 
 ```bash
-uv run python -c 'from lean_vllm.attention import get_attention_backend; print(get_attention_backend(mla=True).get_name())'
+uv run python -c 'import torch; from lean_vllm.attention import LayerSpec, get_attention_backend; print(get_attention_backend(LayerSpec(192, 16, 16, torch.bfloat16, latent_dim=576)).get_name())'
 uv run python -c 'import torch; from lean_vllm.layers.fused_moe import use_triton; print("triton" if use_triton(torch.zeros(1, device="cuda")) else "torch")'
 ```
 
@@ -157,7 +157,7 @@ Record the build and environment with the results:
   git rev-parse HEAD
   git status --short
   git -C ~/workspace/FlashMLA rev-parse HEAD
-  uv run python -c 'from lean_vllm.attention import get_attention_backend; print("lean-vLLM MLA backend:", get_attention_backend(mla=True).get_name())'
+  uv run python -c 'import torch; from lean_vllm.attention import LayerSpec, get_attention_backend; print("lean-vLLM MLA backend:", get_attention_backend(LayerSpec(192, 16, 16, torch.bfloat16, latent_dim=576)).get_name())'
   nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
   uname -r
   uv run python --version

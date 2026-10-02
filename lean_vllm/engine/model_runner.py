@@ -1,11 +1,11 @@
 import logging
 import math
+from collections import Counter
 from datetime import timedelta
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
 
-from lean_vllm.attention import AttentionBackend, get_attention_backend
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
 from lean_vllm.engine.sampled_tokens import SampledTokens
@@ -37,21 +37,10 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         Sequence.block_size = self.block_size    # spawned workers never run LLMEngine.__init__
         self.device = dev.get_device()
-        mla = getattr(hf_config, "kv_lora_rank", None) is not None
-        attention_backend = get_attention_backend(mla=mla)
-        if rank == 0:
-            logger.info("attention backend: %s", attention_backend.get_name())
         self.step_kind = "enforced"    # how the last step ran: see _step_kind
         self._prev_tokens: SampledTokens | None = None    # the step still in flight, if any
         self._prev_rows: dict[int, int] | None = None       # seq_id -> its row in those tokens
         model_cls = get_model_class(hf_config)
-        self.enforce_eager = (config.enforce_eager or self.device.type != "cuda"
-                              or not attention_backend.supports_cuda_graph() or not model_cls.supports_cuda_graph)
-        mode = "none" if self.enforce_eager else config.cudagraph_mode
-        self.cudagraph_mode = self._cudagraph_mode(mode, mla, attention_backend)
-        if rank == 0 and self.cudagraph_mode != mode:
-            logger.info("%s MLA decode cannot run in a full graph; cudagraph_mode is %r not %r",
-                        attention_backend.get_name(), self.cudagraph_mode, mode)
         self.graph_bs: list[int] = []          # captured batch sizes, full graphs
         self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
         self.graphs: dict = {}
@@ -72,6 +61,18 @@ class ModelRunner:
         model_kwargs = {"enable_expert_parallel": True} if config.enable_expert_parallel else {}
         self.model = model_cls(hf_config, **model_kwargs)
         register_layers(self.model)    # before warmup_model, which runs the op
+        # Each layer chose its backend as it was built; graphs depend on all of them.
+        layers = [module for module in self.model.modules() if isinstance(module, Attention)]
+        if rank == 0:
+            counts = Counter(layer.backend.get_name() for layer in layers)
+            logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
+        self.enforce_eager = (config.enforce_eager or self.device.type != "cuda" or not model_cls.supports_cuda_graph
+                              or not all(layer.backend.supports_cuda_graph() for layer in layers))
+        mode = "none" if self.enforce_eager else config.cudagraph_mode
+        self.cudagraph_mode = self._cudagraph_mode(mode, layers)
+        if rank == 0 and self.cudagraph_mode != mode:
+            logger.info("some attention layer cannot run in a full graph; cudagraph_mode is %r not %r",
+                        self.cudagraph_mode, mode)
         for module in self.model.modules():
             if isinstance(module, MLAAttention):
                 # Warmup expands a step's worth of new latents, so a chunk this size fits what it measured.
@@ -155,14 +156,14 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        # Each layer names its cache layout: keys and values per head, or one MLA latent.
+        # Each layer names its cache layout, which its backend may choose: keys and values per head, or one MLA latent.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
-        layer_shape = layers[0].kv_cache_shape(1, self.block_size)
-        block_bytes = len(layers) * math.prod(layer_shape) * config.hf_config.dtype.itemsize
+        block_numel = sum(math.prod(layer.kv_cache_shape(1, self.block_size)) for layer in layers)
+        block_bytes = block_numel * config.hf_config.dtype.itemsize
         if config.num_kvcache_blocks <= 0:
             config.num_kvcache_blocks = dev.kvcache_bytes(self.device, config) // block_bytes
         assert config.num_kvcache_blocks > 0, "no memory left for the kv cache"
-        self.kv_cache = torch.empty(len(layers), *layers[0].kv_cache_shape(config.num_kvcache_blocks, self.block_size))
+        self.kv_cache = [torch.empty(layer.kv_cache_shape(config.num_kvcache_blocks, self.block_size)) for layer in layers]
         for layer, cache in zip(layers, self.kv_cache):
             layer.bind_kv_cache(cache)
 
@@ -180,8 +181,10 @@ class ModelRunner:
         context_lens, logits_indices, temperatures = [], [], []
         pending_dst, pending_src, sampling_rows = [], [], []
         is_prefill = any(seq.is_prefill for seq in seqs)
+        last_tokens = {}    # id(seq) -> where a sampling row's last token sits; a worker's copy has no seq_id
+        batch = self.decodes_first(seqs)
 
-        for seq in seqs:
+        for seq in batch:
             start = seq.num_cached_tokens
             end = start + seq.num_scheduled_tokens
             if seq.is_prefill:
@@ -200,10 +203,7 @@ class ModelRunner:
             max_seqlen_k = max(end, max_seqlen_k)
             context_lens.append(end)
             if end == seq.num_planned_tokens:    # nothing left to prefill, so this row samples
-                logits_indices.append(cu_seqlens_q[-1] - 1)
-                sampling_rows.append(seq)
-                if self.rank == 0:    # only the sampling rank owns sampling parameters
-                    temperatures.append(seq.temperature)
+                last_tokens[id(seq)] = cu_seqlens_q[-1] - 1
             if not seq.block_table:    # warmup
                 continue
             start_block = start // self.block_size
@@ -218,10 +218,16 @@ class ModelRunner:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
 
-        block_tables = self.prepare_block_tables(seqs) if any(seq.block_table for seq in seqs) else None
+        for seq in seqs:    # the scheduler's order, which it reads the sampled tokens back in
+            if id(seq) in last_tokens:
+                logits_indices.append(last_tokens[id(seq)])
+                sampling_rows.append(seq)
+                if self.rank == 0:    # only the sampling rank owns sampling parameters
+                    temperatures.append(seq.temperature)
+
+        block_tables = self.prepare_block_tables(batch) if any(seq.block_table for seq in batch) else None
         context = dict(
             is_prefill=is_prefill,
-            prefill_rows=[seq.is_prefill for seq in seqs],
             cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
             cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
             max_seqlen_q=max_seqlen_q,
@@ -253,6 +259,12 @@ class ModelRunner:
         self._sampling_rows = sampling_rows
         return input_ids, positions, temperatures, context
 
+    @staticmethod
+    def decodes_first(seqs: list[Sequence]) -> list[Sequence]:
+        """The batch's row order: one-query rows first, so a backend that splits a step slices them off, as vLLM's
+        reorder_batch. Stable, and a no-op on a pure-decode step."""
+        return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens > 1)
+
     def _prev_row(self, seq: Sequence) -> int:
         """Where this sequence sampled in the step still in flight."""
         row = self._prev_rows.get(seq.seq_id) if self._prev_rows else None
@@ -260,12 +272,10 @@ class ModelRunner:
         return row
 
     @staticmethod
-    def _cudagraph_mode(mode: str, mla: bool, backend: type[AttentionBackend]) -> str:
-        """The mode these captures can serve. A full graph holds attention, so MLA decode must both attend
-        latents and be safe to replay; a backend that is not falls back to piecewise (decode runs eager, the rest
-        of the model is still captured)."""
-        full_safe = backend.supports_mla_decode() and backend.supports_full_cudagraph_mla_decode()
-        if mla and mode in FULL_MODES and not full_safe:
+    def _cudagraph_mode(mode: str, layers: list[Attention]) -> str:
+        """The mode these captures can serve. A full graph holds attention, so every layer's decode must be
+        capturable; if one is not, full falls back to piecewise (attention runs eager, the rest is still captured)."""
+        if mode in FULL_MODES and not all(layer.supports_full_cudagraph() for layer in layers):
             return "piecewise" if mode in PIECEWISE_MODES else "none"
         return mode
 

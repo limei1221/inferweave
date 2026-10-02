@@ -46,10 +46,12 @@ def test_the_device_override_is_honoured(monkeypatch):
 
 
 def test_the_selector_reads_the_backend_variable(monkeypatch):
+    import torch
+    from lean_vllm.attention import LayerSpec
     from lean_vllm.attention.selector import get_attention_backend
     monkeypatch.setenv("LEAN_VLLM_ATTENTION_BACKEND", "nope")
     with pytest.raises(ValueError, match="unknown attention backend 'nope'"):
-        get_attention_backend()
+        get_attention_backend(LayerSpec(64, 4, 4, torch.float32))
 
 
 def test_the_profiler_is_built_only_when_asked_for(monkeypatch, tmp_path):

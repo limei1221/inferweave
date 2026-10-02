@@ -13,7 +13,7 @@ hardware.
 
 | | Project | Status |
 |---|---|---|
-| 0 | Attention backend abstraction | interface + Torch/FlashAttention backends done |
+| 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done (FlashInfer not yet run on a GPU) |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-09-13.md) |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-09-20.md)); GPU reference checks still to record |
 | 3 | Speculative decoding | |
@@ -25,15 +25,16 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                  # deps, dev tools, the server and the package, into .venv
-uv sync --extra cuda     # add FlashAttention-3, Triton and the torch vLLM pins (NVIDIA only)
+uv sync --extra cuda     # add FlashAttention-3, FlashInfer, Triton and the torch vLLM pins (NVIDIA only)
 uv sync --extra serve    # the server deps alone, for installing without the dev group
 ```
 
 Dao-AILab publishes no FlashAttention-3 wheel, so the `cuda` extra installs a
 third-party build of it, pinned by URL and hash. That build covers Linux on
 x86_64, against the torch pinned beside it. The kernels are Hopper's, so the
-backend reports itself unavailable on anything but an H100 or H200.
-DeepSeek-V2 also decodes with FlashMLA when it is built from source; see
+backend reports itself unavailable on anything but an H100 or H200. The extra
+also installs FlashInfer, which runs on Ampere and newer and compiles its
+kernels on first use, so it needs `nvcc`. DeepSeek-V2 also decodes with FlashMLA when it is built from source; see
 [docs/deepseek-v2.md](docs/deepseek-v2.md).
 
 Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
@@ -61,8 +62,8 @@ outputs = llm.generate(["Hello, lean-vLLM."], sampling_params)
 outputs[0]["text"]
 ```
 
-The attention backend is picked automatically and can be forced with
-`LEAN_VLLM_ATTENTION_BACKEND`. A MoE model's routed experts run a Triton kernel
+Each attention layer picks its backend automatically, and
+`LEAN_VLLM_ATTENTION_BACKEND` forces one. A MoE model's routed experts run a Triton kernel
 on CUDA, as vLLM's do, and `grouped_mm` elsewhere; `LEAN_VLLM_MOE_BACKEND`
 forces either. The kernel's tile sizes come from a config tuned offline by
 `benchmarks/tune_moe.py`, or from vLLM's defaults.
