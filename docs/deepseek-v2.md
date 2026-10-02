@@ -120,6 +120,10 @@ normalized compressed KV plus the shared rope key, with rope already applied.
 For V2-Lite that is 576 values, against the 16 × (192 + 128) = 5,120 a plain
 KV cache would need, or about 31 KB per token in bf16 across 27 layers.
 
+With `q_lora_rank` set (not V2-Lite), `q_a_proj` and `kv_a_proj_with_mqa` both
+read the hidden states, so they load into one `fused_qkv_a_proj` and run as one
+GEMM, as in vLLM.
+
 `MLAAttention` (`layers/attention.py`) owns this layout. The runner asks each
 layer for its `kv_cache_shape` rather than reading head counts off the config.
 
@@ -236,8 +240,7 @@ rotates adjacent pairs (GPT-J style), so its rope uses `is_neox_style=False`.
 2. Measure prefill, pure decode, mixed traffic and peak memory separately, and
    the end-to-end gain of latent decode in mixed batches.
 3. Profile and optimize: prefill cost, routing, latent projections and context
-   gathering. Tune the Triton MoE on an H100 and ship the file. For models with `q_lora_rank`, try fusing `q_a_proj` with
-   `kv_a_proj_with_mqa`, as vLLM does.
+   gathering. Tune the Triton MoE on an H100 and ship the file.
 4. Add features when a workload needs them: an MLA decode kernel beyond Hopper,
    quantization, pipeline parallelism, and data parallelism with all-to-all
    expert dispatch.

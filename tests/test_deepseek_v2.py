@@ -23,7 +23,7 @@ NUM_BLOCKS = 16
 
 CONFIGS = {
     "lite": {},
-    "q_lora": dict(q_lora_rank=24),
+    "q_lora": dict(q_lora_rank=24, attention_bias=True),    # biases load into the fused down-projection too
     "grouped_routing": dict(topk_method="group_limited_greedy", n_group=4, topk_group=2),
 }
 
@@ -216,11 +216,13 @@ def unsplit(layer, positions, hidden_states, residual, attend):
     attn = layer.self_attn
     if attn.q_lora_rank is None:
         q = attn.q_proj(hidden_states)
+        kv_lora = attn.kv_a_proj_with_mqa(hidden_states)
     else:
-        q_c = attn.q_a_layernorm(attn.q_a_proj(hidden_states))
-        q = attn.q_b_proj(q_c)
+        q_c, kv_lora = attn.fused_qkv_a_proj(hidden_states).split(
+            [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim], dim=-1,
+        )
+        q = attn.q_b_proj(attn.q_a_layernorm(q_c))
     q = q.view(-1, attn.num_local_heads, attn.qk_head_dim)
-    kv_lora = attn.kv_a_proj_with_mqa(hidden_states)
     kv_c, k_pe = kv_lora.split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
     kv_c_normed = attn.kv_a_layernorm(kv_c)
     q[..., attn.qk_nope_head_dim:], k_pe = attn.rotary_emb(positions, q[..., attn.qk_nope_head_dim:], k_pe.unsqueeze(1))

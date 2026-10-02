@@ -51,6 +51,22 @@ class ReplicatedLinear(LinearBase):
         return F.linear(x, self.weight, self.bias)
 
 
+class MergedReplicatedLinear(ReplicatedLinear):
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(input_size, sum(output_sizes), bias)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+        param.data.narrow(0, shard_offset, self.output_sizes[loaded_shard_id]).copy_(loaded_weight)
+
+
 class ColumnParallelLinear(LinearBase):
 
     def __init__(

@@ -6,7 +6,7 @@ from transformers import PretrainedConfig
 
 from lean_vllm.layers.attention import MLAAttention
 from lean_vllm.layers.layernorm import RMSNorm
-from lean_vllm.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear, divide
+from lean_vllm.layers.linear import ColumnParallelLinear, MergedReplicatedLinear, ReplicatedLinear, RowParallelLinear, divide
 from lean_vllm.layers.moe import FusedMoE
 from lean_vllm.layers.rotary_embedding import get_rope, rope_config, yarn_get_mscale
 from lean_vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -35,11 +35,14 @@ class DeepseekV2Attention(nn.Module):
 
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+            self.kv_a_proj_with_mqa = ReplicatedLinear(hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias)
         else:
-            self.q_a_proj = ReplicatedLinear(hidden_size, self.q_lora_rank, bias=bias)
+            # q_a_proj and kv_a_proj_with_mqa read the same input, so one GEMM does both
+            self.fused_qkv_a_proj = MergedReplicatedLinear(
+                hidden_size, [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], bias=bias,
+            )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = ReplicatedLinear(hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=bias)
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -100,11 +103,13 @@ class DeepseekV2Attention(nn.Module):
         """Up to attention: the query, and the latent this step caches."""
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)
         else:
-            q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
-            q = self.q_b_proj(q_c)
+            q_c, kv_lora = self.fused_qkv_a_proj(hidden_states).split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1,
+            )
+            q = self.q_b_proj(self.q_a_layernorm(q_c))
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        kv_lora = self.kv_a_proj_with_mqa(hidden_states)
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
         k_pe = k_pe.unsqueeze(1)    # add head dim of 1
@@ -268,6 +273,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
+        if config.q_lora_rank is not None:
+            self.packed_modules_mapping = {
+                **self.packed_modules_mapping,
+                "q_a_proj": ("fused_qkv_a_proj", 0),
+                "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
+            }
         self.model = DeepseekV2Model(config, enable_expert_parallel)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
