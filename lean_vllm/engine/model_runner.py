@@ -66,6 +66,7 @@ class ModelRunner:
         if rank == 0:
             counts = Counter(layer.backend.get_name() for layer in layers)
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
+        self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))    # replay hooks
         self.enforce_eager = (config.enforce_eager or self.device.type != "cuda" or not model_cls.supports_cuda_graph
                               or not all(layer.backend.supports_cuda_graph() for layer in layers))
         mode = "none" if self.enforce_eager else config.cudagraph_mode
@@ -306,7 +307,8 @@ class ModelRunner:
         """One graph for the whole model. Pure decode only: attention is inside it."""
         bs = input_ids.size(0)
         context = get_context()
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_bs = next(x for x in self.graph_bs if x >= bs)
+        graph = self.graphs[graph_bs]
         graph_vars = self.graph_vars
         graph_vars["input_ids"][:bs] = input_ids
         graph_vars["positions"][:bs] = positions
@@ -315,6 +317,8 @@ class ModelRunner:
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        for backend in self.attention_backends:    # e.g. FlashInfer re-plans the graph's decode
+            backend.before_full_graph_replay(context, graph_bs)
         graph.replay()
         return graph_vars["outputs"][:bs]
 
@@ -398,8 +402,9 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs]):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
+                             block_tables=block_tables[:bs], full_graph_size=bs):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup, which also plans FlashInfer
                 # The warmup scheduled MLA decode into the default pool; clear it so the capture reschedules
                 # into the graph's own pool (else the graph bakes pointers freed with this context).
                 get_context().mla_decode_metadata = None

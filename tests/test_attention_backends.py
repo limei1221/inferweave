@@ -643,3 +643,70 @@ def test_flashinfer_pages_list_each_rows_used_pages():
     assert indptr.tolist() == [0, 1, 3, 4]
     assert indices.tolist() == [4, 7, 2, 3]
     assert last_page_len.tolist() == [5, BLOCK_SIZE, 1]
+
+
+def test_flashinfer_pages_pad_a_graphs_rows_with_empty_ones():
+    context = Context(cu_seqlens_k_host=[0, 5, 5 + BLOCK_SIZE],
+                      block_tables=torch.tensor([[4, -1], [7, -1]], dtype=torch.int32))
+    indptr, indices, last_page_len = FlashInferBackend._pages(context, BLOCK_SIZE, num_rows=4)
+    assert indptr.tolist() == [0, 1, 2, 2, 2]
+    assert indices.tolist() == [4, 7]
+    assert last_page_len.tolist() == [5, BLOCK_SIZE, 1, 1]
+
+
+class FakeDecodeWrapper:
+    """Records what FlashInfer's decode wrapper is built with and planned with, and copies plans into its buffers
+    under use_cuda_graph, as the real one does."""
+
+    def __init__(self, workspace, layout, use_cuda_graph=False, use_tensor_cores=False, paged_kv_indptr_buffer=None,
+                 paged_kv_indices_buffer=None, paged_kv_last_page_len_buffer=None):
+        self.use_cuda_graph = use_cuda_graph
+        self.buffers = (paged_kv_indptr_buffer, paged_kv_indices_buffer, paged_kv_last_page_len_buffer)
+        self.plans = []
+
+    def plan(self, indptr, indices, last_page_len, num_heads, num_kv_heads, head_dim, page_size, **options):
+        self.plans.append((indptr.tolist(), indices.tolist(), last_page_len.tolist()))
+        if self.use_cuda_graph:
+            assert len(last_page_len) == len(self.buffers[2]), "a graph's wrapper plans its own batch size only"
+            self.buffers[0].copy_(indptr)
+            self.buffers[1][:len(indices)].copy_(indices)
+            self.buffers[2].copy_(last_page_len)
+
+    def run(self, q, kv_cache):
+        return torch.zeros_like(q)
+
+
+@pytest.fixture
+def fake_flashinfer(monkeypatch):
+    from lean_vllm.attention import flashinfer_backend
+    monkeypatch.setattr(flashinfer_backend, "BatchDecodeWithPagedKVCacheWrapper", FakeDecodeWrapper, raising=False)
+    monkeypatch.setattr(FlashInferBackend, "_wrappers", {})
+    monkeypatch.setattr(FlashInferBackend, "_graph_pages", None)
+    monkeypatch.setattr(FlashInferBackend, "_workspace", torch.zeros(1, dtype=torch.uint8))
+    return FlashInferBackend(NUM_HEADS, HEAD_DIM, SCALE, NUM_KV_HEADS)
+
+
+def test_flashinfer_full_graphs_get_a_wrapper_per_batch_size_replanned_before_replay(fake_flashinfer):
+    """Captured as the runner captures, largest first with worst-case lengths, then re-planned for a real step."""
+    backend, width = fake_flashinfer, 3
+    k_cache = v_cache = torch.zeros(8, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
+    for bs in (4, 2):
+        context = Context(context_lens=torch.full((bs,), width * BLOCK_SIZE, dtype=torch.int32),
+                          block_tables=torch.zeros(bs, width, dtype=torch.int32), full_graph_size=bs)
+        backend.decode(torch.zeros(bs, NUM_HEADS, HEAD_DIM), k_cache, v_cache, context)
+    graphs = {key[-1]: wrapper for key, wrapper in FlashInferBackend._wrappers.items()}
+    assert set(graphs) == {4, 2} and all(wrapper.use_cuda_graph for wrapper in graphs.values())
+    indptr, indices, _ = FlashInferBackend._graph_pages
+    assert graphs[2].buffers[1] is indices and graphs[2].buffers[0].data_ptr() == indptr.data_ptr()
+
+    step = Context(cu_seqlens_k_host=[0, 5, 5 + BLOCK_SIZE, 6 + BLOCK_SIZE],
+                   block_tables=torch.tensor([[4, -1], [7, 2], [3, -1]], dtype=torch.int32))
+    FlashInferBackend.before_full_graph_replay(step, 4)
+
+    assert graphs[4].plans[-1] == ([0, 1, 2, 3, 3], [4, 7, 3], [5, BLOCK_SIZE, 1, 1])
+    assert len(graphs[2].plans) == 1    # another graph's wrapper is left alone
+    assert indptr[:5].tolist() == [0, 1, 2, 3, 3] and indices[:3].tolist() == [4, 7, 3]
+
+    backend.decode(torch.zeros(3, NUM_HEADS, HEAD_DIM), k_cache, v_cache, step)    # an eager step
+    eager = [w for key, w in FlashInferBackend._wrappers.items() if key[-1] is None]
+    assert len(eager) == 1 and not eager[0].use_cuda_graph

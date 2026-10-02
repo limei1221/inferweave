@@ -53,6 +53,11 @@ class AttentionBackend(ABC):
         """False if decode cannot be captured in a full graph, e.g. it is planned on the host each step."""
         return True
 
+    @classmethod
+    def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
+        """Refresh what the full graph captured at batch_size reads but cannot compute itself, from this step's
+        pure-decode context, before it replays. vLLM's metadata builders run before every replay too."""
+
     @staticmethod
     def split_decodes() -> bool:
         """True if forward sends a step's one-query rows to decode and the rest to prefill, as vLLM's backends with

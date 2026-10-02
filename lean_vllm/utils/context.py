@@ -22,6 +22,7 @@ class Context:
     decode_split: tuple | None = None    # filled on first use by split_decodes_and_prefills
     attn_metadata: dict | None = None    # what a backend plans on the step's first layer, e.g. FlashInfer's wrappers
     piecewise_size: int | None = None    # the bucket whose piecewise graphs this pass captures or replays
+    full_graph_size: int | None = None    # the batch size whose full graph this pass captures
     num_actual_tokens: int | None = None    # the step's own rows, when a piecewise bucket pads it; None is all
 
 

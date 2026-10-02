@@ -30,7 +30,7 @@ AttentionBackend                  # the interface
 | Backend (name) | Runs on | Serves | KV page size | CUDA graphs | Splits decode from prefill |
 |---|---|---|---|---|---|
 | `torch` | Anything: CPU, Apple Silicon, any CUDA GPU | Any layer; fp32, fp16 or bf16 | Any multiple of 16 | No, always eager | Yes |
-| `flashinfer` | sm80 and newer (A100, H100, ...), Linux | Plain layers; fp16/bf16; head size 64, 128 or 256 | Any multiple of 16 | Piecewise only | Yes |
+| `flashinfer` | sm80 and newer (A100, H100, ...), Linux | Plain layers; fp16/bf16; head size 64, 128 or 256 | Any multiple of 16 | Full + piecewise | Yes |
 | `flash_attn_3` | H100 / H200 (sm90), Linux x86_64 | Plain and MLA layers; fp16/bf16; head size a multiple of 8, up to 256 | Any multiple of 16 | Full + piecewise | No |
 | `flashmla` | H100 / H200, with FlashMLA built from source | MLA layers with 512 + 64 latents; as FA3 otherwise | 64 | Full + piecewise | MLA layers split themselves |
 
@@ -101,6 +101,7 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | Per-layer selection by dtype, head size, head count and kind; a forced backend that cannot serve a layer | Every machine | Pass |
 | The decode/prefill split: its slices, and a split step against the reference | Every machine (`torch` splits) | Pass |
 | FlashInfer's page table built from host lengths | CPU | Pass |
+| FlashInfer's full-graph wrappers: one per batch size over shared buffers, padded rows, re-planned before replay | CPU, with a fake wrapper | Pass; never captured on a GPU |
 
 The reference is `dense_attention` in `tests/test_attention_backends.py`: the
 textbook formula, looped over heads, with no SDPA and no paging, so agreeing with
@@ -147,7 +148,10 @@ and `MLAAttention` answers with its own latent layout
 
 Capability flags tell the runner what a backend can do: `supports_cuda_graph()`,
 `supports_full_cudagraph()`, `split_decodes()`, `supports_mla_decode()`,
-`supports_full_cudagraph_mla_decode()` and `mla_block_size()`.
+`supports_full_cudagraph_mla_decode()` and `mla_block_size()`. One hook,
+`before_full_graph_replay(context, batch_size)`, runs on each layer's backend
+class before a full graph replays, to refresh state the graph reads but the
+host computes; it does nothing by default.
 
 ### Tensor shapes
 
@@ -266,9 +270,26 @@ The KV cache keeps the layout every backend uses (`[blocks, block_size, heads,
 dim]`, FlashInfer's `NHD`), and keys are stored by the same Triton scatter as
 FA3's.
 
-Full graphs are off for FlashInfer: its decode must be planned before each
-replay, and `_replay_full` has no hook for that yet, so a model on `flashinfer`
-runs piecewise graphs.
+Full graphs capture FlashInfer's decode as vLLM does. A replay runs no
+Python inside the graph, so nothing would plan it; instead:
+
+1. **Fixed buffers.** One page table (indptr, indices, last-page lengths) sized
+   for the largest captured batch, allocated on the first capture, which is the
+   largest. Each graph's wrapper is built with `use_cuda_graph=True` over slices
+   of it, so the captured kernel reads those addresses.
+2. **A wrapper per batch size.** Under CUDA graphs a wrapper's batch size is
+   fixed, so each captured size gets its own, keyed by `full_graph_size` in the
+   context. It is planned on the capture's warmup pass, with the capture's
+   worst-case lengths, and the capture reuses that plan.
+3. **Re-plan before replay.** `_replay_full` calls `before_full_graph_replay`,
+   which plans that size's wrappers from the step's host lengths, padded to the
+   graph's batch size with empty rows (last-page length 1, as vLLM pads). The
+   plan copies into the fixed buffers, so the replay reads the new step.
+
+This is safe because, in CUDA-graph mode, FlashInfer 0.7.0 decides split-KV
+from the batch size alone (`scheduler.cuh`), so a re-plan never asks for kernels
+the graph did not capture. Each wrapper also allocates its own int workspace,
+so roughly 36 captured sizes cost a few hundred MiB on top of the KV cache.
 
 ### Trade-offs of the torch backend
 
@@ -286,8 +307,7 @@ trade for a reference and for laptop development, and the wrong one for speed.
 
 1. Run the suite with `flashinfer` on an A100 or H100, then serve a Qwen3 model
    on it with FA3 disabled and compare against vLLM's FlashInfer backend.
-2. Capture FlashInfer decode in full graphs: fixed-size page-table buffers, one
-   decode wrapper per captured batch size, and a hook that re-plans before each
-   replay, as vLLM does.
+2. Capture a FlashInfer model's full graphs on a GPU and check its decode
+   against eager, then compare decode throughput with piecewise only.
 3. Let `decode` and `prefill` write into the split's output (`out=`), so a
    split step skips the copy.
