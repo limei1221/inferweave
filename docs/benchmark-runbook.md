@@ -4,8 +4,7 @@ Compare DeepSeek-V2-Lite (16B total, 2.4B active, MLA + MoE + YaRN) on one NVIDI
 H100-SXM5-80GB using the same workload and resource limits, with **chunked
 prefill enabled** and **full + piecewise CUDA graphs** on both engines.
 lean-vLLM decodes over latents with FlashMLA and runs the routed experts through
-its Triton MoE. lean-vLLM runs **two curves, async scheduling off and on**; vLLM
-runs **one curve at its default, which turns async scheduling on**.
+its Triton MoE. Both engines run **one curve each with async scheduling on**.
 
 The five offered loads—**1, 24, 32, 48, and 64 requests/s**—are the starting
 bracket, not a final one. V2-Lite activates only 2.4B parameters per token, so it
@@ -103,7 +102,7 @@ export RATES="1,24,32,48,64"
 export KVTOKENS=327680
 export PINNED="--max-num-batched-tokens 8192 --max-num-seqs 256 --enable-chunked-prefill"
 export TRACE_ARGS="--dataset lognormal --input-len 512 --output-len 128 --sigma 0.8 --temperature 0 --warmup 3 --timeout 1200"
-export LEAN_SERVER_ARGS="$PINNED --cudagraph-mode full_and_piecewise"
+export LEAN_SERVER_ARGS="$PINNED --cudagraph-mode full_and_piecewise --async-scheduling"
 export VLLM_SERVER_ARGS="$PINNED --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'"
 mkdir -p "$RUN_RESULTS"
 ```
@@ -119,7 +118,7 @@ mkdir -p "$RUN_RESULTS"
 | Batch token budget / maximum sequences | 8,192 / 256 |
 | Chunked prefill | Enabled |
 | CUDA graphs | Full + piecewise |
-| Async scheduling | lean-vLLM off and on; vLLM at its default, on |
+| Async scheduling | On for both engines |
 
 The graph-mode option differs between engines: lean-vLLM uses
 `--cudagraph-mode full_and_piecewise`; vLLM uses the equivalent
@@ -201,7 +200,7 @@ checks, warmup, and shutdown automatically.
 
 ```bash
 uv run python benchmarks/sweep.py \
-  --model "$MODEL" --engine lean-vllm --suite async \
+  --model "$MODEL" --engine lean-vllm --suite rate \
   --rates "$RATES" --num-requests 1000 --seed 0 \
   --max-model-len 4096 --kvcache-tokens "$KVTOKENS" \
   --server-args "$LEAN_SERVER_ARGS" \
@@ -235,7 +234,7 @@ Use a new output directory for a rerun to preserve the previous results.
 
 ## 5. Profile the step loop
 
-Run one load-48 point per arm with the step-loop profiler on. The server
+Run one load-48 point with the step-loop profiler on. The server
 inherits these variables from the sweep, and each arm's server log names its
 trace file. This trace is CPU-only; `await_tokens` shows the host waiting on
 the device.
@@ -243,21 +242,18 @@ the device.
 ```bash
 LEAN_PROFILE_DIR="$RUN_RESULTS/profile-48" LEAN_PROFILE_STEPS=600 \
   uv run python benchmarks/sweep.py \
-  --model "$MODEL" --engine lean-vllm --suite async \
+  --model "$MODEL" --engine lean-vllm --suite rate \
   --rates 48 --num-requests 1000 --seed 0 \
   --max-model-len 4096 --kvcache-tokens "$KVTOKENS" \
   --server-args "$LEAN_SERVER_ARGS" \
   --client-args "$TRACE_ARGS" --out "$RUN_RESULTS/profile-48"
 ```
 
-The offline pair adds device activity, which gives the GPU idle fraction to
-record for each arm on this model. `bench_offline.py` loads a fixed model path;
-point it at the V2-Lite-Chat directory before running so the idle fraction
-reflects the model under test:
+The offline run adds device activity, which gives the GPU idle fraction.
+`bench_offline.py` loads a fixed model path; point it at the V2-Lite-Chat
+directory before running so the idle fraction reflects the model under test:
 
 ```bash
-LEAN_PROFILE_DIR="$RUN_RESULTS/offline-off" LEAN_PROFILE_CUDA=1 \
-  uv run python benchmarks/bench_offline.py --no-async-scheduling
 LEAN_PROFILE_DIR="$RUN_RESULTS/offline-on" LEAN_PROFILE_CUDA=1 \
   uv run python benchmarks/bench_offline.py --async-scheduling
 ```
@@ -268,7 +264,7 @@ Print the same metrics for both engines:
 
 ```bash
 jq -r '.engine as $engine | .rows[] | [$engine, .arm, .request_rate, .completed, .rejection_rate, .failure_rate, .goodput, .output_tok_s, .ttft_p99, .tpot_p50, .e2e_p99] | @tsv' \
-  "$RUN_RESULTS/lean-v2lite/async/summary.json" \
+  "$RUN_RESULTS/lean-v2lite/rate/summary.json" \
   "$RUN_RESULTS/vllm-v2lite/rate/summary.json"
 ```
 
@@ -288,8 +284,8 @@ Before drawing conclusions:
 
 - Check that each run completed all 1,000 requests without failures or rejections.
   Goodput has no latency cutoff, so read it alongside latency.
-- Compare matching offered loads and workload settings. The like-for-like pair
-  is lean-vLLM's `async-scheduling=True` arm against vLLM. Find where throughput
+- Compare matching offered loads and workload settings. Both engines run with
+  async scheduling on, so the curves are directly comparable. Find where throughput
   levels off and tail latency rises sharply—the saturation knee. If it sits at
   or beyond the top rate, extend `RATES` upward and rerun into a new directory.
 - Confirm both engines decoded with an MLA kernel, not an expanded fallback, and
@@ -312,5 +308,5 @@ tar czf "${RUN_RESULTS}.tar.gz" "$RUN_RESULTS"
 
 Write the report around the matched throughput and latency curves, with the
 commit, the FlashMLA commit, engine versions, hardware, and clock conditions
-alongside them. Report the async scheduling mode and MLA decode kernel of every
-curve, and the offline GPU idle fraction for both arms.
+alongside them. Report the MLA decode kernel of every curve, and the offline GPU
+idle fraction.
