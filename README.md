@@ -17,7 +17,7 @@ hardware.
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-09-13.md) |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-09-20.md)); GPU reference checks still to record |
 | 3 | Speculative decoding | |
-| 4 | Disaggregated prefill / decode | |
+| 4 | Disaggregated prefill / decode | vLLM's connector interface with NixlConnector's pull protocol over TCP, and a proxy; checked end to end on CPU against a single engine ([docs](docs/disaggregated-prefill.md)); not yet run on a GPU |
 
 ## Install
 
@@ -97,6 +97,10 @@ time-to-first-token:
 ```bash
 uv run python example_serving.py
 ```
+
+Prefill and decode can also run on separate servers behind `lean-vllm proxy`,
+with the KV cache pulled from one to the other; see
+[docs/disaggregated-prefill.md](docs/disaggregated-prefill.md).
 
 Sampling parameters the engine does not implement (`top_p`, `seed`, penalties,
 `n > 1`, and the rest) are refused with a 400 rather than ignored, and a `model`

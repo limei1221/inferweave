@@ -117,12 +117,17 @@ async def _serve(
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine thread died: {engine.error!r}")
+    kv_transfer_params = body.kv_transfer_params
+    if body.stream and kv_transfer_params and kv_transfer_params.get("do_remote_decode"):
+        # A stream has nowhere to return the params, so the blocks would sit held until they expire.
+        raise HTTPException(400, "do_remote_decode needs a non-streaming request")
     request_id = f"{'chatcmpl' if chat else 'cmpl'}-{uuid4().hex}"
     sampling_params = SamplingParams(
         temperature=body.temperature,
         max_tokens=body.max_tokens,
         ignore_eos=body.ignore_eos,
         priority=body.priority,
+        kv_transfer_params=kv_transfer_params,
     )
     try:
         outputs = await engine.add_request(prompt_token_ids, sampling_params, request_id)
@@ -170,7 +175,7 @@ async def _disconnected(request: Request):
 async def _deltas(
     outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLMEngine, request_id: str,
 ):
-    """Yields (text, finish_reason, num_completion_tokens); the last has a reason."""
+    """Yields (text, finish_reason, num_completion_tokens, kv_transfer_params); the last has a reason."""
     num_tokens = 0
     try:
         async for output in outputs:
@@ -178,32 +183,37 @@ async def _deltas(
             text = checker.push(output.text)
             if checker.matched:
                 engine.abort(request_id, "stop")    # frees the blocks, counted as a finish rather than a cancel
-                yield text, "stop", num_tokens
+                yield text, "stop", num_tokens, None
                 return
             if output.finished:
                 if output.finish_reason not in FINISH_REASONS:
                     status = DROP_STATUS.get(output.finish_reason, 503)
                     raise HTTPException(status, f"the engine dropped the request: {output.finish_reason}")
-                yield text + checker.flush(), FINISH_REASONS[output.finish_reason], num_tokens
+                reason = FINISH_REASONS[output.finish_reason]
+                yield text + checker.flush(), reason, num_tokens, output.kv_transfer_params
                 return
             if text:
-                yield text, None, num_tokens
+                yield text, None, num_tokens, None
     finally:
         await outputs.aclose()
 
 
 async def _collect(deltas, request_id: str, model: str, num_prompt_tokens: int, chat: bool):
-    text, finish_reason, num_tokens = "", "stop", 0
-    async for delta, reason, num_tokens in deltas:
+    text, finish_reason, num_tokens, kv_transfer_params = "", "stop", 0, None
+    async for delta, reason, num_tokens, kv_transfer_params in deltas:
         text += delta
         finish_reason = reason or finish_reason
     usage = protocol.usage(num_prompt_tokens, num_tokens)
     if chat:
         message = protocol.ChatMessage(role="assistant", content=text)
         choice = protocol.ChatCompletionResponseChoice(index=0, message=message, finish_reason=finish_reason)
-        return protocol.ChatCompletionResponse(id=request_id, model=model, choices=[choice], usage=usage)
+        return protocol.ChatCompletionResponse(
+            id=request_id, model=model, choices=[choice], usage=usage, kv_transfer_params=kv_transfer_params,
+        )
     choice = protocol.CompletionResponseChoice(index=0, text=text, finish_reason=finish_reason, logprobs=None)
-    return protocol.CompletionResponse(id=request_id, model=model, choices=[choice], usage=usage)
+    return protocol.CompletionResponse(
+        id=request_id, model=model, choices=[choice], usage=usage, kv_transfer_params=kv_transfer_params,
+    )
 
 
 async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_prompt_tokens: int, chat: bool):
@@ -227,7 +237,7 @@ async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_pr
         if chat:
             yield chunk([choice("", None, role="assistant")])
         try:
-            async for delta, reason, num_tokens in deltas:
+            async for delta, reason, num_tokens, _ in deltas:
                 yield chunk([choice(delta, reason)])
         except (EngineDeadError, HTTPException) as error:
             # The 200 is already sent, so the error rides in the stream.

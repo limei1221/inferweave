@@ -6,6 +6,7 @@ from transformers import AutoConfig
 
 from lean_vllm.attention import LayerSpec, get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
+from lean_vllm.kv_transfer import KVTransferConfig, parse_kv_transfer_config
 from lean_vllm.models import get_model_class
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,8 @@ class Config:
     request_timeout: float = 0.0       # seconds a request may wait unscheduled; 0 is none
     long_prefill_token_threshold: int = 0    # per-step token cap for one prompt; 0 is none
     dist_port: int = 0    # rendezvous port for the ranks; 0 picks a free one
+    kv_transfer_config: str = ""    # JSON, as vLLM's --kv-transfer-config; empty disaggregates nothing
+    kv_transfer: KVTransferConfig | None = None    # kv_transfer_config, parsed
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -61,6 +64,8 @@ class Config:
             # Ranks above zero never see the sampled tokens, so they could not follow.
             logger.warning("async_scheduling is off: tensor_parallel_size > 1 does not support it")
             self.async_scheduling = False
+        if self.kv_transfer_config and self.kv_transfer is None:
+            self.kv_transfer = parse_kv_transfer_config(self.kv_transfer_config)
         if not self.dist_port:    # resolved here, so spawned workers get the same one
             self.dist_port = _free_port()
         self.hf_config = AutoConfig.from_pretrained(self.model)

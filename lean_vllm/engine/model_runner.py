@@ -10,6 +10,7 @@ from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
+from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, KVOutputAggregator, create_worker_connector
 from lean_vllm.models import get_model_class
 from lean_vllm.layers.attention import Attention, MLAAttention, register_layers
 from lean_vllm.layers.sampler import Sampler
@@ -84,6 +85,11 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+        self.kv_connector = None
+        if config.kv_transfer is not None:
+            self.kv_connector = create_worker_connector(config, rank)
+            self.kv_connector.register_kv_caches(self.kv_cache)
+            self.kv_aggregator = KVOutputAggregator(self.world_size)
         if self.cudagraph_mode in FULL_MODES:
             self.capture_cudagraph()
         if self.cudagraph_mode in PIECEWISE_MODES:
@@ -95,6 +101,8 @@ class ModelRunner:
             self.loop()
 
     def exit(self):
+        if self.kv_connector is not None:
+            self.kv_connector.shutdown()
         if self.world_size > 1:
             dist.barrier()    # sync ranks
         if self.cudagraph_mode != "none":
@@ -118,6 +126,16 @@ class ModelRunner:
             dist.broadcast_object_list([method_name, args], src=0, group=self.call_group)
         method = getattr(self, method_name, None)
         return method(*args)
+
+    def kv_connector_step(self, metadata: KVConnectorMetadata) -> KVConnectorOutput | None:
+        """Start this step's transfers on every rank, and return those finished on all of them (rank 0 only)."""
+        self.kv_connector.start_load_kv(metadata)
+        output = self.kv_connector.get_finished()
+        if self.world_size == 1:
+            return output
+        outputs = [None] * self.world_size if self.rank == 0 else None
+        dist.gather_object(output, outputs, dst=0, group=self.call_group)
+        return self.kv_aggregator.aggregate(outputs) if self.rank == 0 else None
 
     def compile_model(self):
         """As vLLM: traced whole, split at attention, pieces compiled by Inductor. Warmup's step runs the compile."""

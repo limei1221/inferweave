@@ -11,6 +11,7 @@ from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.scheduler import QueueFull, Scheduler
 from lean_vllm.engine.sequence import Sequence
+from lean_vllm.kv_transfer import KVConnectorOutput
 from lean_vllm.sampling_params import SamplingParams
 
 EOS = 7
@@ -33,6 +34,8 @@ class FakeConfig:
     request_timeout: float = 0.0
     long_prefill_token_threshold: int = 0
     async_scheduling: bool = False    # off, unlike Config: most tests count steps in sync order
+    tensor_parallel_size: int = 1
+    kv_transfer: object = None    # a KVTransferConfig turns the connector on
 
 
 class FakeSampledTokens:
@@ -51,6 +54,12 @@ class FakeModelRunner:
     def __init__(self, eos_after: dict[str, int] | None = None):
         self.eos_after = eos_after or {}
         self.batches: list[tuple[bool, list[tuple[str, int]]]] = []
+        self.kv_metadata: list = []    # what each kv_connector_step was handed
+        self.kv_outputs: list = []    # what the next ones report, oldest first
+
+    def kv_connector_step(self, metadata):
+        self.kv_metadata.append(metadata)
+        return self.kv_outputs.pop(0) if self.kv_outputs else KVConnectorOutput()
 
     def call(self, method_name, *args):
         return getattr(self, method_name)(*args)
@@ -119,6 +128,7 @@ class FakeEngine:
                 finished=seq.is_finished,
                 finish_reason=seq.finish_reason,
                 metrics=seq.metrics() if seq.is_finished else None,
+                kv_transfer_params=seq.kv_transfer_result,
             )
             for seq in stepped
         ]
@@ -138,6 +148,9 @@ class FakeEngine:
 
     def _launch(self):
         output = self.last_output = self.scheduler.schedule()
+        if output.kv_connector_metadata is not None:
+            kv_output = self.model_runner.call("kv_connector_step", output.kv_connector_metadata)
+            self.scheduler.update_from_kv_connector_output(kv_output)
         if output:
             pending = self.model_runner.call("run", output.scheduled)
             rows = self.scheduler.advance(output.scheduled)

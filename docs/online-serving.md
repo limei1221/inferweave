@@ -38,6 +38,7 @@ Both completion endpoints stream over Server-Sent Events (SSE) with
 | `n` (completions per prompt) | 1 only |
 | `ignore_eos` (extra) | Generates the full `max_tokens` |
 | `priority` (extra) | Lower runs first, under `--scheduling-policy priority` |
+| `kv_transfer_params` (extra) | Disaggregated prefill, as vLLM's; see [disaggregated-prefill.md](disaggregated-prefill.md) |
 | `top_p`, `top_k`, `min_p`, `seed`, penalties, `logprobs`, `logit_bias`, `tools`, `echo`, `suffix`, `best_of` | **Refused with a 400** |
 
 Unsupported fields are refused rather than ignored, because ignoring them would
@@ -125,6 +126,7 @@ time to first token.
 | `--enforce-eager` | off | Same as `--cudagraph-mode none` |
 | `--tensor-parallel-size` | 1 | GPUs per model, up to 8 |
 | `--enable-expert-parallel` | off | MoE models: each GPU holds whole experts, not a slice of each ([deepseek-v2.md](deepseek-v2.md#expert-parallelism)) |
+| `--kv-transfer-config` | none | JSON; makes the server a prefill or decode instance ([disaggregated-prefill.md](disaggregated-prefill.md)) |
 
 Admission control is off by default, as in vLLM, so overload shows up as p99
 latency rather than rejections. Read goodput alongside p99.

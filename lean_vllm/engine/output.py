@@ -41,3 +41,4 @@ class RequestOutput:
     finished: bool = False
     finish_reason: str | None = None
     metrics: RequestMetrics | None = None
+    kv_transfer_params: dict | None = None    # on a prefill instance's final output: where the decode pulls from

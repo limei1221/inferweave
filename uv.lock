@@ -604,6 +604,7 @@ cuda = [
 ]
 serve = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pydantic" },
     { name = "uvicorn" },
 ]
@@ -625,6 +626,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.115" },
     { name = "flash-attn-3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda'", url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0%2Bcu130torch2.11gite2743ab-cp39-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux' and extra == 'cuda'" },
+    { name = "httpx", marker = "extra == 'serve'" },
     { name = "pydantic", marker = "extra == 'serve'", specifier = ">=2" },
     { name = "safetensors" },
     { name = "tokenizers", specifier = ">=0.22" },

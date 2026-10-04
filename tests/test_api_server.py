@@ -42,6 +42,7 @@ class FakeAsyncEngine:
         self.error = None
         self.admission_error: Exception | None = None
         self.hang = False    # never finish, like a request the client gives up on
+        self.kv_transfer_params = None    # what the final output hands back, as a prefill instance's does
         self.requests: list[tuple] = []
         self.aborted: list[tuple[str, str]] = []
 
@@ -69,6 +70,7 @@ class FakeAsyncEngine:
                     text=piece,
                     finished=last,
                     finish_reason=self.finish_reason if last else None,
+                    kv_transfer_params=self.kv_transfer_params if last else None,
                 )
             if self.hang:
                 await asyncio.Event().wait()
@@ -313,3 +315,34 @@ class TestRefusals:
         payloads = events(complete(client, stream=True))
         assert payloads[-1] == "[DONE]"
         assert json.loads(payloads[-2])["error"]["type"] == "server_error"
+
+
+class TestDisaggregatedPrefill:
+
+    PARAMS = {"do_remote_prefill": True, "remote_block_ids": [3, 4], "remote_request_id": "cmpl-p"}
+
+    def test_the_request_s_params_reach_the_engine(self, client, engine):
+        complete(client, kv_transfer_params=self.PARAMS)
+        assert engine.requests[0][1].kv_transfer_params == self.PARAMS
+
+    def test_a_prefill_instance_s_reply_carries_them_back(self, client, engine):
+        """What the proxy forwards to the decode instance."""
+        engine.kv_transfer_params = self.PARAMS
+        assert complete(client, kv_transfer_params={"do_remote_decode": True}).json()["kv_transfer_params"] == self.PARAMS
+
+    def test_a_chat_reply_carries_them_too(self, client, engine):
+        engine.kv_transfer_params = self.PARAMS
+        response = client.post("/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "kv_transfer_params": {"do_remote_decode": True},
+        })
+        assert response.json()["kv_transfer_params"] == self.PARAMS
+
+    def test_a_streamed_hand_off_is_refused(self, client, engine):
+        """A stream has nowhere to put the params, so the held blocks would only wait out their timeout."""
+        response = complete(client, stream=True, kv_transfer_params={"do_remote_decode": True})
+        assert response.status_code == 400
+        assert "non-streaming" in response.json()["error"]["message"]
+        assert not engine.requests
+
+    def test_a_streamed_decode_is_fine(self, client):
+        assert complete(client, stream=True, kv_transfer_params=self.PARAMS).status_code == 200

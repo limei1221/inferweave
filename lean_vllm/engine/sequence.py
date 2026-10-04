@@ -30,6 +30,7 @@ HASH_ALGOS = {"sha256": sha256_hash, "xxhash": xxhash_hash}
 
 class SequenceStatus(Enum):
     WAITING = auto()
+    WAITING_FOR_REMOTE_KVS = auto()    # admitted, its blocks loading from a prefill instance
     RUNNING = auto()
     FINISHED = auto()
 
@@ -62,6 +63,10 @@ class Sequence:
         self.stop_token_ids = sampling_params.stop_token_ids
         self.skip_special_tokens = sampling_params.skip_special_tokens
         self.priority = sampling_params.priority
+        # Copied, as the connector marks it and generate() shares one SamplingParams across prompts.
+        params = sampling_params.kv_transfer_params
+        self.kv_transfer_params: dict | None = dict(params) if params is not None else None
+        self.kv_transfer_result: dict | None = None    # what the connector hands back on finishing
         self.finish_reason: str | None = None
         self.num_preemptions = 0
         self.arrival_time = perf_counter()

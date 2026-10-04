@@ -18,6 +18,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LEAN_VLLM_MOE_BACKEND": lambda: os.getenv("LEAN_VLLM_MOE_BACKEND") or None,
     # A folder of tuned MoE launch configs, searched before the shipped ones; as vLLM's VLLM_TUNED_CONFIG_FOLDER.
     "LEAN_VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("LEAN_VLLM_TUNED_CONFIG_FOLDER") or None,
+    # Seconds a prefill instance holds a request's KV blocks for a decode instance to read; as VLLM_NIXL_ABORT_REQUEST_TIMEOUT.
+    "LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT": lambda: float(os.getenv("LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT", "480")),
     # Enables the step-loop profiler, which writes its trace here.
     "LEAN_PROFILE_DIR": lambda: os.getenv("LEAN_PROFILE_DIR") or None,
     # Steps skipped, then steps captured.

@@ -202,7 +202,7 @@ class Metrics:
             self.prefix_cache_queries.inc(output.num_queried_blocks)
             self.prefix_cache_hits.inc(output.num_cached_blocks)
             self.running.set(len(scheduler.running))
-            self.waiting.set(len(scheduler.waiting))
+            self.waiting.set(len(scheduler.waiting) + len(scheduler.recving))    # as vLLM, loads count as waiting
             self.kv_usage.set(scheduler.block_manager.usage)
             for request_output in outputs:
                 if request_output.finished:

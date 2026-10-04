@@ -16,10 +16,17 @@ from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, Scheduler, SchedulerOutput
 from lean_vllm.engine.model_runner import ModelRunner
+from lean_vllm.kv_transfer import KVTransferConfig, check_kv_transfer_params
 from lean_vllm.utils.detokenizer import FastIncrementalDetokenizer
 
 
-def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_size: int, max_model_len: int):
+def validate_request(
+    prompt: list[int],
+    sampling_params: SamplingParams,
+    vocab_size: int,
+    max_model_len: int,
+    kv_transfer: KVTransferConfig | None = None,
+):
     """Every front door comes through here, so nothing invalid reaches the runner."""
     if not prompt:
         raise InvalidRequest("the prompt is empty")
@@ -33,6 +40,10 @@ def validate_request(prompt: list[int], sampling_params: SamplingParams, vocab_s
             f"prompt ({len(prompt)}) plus max_tokens ({sampling_params.max_tokens}) "
             f"is over the {max_model_len}-token context"
         )
+    if sampling_params.kv_transfer_params is not None:
+        problem = check_kv_transfer_params(sampling_params.kv_transfer_params, kv_transfer)
+        if problem:
+            raise InvalidRequest(problem)
 
 
 def load_tokenizer(model: str) -> PreTrainedTokenizerFast:
@@ -143,7 +154,8 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, request_id: str | None = None) -> str:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
-        validate_request(prompt, sampling_params, self.config.hf_config.vocab_size, self.config.max_model_len)
+        config = self.config
+        validate_request(prompt, sampling_params, config.hf_config.vocab_size, config.max_model_len, config.kv_transfer)
         seq = Sequence(prompt, sampling_params, request_id)
         detokenizer = FastIncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
         try:
@@ -189,6 +201,11 @@ class LLMEngine:
     def _launch(self) -> SchedulerOutput:
         with record_function("schedule"):
             output = self.scheduler.schedule()
+        if output.kv_connector_metadata is not None:
+            with record_function("kv_connector"):
+                # Every step, scheduled or not, so loads start and finished transfers come back while idle.
+                kv_output = self.model_runner.call("kv_connector_step", output.kv_connector_metadata)
+                self.scheduler.update_from_kv_connector_output(kv_output)
         if output:
             with record_function("launch"):
                 pending = self.model_runner.call("run", output.scheduled)
@@ -217,6 +234,7 @@ class LLMEngine:
             finished=seq.is_finished,
             finish_reason=seq.finish_reason,
             metrics=seq.metrics() if seq.is_finished else None,
+            kv_transfer_params=seq.kv_transfer_result,
         )
 
     def _dropped(self, seq: Sequence) -> RequestOutput:

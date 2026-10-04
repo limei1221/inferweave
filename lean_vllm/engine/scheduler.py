@@ -6,6 +6,7 @@ from lean_vllm.config import Config
 from lean_vllm.engine.sequence import Sequence, SequenceStatus
 from lean_vllm.engine.block_manager import BlockManager
 from lean_vllm.engine.policy import SchedulingPolicy
+from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, create_scheduler_connector
 
 
 @dataclass(slots=True)
@@ -19,6 +20,7 @@ class SchedulerOutput:
     num_decode_tokens: int = 0
     num_queried_blocks: int = 0    # prefix cache, counted at admission
     num_cached_blocks: int = 0
+    kv_connector_metadata: KVConnectorMetadata | None = None    # None without a connector
 
     def __bool__(self):
         return bool(self.scheduled)
@@ -60,12 +62,16 @@ class Scheduler:
         self.waiting = SchedulingPolicy.create(config.scheduling_policy)
         self.running: deque[Sequence] = deque()
         self.seqs: dict[str, Sequence] = {}    # live requests, for abort
+        self.connector = create_scheduler_connector(config) if config.kv_transfer is not None else None
+        self.recving: dict[str, Sequence] = {}    # admitted, their blocks loading from a prefill instance
+        self.sending: dict[str, Sequence] = {}    # finished, their blocks held for a decode instance to read
 
     def is_finished(self):
-        return not self.waiting and not self.running
+        return not self.waiting and not self.running and not self.recving and not self.sending
 
     def add(self, seq: Sequence):
-        if seq.request_id in self.seqs:
+        # An aborted load or a held send still owns blocks under its id.
+        if seq.request_id in self.seqs or seq.request_id in self.recving or seq.request_id in self.sending:
             raise DuplicateRequestId(f"{seq.request_id} is already in flight")
         if self.max_waiting_requests and len(self.waiting) >= self.max_waiting_requests:
             raise QueueFull(f"{len(self.waiting)} requests already waiting")
@@ -77,11 +83,14 @@ class Scheduler:
         seq = self.seqs.pop(request_id, None)
         if seq is None:
             return False
+        if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            self._finish(seq, reason)    # its blocks are being written; they are freed once the load ends
+            return True
         queue = self.waiting if seq.status == SequenceStatus.WAITING else self.running
         queue.remove(seq)    # both queues expose remove()
         seq.drop_pending()
-        self.block_manager.deallocate(seq)
         self._finish(seq, reason)
+        self._free(seq)
         return True
 
     def schedule(self) -> SchedulerOutput:
@@ -91,7 +100,7 @@ class Scheduler:
             output = self._schedule_whole_prompts()
             output.dropped = dropped + output.dropped
             if output:
-                return output    # prefill-only step
+                return self._with_connector_meta(output)    # prefill-only step
             dropped = output.dropped    # nothing to run, but the drops still owe an output
         output = SchedulerOutput(dropped=dropped)
         budget = self.max_num_batched_tokens
@@ -128,6 +137,11 @@ class Scheduler:
                     break
                 budget -= self._admit(seq, num_cached_blocks, budget, output)
 
+        return self._with_connector_meta(output)
+
+    def _with_connector_meta(self, output: SchedulerOutput) -> SchedulerOutput:
+        if self.connector is not None:
+            output.kv_connector_metadata = self.connector.build_connector_meta()
         return output
 
     def _expire_waiting(self) -> list[Sequence]:
@@ -158,6 +172,8 @@ class Scheduler:
             if num_cached_blocks == -1:
                 break
             num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+            if self._loads_remotely(seq):
+                num_tokens = 0    # it waits for its blocks, then computes one token
             if num_tokens > self.max_num_batched_tokens:
                 self.waiting.pop()    # will never fit in one step, and splitting is off
                 self._drop(seq, "capacity", output)
@@ -167,12 +183,24 @@ class Scheduler:
             budget -= self._admit(seq, num_cached_blocks, budget, output)
         return output
 
+    def _loads_remotely(self, seq: Sequence) -> bool:
+        params = seq.kv_transfer_params
+        return self.connector is not None and bool(params and params.get("do_remote_prefill"))
+
     def _admit(self, seq: Sequence, num_cached_blocks: int, budget: int, output: SchedulerOutput) -> int:
-        """Move the head of the waiting queue into the running set."""
+        """Move the head of the waiting queue into the running set, or to wait for its blocks from elsewhere."""
         self.waiting.pop()
         self.block_manager.allocate(seq, num_cached_blocks)
         output.num_queried_blocks += seq.num_blocks
         output.num_cached_blocks += num_cached_blocks
+        if self.connector is not None:
+            num_external_tokens, load_async = self.connector.get_num_new_matched_tokens(seq, seq.num_cached_tokens)
+            if num_external_tokens:
+                assert load_async, "only asynchronous loads are implemented"
+                self.connector.update_state_after_alloc(seq, num_external_tokens)
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                self.recving[seq.request_id] = seq
+                return 0
         seq.status = SequenceStatus.RUNNING
         num_tokens = self._schedule(seq, budget, output)
         self.running.append(seq)
@@ -268,7 +296,34 @@ class Scheduler:
             else:
                 continue
             seq.drop_pending()    # a later step may already have reserved one
-            self.block_manager.deallocate(seq)
             self.running.remove(seq)
             self._drop(seq, reason)
+            self._free(seq)
         return stepped
+
+    def _free(self, seq: Sequence):
+        """Release a finished request's blocks, unless the connector holds them for a decode instance to read."""
+        if self.connector is not None:
+            hold, seq.kv_transfer_result = self.connector.request_finished(seq)
+            if hold:
+                self.sending[seq.request_id] = seq
+                return
+        self.block_manager.deallocate(seq)
+
+    def update_from_kv_connector_output(self, kv_output: KVConnectorOutput):
+        """Free what was sent, and run what was loaded. A failed load prefills here, from the local prefix hits."""
+        for request_id in kv_output.finished_sending:
+            seq = self.sending.pop(request_id, None)
+            if seq is not None:
+                self.block_manager.deallocate(seq)
+        for request_id in kv_output.finished_recving | kv_output.failed_recving:
+            seq = self.recving.pop(request_id)
+            if seq.is_finished:    # aborted while its blocks loaded
+                self.block_manager.deallocate(seq)
+                continue
+            if request_id in kv_output.finished_recving:
+                # As vLLM: the last prompt token recomputes, so this engine samples the first token itself.
+                seq.num_cached_tokens = seq.num_prompt_tokens - 1
+                self.block_manager.hash_blocks(seq, seq.num_cached_tokens)
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)

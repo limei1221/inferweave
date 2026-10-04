@@ -46,9 +46,10 @@ class BaseRequest(BaseModel):
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
     n: int = 1
-    # Extras: the OpenAI schema has no field for either, so they ride in the body.
+    # Extras: the OpenAI schema has no field for these, so they ride in the body.
     ignore_eos: bool = False
     priority: int = 0
+    kv_transfer_params: dict[str, Any] | None = None    # disaggregated prefill, as vLLM's; the proxy sets it
 
     @model_validator(mode="before")
     @classmethod
@@ -142,6 +143,7 @@ class CompletionResponse(BaseModel):
     model: str
     choices: list[CompletionResponseChoice]
     usage: UsageInfo
+    kv_transfer_params: dict[str, Any] | None = None    # from a prefill instance: where to pull its KV from
 
 
 class CompletionStreamResponse(BaseModel):
@@ -166,6 +168,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionResponseChoice]
     usage: UsageInfo
+    kv_transfer_params: dict[str, Any] | None = None
 
 
 class DeltaMessage(BaseModel):

@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 serve = [
     "fastapi>=0.115",
+    "httpx",    # the disaggregated proxy's client
     "pydantic>=2",
     "uvicorn>=0.30",
 ]

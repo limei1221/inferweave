@@ -6,7 +6,7 @@ from dataclasses import MISSING, fields
 from lean_vllm.config import Config
 
 # Not flags: the positional, and what the engine reads from the checkpoint.
-INTERNAL = {"model", "hf_config", "eos"}
+INTERNAL = {"model", "hf_config", "eos", "kv_transfer"}
 
 
 def add_engine_args(parser: argparse.ArgumentParser):
@@ -32,7 +32,19 @@ def main(argv: list[str] | None = None):
     serve.add_argument("--served-model-name", default=None, help="the id reported by /v1/models")
     serve.add_argument("--log-level", default="info")
     add_engine_args(serve)
+    proxy = subparsers.add_parser("proxy", help="split each request between prefill and decode servers")
+    proxy.add_argument("--prefill", nargs="+", required=True, help="prefill server URLs, kv_role producer or both")
+    proxy.add_argument("--decode", nargs="+", required=True, help="decode server URLs, kv_role consumer or both")
+    proxy.add_argument("--host", default="127.0.0.1")
+    proxy.add_argument("--port", type=int, default=8000)
+    proxy.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
+
+    if args.command == "proxy":
+        import uvicorn
+        from lean_vllm.entrypoints.disagg_proxy import build_proxy_app
+        uvicorn.run(build_proxy_app(args.prefill, args.decode), host=args.host, port=args.port, log_level=args.log_level)
+        return
 
     from lean_vllm.entrypoints.server import run    # imports fastapi, which is the `serve` extra
 
