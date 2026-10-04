@@ -14,8 +14,8 @@ hardware.
 | | Project | Status |
 |---|---|---|
 | 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done (FlashInfer not yet run on a GPU) |
-| 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-09-13.md) |
-| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-09-20.md)); GPU reference checks still to record |
+| 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-10-03-Qwen3-8B.md) |
+| 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md)); GPU reference checks still to record |
 | 3 | Speculative decoding | |
 | 4 | Disaggregated prefill / decode | vLLM's connector interface with NixlConnector's pull protocol over TCP, and a proxy; checked end to end on CPU against a single engine ([docs](docs/disaggregated-prefill.md)); not yet run on a GPU |
 
@@ -141,11 +141,13 @@ uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
 
 Published reports, each against vLLM 0.26.0 on one H100:
 
-- [13 September](docs/benchmark-2026-09-13.md), Qwen3-8B: at parity below
-  saturation, 5–7% behind on goodput at the plateau.
-- [20 September](docs/benchmark-2026-09-20.md), DeepSeek-V2-Lite-Chat: median
-  TPOT 7.0 ms against vLLM's 4.4 ms at low load, and plateaus at about 20
-  requests/s where vLLM reaches 31.8.
+- [3 October, Qwen3-8B](docs/benchmark-2026-10-03-Qwen3-8B.md): at parity below saturation, 3.7–3.9%
+  behind on goodput at the plateau.
+- [3 October, DeepSeek-V2-Lite-Chat](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md): median TPOT 6.5 ms against
+  vLLM's 4.6 ms at low load, and peaks at 23.2 requests/s where vLLM reaches
+  31.2.
+
+[All 3 October numbers](docs/benchmark-results-2026-10-03.md) are also in one table.
 
 [docs/benchmark-runbook.md](docs/benchmark-runbook.md) is the step-by-step for
 producing numbers on a rented H100.

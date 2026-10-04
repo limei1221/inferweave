@@ -7,8 +7,8 @@ produced.
 
 It serves every model the engine loads (Qwen3 and DeepSeek-V2, see
 [deepseek-v2.md](deepseek-v2.md)), one model per server. On Qwen3-8B on an H100
-it matches vLLM below saturation and trails it by 5–7% at the plateau
-([13 September report](benchmark-2026-09-13.md)).
+it matches vLLM below saturation and trails it by 3.7–3.9% at the plateau
+([3 October report](benchmark-2026-10-03-Qwen3-8B.md)).
 
 ## What is supported
 
@@ -133,18 +133,19 @@ latency rather than rejections. Read goodput alongside p99.
 
 ## Performance
 
-The [13 September report](benchmark-2026-09-13.md) compares lean-vLLM with
-vLLM 0.26.0 on Qwen3-8B on one H100:
+The [3 October report](benchmark-2026-10-03-Qwen3-8B.md) compares lean-vLLM with vLLM 0.26.0 on Qwen3-8B
+on one H100:
 
 - Below saturation the two are at parity: identical goodput at load 1, and
   median TPOT 3% higher.
-- At the plateau lean-vLLM reaches about 24.1–24.5 requests/s against vLLM's
-  25.7–26.1.
-- Async scheduling adds 7–9% goodput under load.
-- The remaining gap was mostly large prefill steps, which ran eager here and
-  compiled in vLLM. They now run compiled here too; the report predates that.
+- At the plateau lean-vLLM reaches 24.81–25.06 requests/s against vLLM's
+  25.76–26.09.
+- Async scheduling adds 1.5–6.7% goodput under load.
+- Large prefill steps now run compiled on both engines, so the remaining gap
+  sits in the graph steps: lean-vLLM captures 13 piecewise sizes to vLLM's 51,
+  and pads more when a step falls between them.
 
-DeepSeek-V2-Lite has its own [20 September report](benchmark-2026-09-20.md).
+DeepSeek-V2-Lite has its own [3 October report](benchmark-2026-10-03-DeepSeek-V2-Lite.md).
 
 ## How it works
 

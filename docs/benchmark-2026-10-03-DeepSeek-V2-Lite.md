@@ -11,8 +11,8 @@ each, no rejections, failures, or preemptions — replaying the same lognormal
 trace (~661k prompt, ~177k generated tokens).
 
 This run follows the addition of Inductor compilation to lean-vLLM; the earlier
-report on the pre-Inductor baseline is in
-[`benchmark-2026-09-20-pre-inductor.md`](benchmark-2026-09-20-pre-inductor.md).
+report on the pre-Inductor baseline, `benchmark-2026-09-20.md`, was retired in
+bbade78 and is in the git history.
 The main findings are:
 
 - **Inductor compilation lifted lean-vLLM's plateau from ~20 to ~23

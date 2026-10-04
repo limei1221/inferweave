@@ -104,12 +104,12 @@ and one with group-limited routing.
 
 ## Performance
 
-The [20 September report](benchmark-2026-09-20.md) compares V2-Lite-Chat against
+The [3 October report](benchmark-2026-10-03-DeepSeek-V2-Lite.md) compares V2-Lite-Chat against
 vLLM 0.26.0 on one H100. With no queueing, lean-vLLM's median time per output
-token is 7.0 ms against vLLM's 4.4 ms. Under load, lean-vLLM plateaus at about
-20 requests/s while vLLM reaches 31.8. Decode now runs from CUDA graphs, and
-most of the remaining gap was eager prefill, which now runs compiled; the report
-predates that.
+token is 6.5 ms against vLLM's 4.6 ms. Under load, lean-vLLM peaks at 23.2
+requests/s at load 48 and falls to 21.1 at load 64, while vLLM reaches 31.2.
+Large prefill steps now run compiled but outside graphs, and still take 55–63%
+of step time at the plateau.
 
 ## How it works
 
