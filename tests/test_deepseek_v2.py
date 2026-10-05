@@ -36,7 +36,7 @@ def tiny_config(**overrides) -> DeepseekV2Config:
             moe_intermediate_size=24, n_routed_experts=8, num_experts_per_tok=3, n_shared_experts=1,
             first_k_dense_replace=1, num_hidden_layers=3, vocab_size=128, max_position_embeddings=256,
             q_lora_rank=None, kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=8,
-            v_head_dim=10,    # not the qk head size, so the value padding is exercised
+            v_head_dim=10,    # not the qk head size, so narrower values, and padding them, are exercised
             rope_parameters={
                 "rope_type": "yarn", "rope_theta": 10000.0, "factor": 4.0,
                 "mscale": 1.0, "mscale_all_dim": 0.707,    # unequal, so cos and sin are scaled too
@@ -118,7 +118,9 @@ def test_a_prompt_matches_transformers(models, runner):
 @pytest.mark.parametrize("max_context_chunk", [64, 4], ids=["one_chunk", "split_rows"])
 # Pure decode attends the latents through mla_decode, or expands them as other steps do.
 @pytest.mark.parametrize("latent_decode", [True, False], ids=["latent_decode", "expanded_decode"])
-def test_paged_steps_match_transformers(models, runner, max_context_chunk, latent_decode, monkeypatch):
+# Values as they are, as FA3 and torch take them, or padded to the keys' size, as a one-size backend needs.
+@pytest.mark.parametrize("pad_values", [False, True], ids=["narrow_values", "padded_values"])
+def test_paged_steps_match_transformers(models, runner, max_context_chunk, latent_decode, pad_values, monkeypatch):
     """Chunks, a cold prompt beside a resumed one, pure decode, then decode mixed with a prompt."""
     monkeypatch.setattr(TorchAttention, "supports_mla_decode", staticmethod(lambda: latent_decode))
     reference, model = models
@@ -127,6 +129,7 @@ def test_paged_steps_match_transformers(models, runner, max_context_chunk, laten
     for layer, layer_cache in zip(layers, cache):
         layer.bind_kv_cache(layer_cache)
         layer.max_context_chunk = max_context_chunk
+        monkeypatch.setattr(layer, "pad_values", pad_values)
     a, b, c = (torch.randint(0, 128, (n,)).tolist() for n in (11, 8, 3))
     table_a, table_b, table_c = [5, 2, 9], [7, 0], [3]    # scattered, so a wrong page walk shows
 

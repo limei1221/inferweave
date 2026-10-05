@@ -7,7 +7,8 @@ from lean_vllm.attention import (
     BACKENDS, FlashAttention3Backend, FlashInferBackend, FlashMLABackend, LayerSpec, TorchAttention,
     get_attention_backend,
 )
-from lean_vllm.layers.attention import Attention
+from lean_vllm.attention import triton_merge
+from lean_vllm.layers.attention import Attention, merge_attention, merge_attention_
 from lean_vllm.utils.context import Context, split_decodes_and_prefills
 
 torch.manual_seed(0)
@@ -167,6 +168,58 @@ def test_varlen_with_lse(backend, device, dtype, tol, causal):
     expected_lse = torch.cat([dense_scores(q, k, causal=causal).logsumexp(-1).T for q, k in zip(qs, ks)])
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
     torch.testing.assert_close(lse, expected_lse, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
+def test_narrow_values_match_padded_ones(backend, device, dtype, tol, causal):
+    """MLA prefill's shape, 192-wide keys and 128-wide values, taken as they are by a backend that can.
+
+    Padded values are what every backend is checked on above, so they are the reference.
+    """
+    qk_dim, v_dim = 192, 128
+    if not backend.supports_value_head_size(qk_dim, v_dim):
+        pytest.skip(f"{backend.get_name()} pads values")
+    mla = type(backend)(NUM_HEADS, qk_dim, SCALE, NUM_HEADS)    # expanded MLA: a key head per query head
+    seqlens_q = [5, 1, 12]
+    seqlens_k = seqlens_q if causal else [7, 4, 16]
+    q = randn(sum(seqlens_q), NUM_HEADS, qk_dim, device=device, dtype=dtype)
+    k = randn(sum(seqlens_k), NUM_HEADS, qk_dim, device=device, dtype=dtype)
+    # A view into a wider tensor, as MLA's split of kv_b_proj's output hands over.
+    v = randn(sum(seqlens_k), NUM_HEADS, qk_dim, device=device, dtype=dtype)[..., :v_dim]
+    padded_v = torch.nn.functional.pad(v, (0, qk_dim - v_dim))
+
+    def cumulative(seqlens):
+        return torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+
+    args = (cumulative(seqlens_q), cumulative(seqlens_k), max(seqlens_q), max(seqlens_k), causal)
+    out, lse = mla.varlen_with_lse(q, k, v, *args)
+    want, want_lse = mla.varlen_with_lse(q, k, padded_v, *args)
+    assert out.shape[-1] == v_dim
+    torch.testing.assert_close(out, want[..., :v_dim], atol=tol, rtol=tol)
+    torch.testing.assert_close(lse, want_lse, atol=tol, rtol=tol)
+    if causal:
+        context = Context(is_prefill=True, cu_seqlens_q=args[0], cu_seqlens_k=args[1],
+                          max_seqlen_q=args[2], max_seqlen_k=args[3], keys_are_new=True)
+        empty = torch.tensor([], device=device, dtype=dtype)
+        got = mla.prefill(q, k, v, empty, empty, context)
+        torch.testing.assert_close(got, mla.prefill(q, k, padded_v, empty, empty, context)[..., :v_dim],
+                                   atol=tol, rtol=tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or triton_merge._IMPORT_ERROR is not None,
+                    reason="the Triton merge needs a CUDA device and a Triton build")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_the_triton_merge_matches_torch(dtype):
+    """In place, with lse in FA3's transposed layout, so the strides are exercised too."""
+    num_tokens, num_heads, head_dim = 37, 16, 128
+    o_a = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=dtype)
+    o_b = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=dtype)
+    lse_a = (torch.randn(num_heads, num_tokens, device="cuda") * 3).T
+    lse_b = (torch.randn(num_heads, num_tokens, device="cuda") * 3).T
+    want_o, want_lse = merge_attention(o_a, lse_a, o_b, lse_b)
+    merge_attention_(o_a, lse_a, o_b, lse_b)
+    torch.testing.assert_close(o_a, want_o, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse_a, want_lse)
 
 
 def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):

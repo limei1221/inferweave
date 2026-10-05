@@ -68,6 +68,11 @@ class AttentionBackend(ABC):
     def supports_head_size(head_size: int) -> bool:
         return True
 
+    @staticmethod
+    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
+        """Whether prefill takes values narrower than keys, as an MLA layer's are. False pads them to the keys' size."""
+        return head_size == v_head_size
+
     @classmethod
     def validate(cls, spec: LayerSpec) -> list[str]:
         """Why this backend cannot serve the layer, or nothing if it can. As vLLM's validate_configuration."""

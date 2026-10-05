@@ -66,6 +66,7 @@ class DeepseekV2Attention(nn.Module):
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
+        self._latent_projections: tuple[torch.Tensor, torch.Tensor] | None = None    # set once the weights load
         self.mla_attn = MLAAttention(
             self.num_local_heads,
             self.qk_head_dim,
@@ -88,12 +89,19 @@ class DeepseekV2Attention(nn.Module):
 
     def latent_projections(self) -> tuple[torch.Tensor, torch.Tensor]:
         """kv_b_proj per head: W_UK_T [heads, qk_nope_head_dim, kv_lora_rank] and W_UV [heads, kv_lora_rank, v_head_dim]."""
+        if self._latent_projections is not None:
+            return self._latent_projections
         kv_b_proj_weight = self.kv_b_proj.weight.T.view(
             self.kv_lora_rank, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim,
         )
         W_UK, W_UV = kv_b_proj_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         # (L, N, P) -> (N, P, L) and (L, N, V) -> (N, L, V)
         return W_UK.permute(1, 2, 0), W_UV.transpose(0, 1)
+
+    def process_weights_after_loading(self):
+        """Views, so no memory and no copy: bmm takes their strides as they are. Spares each step their setup."""
+        self._latent_projections = None
+        self._latent_projections = self.latent_projections()
 
     def project(
         self,

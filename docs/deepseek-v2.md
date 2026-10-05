@@ -134,16 +134,21 @@ layer for its `kv_cache_shape` rather than reading head counts off the config.
 2. If a row resumes from cached context, that context is read in chunks of at
    most `max_num_batched_tokens` keys, expanded and attended. Each chunk's
    output is merged into the running result by log-sum-exp, as in vLLM's
-   chunked context. This bounds memory, but the context is re-expanded in every
-   layer.
+   chunked context. On CUDA the merge is one Triton launch, vLLM's
+   `merge_attn_states`, written over the running result in place. This bounds
+   memory, but the context is re-expanded in every layer.
 
-Values are 128 wide and keys 192, so values are zero-padded to 192 for the
-kernel and the output is cut back to 128.
+Values are 128 wide and keys 192. FA3 on Hopper takes them as they are, as
+vLLM's MLA prefill does there, and so does `torch`. A backend that takes one
+head size (`supports_value_head_size` false, as `flashinfer` here) gets values
+zero-padded to 192 and its output cut back to 128.
 
 **Decode** skips the expansion. Since `q · (W_UK c) = (W_UKᵀ q) · c`, each head's
 query is projected into latent space and attends the cached latents directly
 as one shared key head. The value projection is applied after attention. vLLM
-does the same with `W_UK_T` and `W_UV`. `flashmla` and `torch` implement this
+does the same with `W_UK_T` and `W_UV`. Both engines build them once the
+weights load (`process_weights_after_loading`); here they are views of
+`kv_b_proj`'s weight, whose strides `bmm` takes without a copy. `flashmla` and `torch` implement this
 as `mla_decode`. On `flash_attn_3`, decode rows are expanded like prefill.
 
 **Mixed batches** split into decode rows, which use `mla_decode`, and the rest,

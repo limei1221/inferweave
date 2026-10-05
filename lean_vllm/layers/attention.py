@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend
+from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend, triton_merge
 from lean_vllm.utils import device as dev
 from lean_vllm.utils.context import Context, get_context, split_decodes_and_prefills
 
@@ -177,6 +177,16 @@ def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]
     return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
 
 
+def merge_attention_(o_a, lse_a, o_b, lse_b) -> None:
+    """merge_attention written over o_a and lse_a: one Triton launch on CUDA, as vLLM's merge_attn_states."""
+    if o_a.is_cuda and triton_merge._IMPORT_ERROR is None:
+        triton_merge.merge_attn_states_(o_a, lse_a, o_b, lse_b)
+        return
+    o, lse = merge_attention(o_a, lse_a, o_b, lse_b)
+    o_a.copy_(o)
+    lse_a.copy_(lse)
+
+
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
@@ -202,6 +212,8 @@ class MLAAttention(Attention):
         super().__init__(num_heads, qk_head_dim, scale, num_heads, backend)
         self.v_head_dim = v_head_dim
         self.latent_dim = latent_dim
+        # Values pad up to the keys' head size only for a backend that takes one size, as vLLM's MLA prefill.
+        self.pad_values = not self.backend.supports_value_head_size(qk_head_dim, v_head_dim)
         self.expand = expand    # methods of the owning layer, so not a registered submodule
         self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
@@ -250,8 +262,7 @@ class MLAAttention(Attention):
         if context.keys_are_new or context.block_tables is None:
             # Every key the step reads is new, so a plain prefill with no page table covers it.
             unpaged = dataclasses.replace(context, block_tables=None, keys_are_new=True)
-            o = self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged)
-            return o[..., :self.v_head_dim].contiguous()
+            return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged))
         # New tokens attend each other causally, then each chunk of cached keys unmasked.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
         o, lse = self.backend.varlen_with_lse(
@@ -267,8 +278,8 @@ class MLAAttention(Attention):
                 chunk.max_seqlen_q, chunk.max_seqlen_k, causal=False,
             )
             del k, v
-            o[rows], lse[rows] = merge_attention(o[rows], lse[rows], o_chunk, lse_chunk)
-        return o[..., :self.v_head_dim].contiguous()
+            merge_attention_(o[rows], lse[rows], o_chunk, lse_chunk)    # rows is a slice, so these are views
+        return self._unpad(o)
 
     def _decode_latents(self, q: torch.Tensor, context: Context) -> torch.Tensor:
         """Attention over the cached latents as they are, so nothing expands.
@@ -287,5 +298,7 @@ class MLAAttention(Attention):
         return out
 
     def _pad(self, v: torch.Tensor) -> torch.Tensor:
-        # Backends take one head size, so values pad up to the keys' and are cut back after.
-        return F.pad(v, (0, self.head_dim - self.v_head_dim))
+        return F.pad(v, (0, self.head_dim - self.v_head_dim)) if self.pad_values else v
+
+    def _unpad(self, o: torch.Tensor) -> torch.Tensor:
+        return o[..., :self.v_head_dim].contiguous() if self.pad_values else o

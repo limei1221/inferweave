@@ -27,6 +27,10 @@ class TorchAttention(AttentionBackend):
         return True
 
     @staticmethod
+    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
+        return True    # SDPA and the written-out varlen_with_lse take any value width
+
+    @staticmethod
     def split_decodes() -> bool:
         return True    # so decode rows skip prefill's padding to the step's longest query
 
@@ -150,4 +154,5 @@ class TorchAttention(AttentionBackend):
         q = q.view(B, Lq, self.num_kv_heads, group, D).permute(0, 2, 3, 1, 4).reshape(B, self.num_kv_heads, group * Lq, D)
         mask = mask.unsqueeze(2).expand(-1, -1, group, -1, -1).reshape(B, 1, group * Lq, -1)
         o = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=self.scale)
-        return o.view(B, self.num_kv_heads, group, Lq, -1).permute(0, 3, 1, 2, 4).reshape(B, Lq, self.num_heads, -1)
+        o = o[..., :v.size(-1)]    # MPS returns the keys' width for one query
+        return o.reshape(B, self.num_kv_heads, group, Lq, -1).permute(0, 3, 1, 2, 4).reshape(B, Lq, self.num_heads, -1)
