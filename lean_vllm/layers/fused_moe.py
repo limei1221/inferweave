@@ -94,6 +94,164 @@ else:
             acc *= tl.load(topk_weights_ptr + offs_pair, mask=pair_mask, other=0.0)[:, None]
         tl.store(c_ptrs, acc.to(c_ptr.dtype.element_ty), mask=c_mask)
 
+    @triton.jit
+    def topk_softmax_kernel(
+        logits_ptr,
+        weights_ptr,
+        ids_ptr,
+        num_tokens,
+        scaling,
+        stride_logits,
+        NUM_EXPERTS: tl.constexpr,
+        EXPERTS_POW2: tl.constexpr,
+        TOP_K: tl.constexpr,
+        TOP_K_POW2: tl.constexpr,
+        NUM_GROUPS: tl.constexpr,
+        GROUPS_POW2: tl.constexpr,
+        TOPK_GROUP: tl.constexpr,
+        RENORMALIZE: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """vLLM's topk_softmax for BLOCK_T tokens: softmax, the best groups if grouped, top-k, all in registers."""
+        rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+        cols = tl.arange(0, EXPERTS_POW2)
+        row_mask = rows < num_tokens
+        col_mask = cols < NUM_EXPERTS
+        logits = tl.load(logits_ptr + rows[:, None] * stride_logits + cols[None, :],
+                         mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
+        logits = tl.where(col_mask[None, :], logits, float("-inf"))
+        scores = tl.exp(logits - tl.max(logits, axis=1)[:, None])
+        scores = scores / tl.sum(scores, axis=1)[:, None]
+        scores = tl.where(col_mask[None, :], scores, float("-inf"))    # padding is never picked
+        if NUM_GROUPS > 1:
+            # A group scores its best expert; only the TOPK_GROUP best groups stay eligible.
+            group = cols // (NUM_EXPERTS // NUM_GROUPS)
+            group_cols = tl.arange(0, GROUPS_POW2)
+            group_scores = tl.full((BLOCK_T, GROUPS_POW2), float("-inf"), tl.float32)
+            for g in tl.static_range(NUM_GROUPS):
+                best = tl.max(tl.where(group[None, :] == g, scores, float("-inf")), axis=1)
+                group_scores = tl.where(group_cols[None, :] == g, best[:, None], group_scores)
+            eligible = tl.zeros((BLOCK_T, EXPERTS_POW2), dtype=tl.int32)
+            for _ in tl.static_range(TOPK_GROUP):
+                picked = tl.argmax(group_scores, axis=1)
+                eligible = tl.where(group[None, :] == picked[:, None], 1, eligible)
+                group_scores = tl.where(group_cols[None, :] == picked[:, None], float("-inf"), group_scores)
+            scores = tl.where(eligible != 0, scores, float("-inf"))
+
+        # Top-k by repeated argmax, as vLLM's kernel: k is small, and a tie goes to the lower expert.
+        k_cols = tl.arange(0, TOP_K_POW2)
+        weights = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.float32)
+        ids = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.int32)
+        for k in tl.static_range(TOP_K):
+            weight, expert = tl.max(scores, axis=1, return_indices=True)
+            weights = tl.where(k_cols[None, :] == k, weight[:, None], weights)
+            ids = tl.where(k_cols[None, :] == k, expert[:, None], ids)
+            scores = tl.where(cols[None, :] == expert[:, None], float("-inf"), scores)
+        if RENORMALIZE:
+            weights = weights / tl.sum(weights, axis=1)[:, None]
+        weights = weights * scaling
+        out = rows[:, None] * TOP_K + k_cols[None, :]
+        out_mask = row_mask[:, None] & (k_cols < TOP_K)[None, :]
+        tl.store(weights_ptr + out, weights, mask=out_mask)
+        tl.store(ids_ptr + out, ids, mask=out_mask)
+
+    # align_blocks in three launches. A program owns BLOCK pairs, so a pair's slot is its expert's padded start,
+    # plus the pairs of that expert in earlier programs, plus its rank in its own: no atomics, and a fixed order.
+
+    @triton.jit
+    def count_experts_kernel(topk_ids_ptr, counts_ptr, num_pairs, EXPERTS_POW2: tl.constexpr, BLOCK: tl.constexpr):
+        """counts[program, expert]: how many of the program's pairs go to the expert."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        ids = tl.load(topk_ids_ptr + offs, mask=offs < num_pairs, other=-1)
+        experts = tl.arange(0, EXPERTS_POW2)
+        counts = tl.sum((ids[:, None] == experts[None, :]).to(tl.int32), axis=0)
+        tl.store(counts_ptr + pid * EXPERTS_POW2 + experts, counts)
+
+    @triton.jit
+    def scan_experts_kernel(
+        counts_ptr,
+        expert_starts_ptr,
+        sorted_pairs_ptr,
+        num_rows_ptr,
+        num_programs,
+        num_pairs,
+        EXPERTS_POW2: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        ROWS: tl.constexpr,
+        TAIL: tl.constexpr,
+    ):
+        """One program: counts becomes each program's offset within an expert's run, and runs are padded to BLOCK_M."""
+        experts = tl.arange(0, EXPERTS_POW2)
+        totals = tl.zeros((EXPERTS_POW2,), dtype=tl.int32)
+        for start in range(0, num_programs, ROWS):
+            rows = start + tl.arange(0, ROWS)
+            ptrs = counts_ptr + rows[:, None] * EXPERTS_POW2 + experts[None, :]
+            mask = (rows < num_programs)[:, None]
+            counts = tl.load(ptrs, mask=mask, other=0)
+            tl.store(ptrs, tl.cumsum(counts, axis=0) - counts + totals[None, :], mask=mask)    # exclusive
+            totals += tl.sum(counts, axis=0)
+        padded = (totals + BLOCK_M - 1) // BLOCK_M * BLOCK_M
+        starts = tl.cumsum(padded, axis=0) - padded
+        tl.store(expert_starts_ptr + experts, starts)
+        tl.store(num_rows_ptr, tl.sum(padded, axis=0))
+        # The overhang of each run's last block: rows the GEMMs mask out.
+        for offset in tl.static_range(0, BLOCK_M, TAIL):
+            cols = offset + tl.arange(0, TAIL)
+            overhang = totals[:, None] + cols[None, :]
+            sentinel = tl.zeros((EXPERTS_POW2, TAIL), dtype=tl.int32) + num_pairs
+            tl.store(sorted_pairs_ptr + starts[:, None] + overhang, sentinel, mask=overhang < padded[:, None])
+
+    @triton.jit
+    def scatter_pairs_kernel(
+        topk_ids_ptr,
+        counts_ptr,
+        expert_starts_ptr,
+        expert_map_ptr,
+        sorted_pairs_ptr,
+        block_experts_ptr,
+        num_pairs,
+        num_blocks,
+        NUM_EXPERTS: tl.constexpr,
+        EXPERTS_POW2: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK: tl.constexpr,
+        HAS_EXPERT_MAP: tl.constexpr,
+    ):
+        """Each pair to its slot, and each block's expert; program i does BLOCK of each."""
+        pid = tl.program_id(0)
+        experts = tl.arange(0, EXPERTS_POW2)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < num_pairs
+        ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
+        one_hot = (ids[:, None] == experts[None, :]).to(tl.int32)
+        rank = tl.sum(tl.cumsum(one_hot, axis=0) * one_hot, axis=1) - 1    # among this program's pairs of the expert
+        ids = tl.where(mask, ids, 0)
+        slots = (tl.load(expert_starts_ptr + ids, mask=mask, other=0)
+                 + tl.load(counts_ptr + pid * EXPERTS_POW2 + ids, mask=mask, other=0) + rank)
+        tl.store(sorted_pairs_ptr + slots, offs, mask=mask)
+
+        # A block belongs to the last expert starting at or before it, so an empty expert owns none.
+        blocks = pid * BLOCK + tl.arange(0, BLOCK)
+        block_mask = blocks < num_blocks
+        first_blocks = tl.load(expert_starts_ptr + experts) // BLOCK_M
+        owners = (first_blocks[None, :] <= blocks[:, None]) & (experts < NUM_EXPERTS)[None, :]
+        block_experts = tl.sum(owners.to(tl.int32), axis=1) - 1
+        if HAS_EXPERT_MAP:
+            block_experts = tl.load(expert_map_ptr + block_experts, mask=block_mask, other=-1)
+        tl.store(block_experts_ptr + blocks, block_experts, mask=block_mask)
+
+    @triton.jit
+    def silu_and_mul_kernel(x_ptr, out_ptr, d, stride_x, stride_out, BLOCK: tl.constexpr):
+        """out = silu(gate) * up for one row and BLOCK columns, in fp32."""
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < d
+        gate = tl.load(x_ptr + row * stride_x + cols, mask=mask).to(tl.float32)
+        up = tl.load(x_ptr + row * stride_x + d + cols, mask=mask).to(tl.float32)
+        out = gate * tl.sigmoid(gate) * up
+        tl.store(out_ptr + row * stride_out + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+
 
 def use_triton(x: torch.Tensor) -> bool:
     """Triton when it can run here, unless $LEAN_VLLM_MOE_BACKEND asks for one by name."""
@@ -158,11 +316,12 @@ def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tupl
     """Sort the token-expert pairs by expert, and pad each expert's run to a multiple of block_m.
 
     Returns each padded row's pair (out of range in an overhang), each block's expert, and the row count. No sync.
+    The reference for align_blocks_triton, which the Triton path runs.
     """
     pairs = topk_ids.flatten()
     num_pairs = pairs.numel()
     experts = torch.arange(num_experts, device=pairs.device, dtype=pairs.dtype)
-    expert_of_pair, order = pairs.sort()
+    expert_of_pair, order = pairs.sort(stable=True)    # a run in pair order, as the kernels lay it out
     starts = torch.searchsorted(expert_of_pair, experts)
     counts = torch.searchsorted(expert_of_pair, experts, right=True) - starts
     padded = (counts + block_m - 1) // block_m * block_m
@@ -178,6 +337,76 @@ def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tupl
     block_experts = torch.searchsorted(padded_starts // block_m, blocks, right=True) - 1
     num_rows = (padded_starts[-1] + padded[-1]).to(torch.int32)
     return sorted_pairs, block_experts.to(torch.int32), num_rows
+
+
+def align_blocks_triton(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_m: int,
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """align_blocks in three launches where it takes about twenty, with expert_map applied to each block.
+
+    Rows past num_rows are left unwritten, as no GEMM program reads them.
+    """
+    pairs = topk_ids.flatten()
+    num_pairs = pairs.numel()
+    experts_pow2 = triton.next_power_of_2(num_experts)
+    tile = max(16, 8192 // experts_pow2)    # rows of a one-hot tile, so a tile stays near 8K elements
+    num_programs = triton.cdiv(num_pairs, tile)
+    num_blocks = triton.cdiv(num_pairs, block_m) + num_experts    # every expert wastes under one whole block
+    device = pairs.device
+    counts = torch.empty(num_programs, experts_pow2, dtype=torch.int32, device=device)
+    expert_starts = torch.empty(experts_pow2, dtype=torch.int32, device=device)
+    sorted_pairs = torch.empty(num_blocks * block_m, dtype=torch.int32, device=device)
+    block_experts = torch.empty(num_blocks, dtype=torch.int32, device=device)
+    num_rows = torch.empty(1, dtype=torch.int32, device=device)
+    count_experts_kernel[(num_programs,)](pairs, counts, num_pairs, EXPERTS_POW2=experts_pow2, BLOCK=tile)
+    scan_experts_kernel[(1,)](
+        counts, expert_starts, sorted_pairs, num_rows, num_programs, num_pairs,
+        EXPERTS_POW2=experts_pow2, BLOCK_M=block_m, ROWS=tile, TAIL=min(block_m, tile),
+    )
+    scatter_pairs_kernel[(max(num_programs, triton.cdiv(num_blocks, tile)),)](
+        pairs, counts, expert_starts, block_experts if expert_map is None else expert_map,
+        sorted_pairs, block_experts, num_pairs, num_blocks,
+        NUM_EXPERTS=num_experts, EXPERTS_POW2=experts_pow2, BLOCK_M=block_m, BLOCK=tile,
+        HAS_EXPERT_MAP=expert_map is not None,
+    )
+    return sorted_pairs, block_experts, num_rows
+
+
+def topk_softmax(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    scaling: float,
+    num_groups: int = 1,
+    topk_group: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Routing in one launch: fp32 weights and int32 expert ids, [T, top_k] each, in descending order."""
+    num_tokens, num_experts = router_logits.shape
+    assert num_experts % num_groups == 0, f"{num_experts} experts do not split into {num_groups} groups"
+    weights = torch.empty(num_tokens, top_k, dtype=torch.float32, device=router_logits.device)
+    ids = torch.empty(num_tokens, top_k, dtype=torch.int32, device=router_logits.device)
+    experts_pow2 = triton.next_power_of_2(num_experts)
+    block_t = max(1, 4096 // experts_pow2)
+    topk_softmax_kernel[(triton.cdiv(num_tokens, block_t),)](
+        router_logits, weights, ids, num_tokens, scaling, router_logits.stride(0),
+        NUM_EXPERTS=num_experts, EXPERTS_POW2=experts_pow2,
+        TOP_K=top_k, TOP_K_POW2=triton.next_power_of_2(top_k),
+        NUM_GROUPS=num_groups, GROUPS_POW2=triton.next_power_of_2(num_groups), TOPK_GROUP=topk_group,
+        RENORMALIZE=renormalize, BLOCK_T=block_t,
+    )
+    return weights, ids
+
+
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """[N, 2D] -> [N, D] in one launch. layers.activation's is torch.compiled: a Dynamo call per layer in an eager op."""
+    num_rows, d = x.size(0), x.size(1) // 2
+    out = torch.empty(num_rows, d, dtype=x.dtype, device=x.device)
+    block = min(triton.next_power_of_2(d), 1024)
+    silu_and_mul_kernel[(num_rows, triton.cdiv(d, block))](x, out, d, x.stride(0), out.stride(0), BLOCK=block)
+    return out
 
 
 def fused_experts(
@@ -202,10 +431,9 @@ def fused_experts(
         num_experts = expert_map.numel()    # blocked by global id, as vLLM's moe_align_block_size
     top_k = topk_ids.size(1)
     num_pairs = num_tokens * top_k
-    sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, num_experts, launch["BLOCK_SIZE_M"])
-    if expert_map is not None:
-        block_experts = expert_map[block_experts]
-    topk_weights = topk_weights.flatten().to(x.dtype)
+    sorted_pairs, block_experts, num_rows = align_blocks_triton(
+        topk_ids, num_experts, launch["BLOCK_SIZE_M"], expert_map)
+    topk_weights = topk_weights.flatten()    # the kernel scales its fp32 accumulator by them, in their own dtype
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pairs_per_row: int, mul_routed_weight: bool):
         n, k = b.shape[1], b.shape[2]

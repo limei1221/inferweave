@@ -54,6 +54,64 @@ def torch_experts(
     return torch.zeros_like(x).index_add_(0, token_ids, h)
 
 
+def torch_select_experts(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    scaling: float,
+    num_groups: int = 1,
+    topk_group: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The portable routing: softmax, the best groups when grouped, then top-k. fp32 weights, int32 ids."""
+    scores = router_logits.softmax(dim=-1)
+    # scores: [N, E]
+    if num_groups > 1:
+        # Only experts in the topk_group best groups stay eligible.
+        num_token = scores.size(0)
+        group_scores = scores.view(num_token, num_groups, -1).max(dim=-1).values    # [N, G]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]    # [N, topk_group]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = (group_mask.unsqueeze(-1)
+                      .expand(num_token, num_groups, scores.size(-1) // num_groups)
+                      .reshape(num_token, -1))    # [N, E]
+        scores = scores.masked_fill(~score_mask.bool(), float("-inf"))    # [N, E]
+    topk_weights, topk_ids = torch.topk(scores, k=top_k, dim=-1, sorted=False)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if scaling != 1.0:
+        topk_weights = topk_weights * scaling
+    return topk_weights, topk_ids.to(torch.int32)
+
+
+# One launch on the Triton path, where the traced softmax, topk and scaling took several.
+@torch.library.custom_op("lean_vllm::select_experts", mutates_args=())
+def select_experts(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    scaling: float,
+    num_groups: int,
+    topk_group: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if fused_moe.use_triton(router_logits):
+        return fused_moe.topk_softmax(router_logits, top_k, renormalize, scaling, num_groups, topk_group)
+    return torch_select_experts(router_logits, top_k, renormalize, scaling, num_groups, topk_group)
+
+
+@select_experts.register_fake
+def _(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    scaling: float,
+    num_groups: int,
+    topk_group: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (router_logits.size(0), top_k)
+    return router_logits.new_empty(shape, dtype=torch.float32), router_logits.new_empty(shape, dtype=torch.int32)
+
+
 # Opaque to torch.compile, as vLLM's: the Triton path picks its launch from the batch size, which a trace would fix.
 @torch.library.custom_op("lean_vllm::moe_experts", mutates_args=())
 def moe_experts(
@@ -65,7 +123,8 @@ def moe_experts(
     expert_map: torch.Tensor | None,
 ) -> torch.Tensor:
     if fused_moe.use_triton(x):
-        return fused_moe.fused_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, silu_and_mul, expert_map)
+        return fused_moe.fused_experts(
+            x, gate_up_proj, down_proj, topk_weights, topk_ids, fused_moe.silu_and_mul, expert_map)
     return torch_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, expert_map)
 
 

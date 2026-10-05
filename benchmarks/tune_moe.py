@@ -19,8 +19,9 @@ import triton
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from lean_vllm.layers.fused_moe import CONFIG_DIR, fused_experts, get_config_file_name, try_get_optimal_moe_config
-from lean_vllm.layers.moe import silu_and_mul
+from lean_vllm.layers.fused_moe import (
+    CONFIG_DIR, fused_experts, get_config_file_name, silu_and_mul, try_get_optimal_moe_config,
+)
 
 BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
 # vLLM's CUDA search space: 1,920 configs.
@@ -60,9 +61,9 @@ def benchmark_config(config: dict | None, num_tokens: int, E: int, N: int, hidde
     gate_up_proj = torch.randn(E, 2 * N, hidden_size, dtype=dtype)
     down_proj = torch.randn(E, hidden_size, N, dtype=dtype)
     gating_output = torch.randn(num_iters, num_tokens, E, dtype=torch.float32)
-    # Graph inputs: each iteration copies its routing in before the replay.
-    topk_weights = torch.empty(num_tokens, top_k, dtype=dtype)
-    topk_ids = torch.empty(num_tokens, top_k, dtype=torch.int64)
+    # Graph inputs: each iteration copies its routing in before the replay. The dtypes select_experts returns.
+    topk_weights = torch.empty(num_tokens, top_k, dtype=torch.float32)
+    topk_ids = torch.empty(num_tokens, top_k, dtype=torch.int32)
 
     def prepare(i: int):
         weights, ids = gating_output[i].softmax(dim=-1).topk(top_k, dim=-1)

@@ -166,6 +166,14 @@ whole blocks, so a block reads one expert's weights, as vLLM's fused MoE does.
 Elsewhere, two `F.grouped_mm` calls do the same work. That path is the
 reference the kernel is tested against.
 
+The glue around the two GEMMs is fused as vLLM's is, because a decode graph
+replays it in every MoE layer. Routing is one launch after the fp32 gate
+(vLLM's `topk_softmax`, extended to group-limited routing). Blocking the pairs
+takes three launches in place of `align_blocks`' twenty or so torch ops (vLLM's
+`moe_align_block_size`), with no atomics, so a run keeps its pairs in order.
+SiLU-and-mul is one launch. Each kernel is tested against the torch code it
+replaces.
+
 ### Tuning the MoE kernel
 
 As in vLLM, tile sizes are tuned offline, not at runtime. For each batch size,

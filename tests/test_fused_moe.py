@@ -9,11 +9,12 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from lean_vllm.layers import fused_moe
 from lean_vllm.layers.fused_moe import (
     align_blocks, fused_experts, get_config_file_name, get_default_config, get_moe_configs,
     try_get_optimal_moe_config, use_triton,
 )
-from lean_vllm.layers.moe import FusedMoE, determine_expert_map, silu_and_mul, torch_experts
+from lean_vllm.layers.moe import FusedMoE, determine_expert_map, silu_and_mul, torch_experts, torch_select_experts
 
 HIDDEN, INTERMEDIATE = 32, 16
 NUM_EXPERTS, TOP_K, TOKENS = 8, 3, 20
@@ -103,6 +104,16 @@ def test_an_expert_with_no_tokens_owns_no_block():
     assert num_rows == 2 * BLOCK_M
     assert block_experts[:2].tolist() == [0, NUM_EXPERTS - 1]
     assert (sorted_pairs[:2] < 4).all() and (sorted_pairs[2:BLOCK_M] == 4).all()
+
+
+def test_a_run_holds_its_pairs_in_pair_order(batch):
+    """The order the Triton kernels lay a run out in, so the two can be compared row for row."""
+    _, _, topk_ids = batch
+    sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, NUM_EXPERTS, BLOCK_M)
+    for block in range(int(num_rows) // BLOCK_M):
+        held = sorted_pairs[block * BLOCK_M:(block + 1) * BLOCK_M]
+        held = held[held < topk_ids.numel()].tolist()
+        assert held == sorted(held)
 
 
 @pytest.mark.parametrize("block_m", [16, 64])
@@ -333,3 +344,57 @@ def test_triton_cannot_be_forced_where_it_does_not_run(monkeypatch):
         pytest.skip("triton runs here")
     with pytest.raises(RuntimeError, match="not available"):
         use_triton(torch.zeros(1))
+
+
+def dense_routing(weights: torch.Tensor, ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """[T, E] with each token's routing weights at its experts, so routings compare whatever order top-k left."""
+    dense = torch.zeros(ids.size(0), num_experts, dtype=weights.dtype, device=weights.device)
+    return dense.scatter_(1, ids.long(), weights)
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("num_tokens", [1, 20, 3000])    # 3000 * 6 pairs span many programs
+@pytest.mark.parametrize("num_experts", [8, 64, 160])    # 160 is not a power of two
+@pytest.mark.parametrize("block_m", [16, 64])
+@pytest.mark.parametrize("ep", [False, True], ids=["one_rank", "ep"])
+def test_triton_alignment_matches_the_reference(num_tokens, num_experts, block_m, ep):
+    """Row for row up to num_rows, past which the kernels write nothing and no GEMM reads."""
+    torch.manual_seed(0)
+    top_k = 6
+    topk_ids = torch.rand(num_tokens, num_experts, device="cuda").topk(top_k, dim=-1).indices.to(torch.int32)
+    expert_map = determine_expert_map(3, 1, num_experts)[1].cuda() if ep else None
+    want_pairs, want_experts, want_rows = align_blocks(topk_ids, num_experts, block_m)
+    if expert_map is not None:
+        want_experts = expert_map[want_experts]
+    got_pairs, got_experts, got_rows = fused_moe.align_blocks_triton(topk_ids, num_experts, block_m, expert_map)
+    num_rows = int(want_rows)
+    assert int(got_rows) == num_rows
+    assert torch.equal(got_pairs[:num_rows], want_pairs[:num_rows])
+    assert torch.equal(got_experts[:num_rows // block_m], want_experts[:num_rows // block_m])
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("routing", [
+    dict(num_groups=1, topk_group=1),
+    dict(num_groups=8, topk_group=3),    # DeepSeek-V2's group-limited greedy
+], ids=["greedy", "grouped"])
+@pytest.mark.parametrize("renormalize, scaling", [(False, 1.0), (True, 2.5)])
+@pytest.mark.parametrize("num_experts", [64, 160])
+def test_triton_routing_matches_torch(routing, renormalize, scaling, num_experts):
+    torch.manual_seed(0)
+    router_logits = torch.randn(300, num_experts, device="cuda")
+    args = (router_logits, 6, renormalize, scaling, routing["num_groups"], routing["topk_group"])
+    got_weights, got_ids = fused_moe.topk_softmax(*args)
+    want_weights, want_ids = torch_select_experts(*args)
+    assert got_ids.dtype == want_ids.dtype == torch.int32
+    torch.testing.assert_close(
+        dense_routing(got_weights, got_ids, num_experts), dense_routing(want_weights, want_ids, num_experts))
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("width", [16, 1408, 3000])    # under one block, the V2-Lite expert, and three blocks
+def test_triton_silu_and_mul_matches_torch(width):
+    torch.manual_seed(0)
+    x = torch.randn(37, 2 * width, device="cuda", dtype=torch.bfloat16)
+    gate, up = x.float().chunk(2, dim=-1)
+    torch.testing.assert_close(fused_moe.silu_and_mul(x), (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))

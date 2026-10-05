@@ -139,6 +139,7 @@ class DeepseekV2MoE(nn.Module):
         self.renormalize = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = ReplicatedLinear(config.hidden_size, config.n_routed_experts, bias=False)
+        self.gate.weight.data = self.gate.weight.data.float()    # held in fp32, so no step casts it
         self.experts = FusedMoE(config.n_routed_experts, self.top_k, config.hidden_size, config.moe_intermediate_size,
                                 enable_expert_parallel)
         self.shared_experts = None
@@ -150,27 +151,13 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # hidden_states: [N, D]
-        router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
-        scores = router_logits.softmax(dim=-1)
-        # scores: [N, E]
-        if self.topk_method == "group_limited_greedy":
-            # Only experts in the topk_group best groups stay eligible.
-            num_token = scores.size(0)
-            group_scores = scores.view(num_token, self.num_expert_group, -1).max(dim=-1).values    # [N, G]
-            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]    # [N, self.topk_group]
-            group_mask = torch.zeros_like(group_scores)
-            group_mask.scatter_(1, group_idx, 1)
-            score_mask = (group_mask.unsqueeze(-1)
-                          .expand(num_token, self.num_expert_group, scores.size(-1) // self.num_expert_group)
-                          .reshape(num_token, -1))    # [N, E]
-            scores = scores.masked_fill(~score_mask.bool(), float("-inf"))    # [N, E]
-        topk_weights, topk_ids = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-        if self.renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        if self.routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * self.routed_scaling_factor
-        return topk_weights, topk_ids
+        # hidden_states: [N, D]; the gate runs in fp32, as transformers'
+        router_logits = F.linear(hidden_states.float(), self.gate.weight)
+        grouped = self.topk_method == "group_limited_greedy"
+        return torch.ops.lean_vllm.select_experts(
+            router_logits, self.top_k, self.renormalize, float(self.routed_scaling_factor),
+            self.num_expert_group if grouped else 1, self.topk_group if grouped else 1,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         final_hidden_states = self.experts(hidden_states, *self.route(hidden_states))
