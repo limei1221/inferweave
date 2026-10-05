@@ -25,11 +25,21 @@ logger = logging.getLogger(__name__)
 # How long a TP worker may wait for its next call; gloo's 30-minute default would kill an idle server.
 CALL_TIMEOUT = timedelta(days=365)
 
-# Piecewise buckets: step sizes worth capturing, minimum gap, and maximum replay padding.
-PIECEWISE_MIN_TOKENS = 64
-PIECEWISE_MAX_TOKENS = 512
-PIECEWISE_MIN_GAP = 16
-PIECEWISE_MAX_PAD = 0.25
+
+
+def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> list[int]:
+    """vLLM's default capture sizes: 1, 2, 4, then every 8 below 256 and every 16 from there, up to twice the
+    batch's sequences, 512 at most, and the token budget. The budget itself is captured if it fits.
+
+    Piecewise graphs take every size, and full decode graphs those of at most max_num_seqs rows.
+    """
+    top = min(max_num_seqs * 2, 512, max_num_batched_tokens)
+    sizes = [size for size in (1, 2, 4) if size <= top]
+    sizes += range(8, min(top + 1, 256), 8)
+    sizes += range(256, top + 1, 16)
+    if max_num_batched_tokens <= top:
+        sizes.append(max_num_batched_tokens)
+    return sorted(set(sizes))
 
 
 class ModelRunner:
@@ -384,20 +394,10 @@ class ModelRunner:
         self._prev_rows = {seq.seq_id: i for i, seq in enumerate(self._sampling_rows)}
         return pending
 
-    def _piecewise_buckets(self) -> list[int]:
-        """Token counts to capture at: small steps only, where launch overhead rivals compute, none padded past a quarter."""
-        top = min(PIECEWISE_MAX_TOKENS, self.config.max_num_batched_tokens)
-        sizes, size = [], PIECEWISE_MIN_TOKENS
-        while size < top:
-            sizes.append(size)
-            gap = max(int(size * PIECEWISE_MAX_PAD), PIECEWISE_MIN_GAP)
-            size += 1 << (gap.bit_length() - 1)    # a power of two, so sizes stay round
-        return sorted(set(sizes) | {top})
-
     @torch.inference_mode()
     def capture_piecewise(self):
         """Run the compiled model once per bucket, largest first; each piece captures its graph as the run reaches it."""
-        self.piecewise_bs = self._piecewise_buckets()
+        self.piecewise_bs = cudagraph_capture_sizes(self.config.max_num_seqs, self.config.max_num_batched_tokens)
         largest = self.piecewise_bs[-1]
         input_ids = torch.zeros(largest, dtype=torch.int64)
         positions = torch.zeros(largest, dtype=torch.int64)
@@ -416,7 +416,9 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
+        self.graph_bs = [size for size in sizes if size <= config.max_num_seqs]    # a decode step has a row per token
+        max_bs = self.graph_bs[-1]
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
@@ -424,7 +426,6 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         # FlashMLA bakes its tile schedule and split-KV workspace from context_lens at capture, so capture the
         # worst case: block 0 is valid, so a full block_tables of zeros holds max_model_len tokens per row. Every
         # replay refreshes context_lens/block_tables (see _replay_full), and the kernel gates on those lengths.

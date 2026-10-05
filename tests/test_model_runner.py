@@ -6,8 +6,7 @@ import random
 import pytest
 import torch
 
-from lean_vllm.engine.model_runner import (
-    ModelRunner, PIECEWISE_MAX_PAD, PIECEWISE_MAX_TOKENS, PIECEWISE_MIN_TOKENS)
+from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes
 from lean_vllm.attention import TorchAttention
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import Attention, MLAAttention
@@ -197,35 +196,31 @@ def test_a_failed_step_leaves_no_context_behind(runner):
     assert get_context() == Context()
 
 
-class TestPiecewiseBuckets:
+class TestCaptureSizes:
+    """vLLM 0.26's defaults, so a step pads to the same size on both engines."""
 
-    def buckets(self, budget):
-        runner = ModelRunner.__new__(ModelRunner)
-        runner.config = type("C", (), {"max_num_batched_tokens": budget})()
-        return runner._piecewise_buckets()
+    def test_the_benchmark_config_captures_what_vllm_does(self):
+        """256 sequences and an 8192-token budget: 51 piecewise sizes from 1 to 512, 35 full ones to 256."""
+        sizes = cudagraph_capture_sizes(256, 8192)
+        assert sizes == [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
+        assert len(sizes) == 51
+        assert len([size for size in sizes if size <= 256]) == 35
 
-    def test_the_grid_stops_at_the_cap(self):
-        """Steps above it run eager: padding them costs more than the dispatch saves."""
-        assert self.buckets(8192)[-1] == PIECEWISE_MAX_TOKENS
-        assert self.buckets(16384)[-1] == PIECEWISE_MAX_TOKENS
+    def test_the_sizes_stop_at_512(self):
+        assert cudagraph_capture_sizes(1024, 8192)[-1] == 512
 
-    def test_a_budget_under_the_cap_is_the_top_bucket(self):
-        assert self.buckets(300)[-1] == 300    # not a listed size, still covered
+    def test_a_budget_under_the_top_is_captured_itself(self):
+        assert cudagraph_capture_sizes(256, 300)[-4:] == [256, 272, 288, 300]
 
-    def test_buckets_are_sorted_and_unique(self):
-        sizes = self.buckets(5000)
-        assert sizes == sorted(set(sizes))
+    def test_few_sequences_capture_up_to_twice_their_count(self):
+        assert cudagraph_capture_sizes(4, 8192) == [1, 2, 4, 8]
+        assert cudagraph_capture_sizes(1, 8192) == [1, 2]
 
-    def test_a_budget_under_the_smallest_size_is_the_only_bucket(self):
-        assert self.buckets(32) == [32]
-
-    @pytest.mark.parametrize("budget", [256, 512, 8192, 16384])
-    def test_no_step_pads_past_the_cap(self, budget):
-        """The gap above a bucket is what a step one token past it pads through."""
-        sizes = self.buckets(budget)
-        assert sizes[0] == PIECEWISE_MIN_TOKENS
-        for smaller, larger in zip(sizes, sizes[1:]):
-            assert larger <= (smaller + 1) * (1 + PIECEWISE_MAX_PAD), f"{smaller} -> {larger}"
+    @pytest.mark.parametrize("max_num_seqs, budget", [(1, 1), (3, 4096), (100, 8192), (256, 200), (2048, 16384)])
+    def test_sizes_are_sorted_unique_and_within_both_limits(self, max_num_seqs, budget):
+        sizes = cudagraph_capture_sizes(max_num_seqs, budget)
+        assert sizes == sorted(set(sizes)) and sizes[0] == 1
+        assert sizes[-1] <= min(2 * max_num_seqs, 512, budget)
 
 
 class TestStepKind:
@@ -251,7 +246,7 @@ class TestStepKind:
         assert runner._step_kind(is_prefill=True, num_tokens=2048) == "prefill"
 
     def test_a_prefill_step_under_the_smallest_bucket_stays_eager(self, runner):
-        """Padding 8 tokens up to 256 would cost more than the dispatch it saves."""
+        """No smaller bucket was captured, so there is nothing to pad into."""
         assert runner._step_kind(is_prefill=True, num_tokens=8) == "prefill"
 
     def test_a_mode_without_piecewise_leaves_prefill_eager(self, runner):

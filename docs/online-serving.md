@@ -232,14 +232,19 @@ tokens. On an H100 it cuts offline GPU idle time from 22.4% to 3.2%.
 
 | Step | Under `full_and_piecewise` (default) |
 | --- | --- |
-| Pure decode, up to 512 rows | One full graph |
-| Prefill or mixed, 64–512 tokens | Piecewise graphs |
+| Pure decode, up to `max_num_seqs` rows (512 at most) | One full graph |
+| Prefill or mixed, up to 512 tokens | Piecewise graphs |
 | Anything else | Compiled, no graph |
 
+The sizes captured are vLLM's: 1, 2 and 4, then every 8 below 256 and every 16
+from 256, up to twice `max_num_seqs`, 512 or the token budget, whichever is
+smallest. With 256 sequences and an 8,192-token budget that is 51 piecewise
+sizes and 35 full ones, as in vLLM, so a step pads to the same size on both
+engines.
+
 `full` runs all prefill and mixed steps compiled, without a graph. `piecewise`
-also sends decode steps of 64–512 rows through piecewise graphs, so smaller
-decode steps run without one. `none` compiles and captures nothing, so every
-step runs eager.
+also sends decode steps through piecewise graphs. `none` compiles and captures
+nothing, so every step runs eager.
 
 As in vLLM, the model is traced once with `torch.compile` and split at each
 attention op. Inductor compiles each piece between two attention ops, fusing
