@@ -1,6 +1,7 @@
 """The synchronous engine driven from the event loop, with each step on a worker thread.
 
-Only the blocking `step()` leaves the loop; a lock keeps everything else off the engine meanwhile.
+Only the blocking `step()` leaves the loop; a lock keeps everything else off the engine meanwhile. The server runs
+core_client.AsyncMPClient by default, which moves the engine to its own process; this is `--no-engine-process`.
 """
 
 import asyncio
@@ -106,6 +107,12 @@ class AsyncLLMEngine:
             stream = self._streams[request_id] = AsyncStream()
             self._has_work.set()
         return self._generate(request_id, stream)
+
+    async def render_metrics(self) -> str:
+        return self.metrics.render()
+
+    async def metrics_summary(self) -> dict:
+        return self.metrics.summary()
 
     async def _generate(self, request_id: str, stream: AsyncStream) -> AsyncIterator[RequestOutput]:
         try:

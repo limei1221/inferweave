@@ -19,7 +19,7 @@ it matches vLLM below saturation and trails it by 3.7–3.9% at the plateau
 | `POST /v1/completions` | Completes a prompt, given as a string or token ids |
 | `POST /v1/chat/completions` | Completes `system` / `user` / `assistant` messages through the chat template |
 | `GET /v1/models` | Lists the one model id this server answers to |
-| `GET /health` | 200, or 503 once the engine thread has died |
+| `GET /health` | 200, or 503 once the engine has died |
 | `GET /metrics` | Prometheus text |
 | `GET /metrics.json` | The same numbers as a JSON summary |
 
@@ -150,25 +150,34 @@ DeepSeek-V2-Lite has its own [3 October report](benchmark-2026-10-03-DeepSeek-V2
 ## How it works
 
 ```text
-     HTTP (FastAPI / uvicorn)      <- tokenize, stop strings, SSE
-               |
-         AsyncLLMEngine            <- per-request asyncio.Queue
-               |  (event loop -> worker thread)
-      step() on one worker         <- detokenize
-               |
-           Scheduler               <- one token budget per step
-               |
-          ModelRunner              <- one mixed batch
+  server process                       engine core process
+  --------------                       -------------------
+  HTTP (FastAPI / uvicorn)             EngineCore busy loop
+    tokenize, stop strings, SSE          requests in, between steps
+  AsyncMPClient          -- ZMQ -->      LLMEngine.step()
+    per-request asyncio.Queue              Scheduler: one token budget per step
+    detokenize           <-- ZMQ --        ModelRunner: one mixed batch
 ```
 
-The engine is synchronous. Its loop runs on the asyncio event loop and hands
-each `step()` to a single worker thread, since a step blocks for a whole forward
-pass and would otherwise starve the HTTP handlers. New requests and aborts reach
-the engine between steps. An abort that arrives during a step is applied when
-the step returns.
+As in vLLM, the engine runs in a process of its own (`engine/core.py`), and the
+server talks to it over two ZMQ sockets (`engine/core_client.py`). The server's
+event loop and the step loop then each hold their own GIL, so streaming many
+responses does not slow down a step's Python dispatch. The core sends token ids,
+and the server turns them into text.
 
-If the engine raises, every outstanding request fails, `/health` turns 503, and
-the process exits for a supervisor to restart.
+The core takes every queued request, runs one step, sends that step's outputs,
+and repeats; when it has nothing to run it blocks on its socket. New requests
+and aborts reach the engine between steps. An add waits for the core's answer,
+so a full queue is still a 429 and an invalid prompt a 400. `/metrics` asks the
+core, since that is where the counters live. On Ctrl-C the server tells the core
+to finish its step and exit. If the server process disappears, the core notices
+and exits on its own.
+
+`--no-engine-process` keeps the old layout, for the A/B: the engine runs in the
+server process, each `step()` on one worker thread, and detokenizes there.
+
+If the engine raises or its process dies, every outstanding request fails,
+`/health` turns 503, and the server exits for a supervisor to restart.
 
 ### Scheduling
 
@@ -193,7 +202,8 @@ launch step k                    reconcile step k-1
 detokenize step k-1              detokenize step k-1
 ```
 
-With it off, only detokenization overlaps. With it on, scheduling and batch
+With it off, only detokenization overlaps, and by default that runs in the
+server process anyway; the table is the `--no-engine-process` layout. With it on, scheduling and batch
 preparation overlap too, but a stop is seen one step late. A request that ends
 on EOS or a stop string therefore has one extra token computed and discarded.
 Requests that end at `max_tokens` do not pay this.

@@ -120,7 +120,8 @@ class _InFlight:
 
 class LLMEngine:
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, detokenize: bool = True, **kwargs):
+        """detokenize=False leaves text empty, for a client that detokenizes itself, as an engine core's does."""
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         self.config = config = Config(model, **config_kwargs)
@@ -138,6 +139,7 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0)
         self.scheduler = Scheduler(config)
         self.metrics = Metrics()
+        self.detokenize = detokenize
         self.detokenizers: dict[str, FastIncrementalDetokenizer] = {}
         self.in_flight: _InFlight | None = None
         self.profiler = _StepProfiler.from_env()
@@ -157,14 +159,17 @@ class LLMEngine:
         config = self.config
         validate_request(prompt, sampling_params, config.hf_config.vocab_size, config.max_model_len, config.kv_transfer)
         seq = Sequence(prompt, sampling_params, request_id)
-        detokenizer = FastIncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
+        detokenizer = None
+        if self.detokenize:
+            detokenizer = FastIncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
         try:
             self.scheduler.add(seq)    # last, so a refused request leaves nothing behind
         except QueueFull:
             self.metrics.record_rejected()
             raise
         self.metrics.record_received()
-        self.detokenizers[seq.request_id] = detokenizer
+        if detokenizer is not None:
+            self.detokenizers[seq.request_id] = detokenizer
         return seq.request_id
 
     def abort_request(self, request_id: str, reason: str = "abort") -> bool:
@@ -223,10 +228,11 @@ class LLMEngine:
 
     def _output(self, seq: Sequence) -> RequestOutput:
         token_id = seq.last_token
-        detokenizer = self.detokenizers[seq.request_id]
-        text = detokenizer.decode(token_id)
-        if seq.is_finished:
-            del self.detokenizers[seq.request_id]
+        text = ""
+        if self.detokenize:
+            text = self.detokenizers[seq.request_id].decode(token_id)
+            if seq.is_finished:
+                del self.detokenizers[seq.request_id]
         return RequestOutput(
             request_id=seq.request_id,
             token_ids=[token_id],

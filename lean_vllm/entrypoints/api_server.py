@@ -1,4 +1,4 @@
-"""OpenAI-compatible HTTP server over `AsyncLLMEngine`."""
+"""OpenAI-compatible HTTP server over `AsyncMPClient`, or `AsyncLLMEngine` in-process; both have one surface."""
 
 import asyncio
 import json
@@ -72,16 +72,23 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
     @app.get("/health")
     async def health():
         if engine.is_dead:
-            raise HTTPException(503, f"the engine thread died: {engine.error!r}")
+            raise HTTPException(503, f"the engine died: {engine.error!r}")
         return {"status": "ok"}
 
     @app.get("/metrics")
     async def metrics():
-        return PlainTextResponse(engine.metrics.render(), media_type="text/plain; version=0.0.4")
+        try:
+            text = await engine.render_metrics()    # the counters live with the engine, maybe in another process
+        except EngineDeadError as dead:
+            raise HTTPException(503, str(dead))
+        return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
 
     @app.get("/metrics.json")
     async def metrics_json():
-        return engine.metrics.summary()
+        try:
+            return await engine.metrics_summary()
+        except EngineDeadError as dead:
+            raise HTTPException(503, str(dead))
 
     @app.get("/v1/models")
     async def models():
@@ -116,7 +123,7 @@ async def _serve(
         # As in OpenAI and vLLM, an unserved model name is a 404, not a field to ignore.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
-        raise HTTPException(503, f"the engine thread died: {engine.error!r}")
+        raise HTTPException(503, f"the engine died: {engine.error!r}")
     kv_transfer_params = body.kv_transfer_params
     if body.stream and kv_transfer_params and kv_transfer_params.get("do_remote_decode"):
         # A stream has nowhere to return the params, so the blocks would sit held until they expire.

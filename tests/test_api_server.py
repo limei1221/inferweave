@@ -80,6 +80,12 @@ class FakeAsyncEngine:
     def abort(self, request_id, reason="abort"):
         self.aborted.append((request_id, reason))
 
+    async def render_metrics(self):
+        return self.metrics.render()
+
+    async def metrics_summary(self):
+        return self.metrics.summary()
+
 
 @pytest.fixture
 def engine():
