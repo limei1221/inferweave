@@ -9,7 +9,7 @@ pytest.importorskip("fastapi", reason="the serve extra is not installed")
 
 from fastapi.testclient import TestClient
 
-from lean_vllm.engine.async_engine import EngineDeadError
+from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.scheduler import InvalidRequest, QueueFull

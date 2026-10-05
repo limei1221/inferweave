@@ -11,13 +11,13 @@ from lean_vllm import envs
 from lean_vllm.config import Config
 from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.engine.output import RequestOutput
+from lean_vllm.engine.output_processor import OutputProcessor
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, Scheduler, SchedulerOutput
 from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.kv_transfer import KVTransferConfig, check_kv_transfer_params
-from lean_vllm.utils.detokenizer import FastIncrementalDetokenizer
 
 
 def validate_request(
@@ -139,8 +139,7 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0)
         self.scheduler = Scheduler(config)
         self.metrics = Metrics()
-        self.detokenize = detokenize
-        self.detokenizers: dict[str, FastIncrementalDetokenizer] = {}
+        self.output_processor = OutputProcessor(self.tokenizer) if detokenize else None
         self.in_flight: _InFlight | None = None
         self.profiler = _StepProfiler.from_env()
         atexit.register(self.exit)
@@ -159,24 +158,22 @@ class LLMEngine:
         config = self.config
         validate_request(prompt, sampling_params, config.hf_config.vocab_size, config.max_model_len, config.kv_transfer)
         seq = Sequence(prompt, sampling_params, request_id)
-        detokenizer = None
-        if self.detokenize:
-            detokenizer = FastIncrementalDetokenizer(self.tokenizer, prompt, seq.skip_special_tokens)
         try:
-            self.scheduler.add(seq)    # last, so a refused request leaves nothing behind
+            self.scheduler.add(seq)    # before the detokenizer, so a refused request leaves nothing behind
         except QueueFull:
             self.metrics.record_rejected()
             raise
         self.metrics.record_received()
-        if detokenizer is not None:
-            self.detokenizers[seq.request_id] = detokenizer
+        if self.output_processor is not None:
+            self.output_processor.add_request(seq.request_id, prompt, seq.skip_special_tokens)
         return seq.request_id
 
     def abort_request(self, request_id: str, reason: str = "abort") -> bool:
         """reason is "stop" when the server ends it on a stop string, which counts as a finish."""
         seq = self.scheduler.seqs.get(request_id)
         aborted = self.scheduler.abort(request_id, reason)
-        self.detokenizers.pop(request_id, None)
+        if self.output_processor is not None:
+            self.output_processor.abort_request(request_id)
         if aborted:
             self.metrics.record_aborted(self._dropped(seq))
         return aborted
@@ -191,14 +188,16 @@ class LLMEngine:
         else:
             stepped = self._reconcile(draining)
             output = self._launch()
-        with record_function("detokenize"):
-            outputs = [self._output(seq) for seq in stepped]
+        outputs = [self._output(seq) for seq in stepped]
         # A request dropped right after reconcile already has its final output.
         outputs += [self._dropped(seq) for seq in output.dropped if seq not in stepped]
         # attributed to the step this call launched
         self.metrics.record_step(
             self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind,
         )
+        if self.output_processor is not None:
+            with record_function("detokenize"):
+                outputs = self.output_processor.process_outputs(outputs)
         if self.profiler is not None:
             self.profiler.step()
         return outputs, output.num_prefill_tokens, output.num_decode_tokens
@@ -227,16 +226,9 @@ class LLMEngine:
             return self.scheduler.reconcile(draining.rows, token_ids)
 
     def _output(self, seq: Sequence) -> RequestOutput:
-        token_id = seq.last_token
-        text = ""
-        if self.detokenize:
-            text = self.detokenizers[seq.request_id].decode(token_id)
-            if seq.is_finished:
-                del self.detokenizers[seq.request_id]
         return RequestOutput(
             request_id=seq.request_id,
-            token_ids=[token_id],
-            text=text,
+            token_ids=[seq.last_token],
             finished=seq.is_finished,
             finish_reason=seq.finish_reason,
             metrics=seq.metrics() if seq.is_finished else None,
@@ -245,7 +237,6 @@ class LLMEngine:
 
     def _dropped(self, seq: Sequence) -> RequestOutput:
         """Finished by the scheduler without ever sampling, so there is no token."""
-        self.detokenizers.pop(seq.request_id, None)
         return RequestOutput(
             request_id=seq.request_id,
             token_ids=[],

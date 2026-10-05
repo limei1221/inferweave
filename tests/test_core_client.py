@@ -1,4 +1,4 @@
-"""The engine core in its own process: requests across, outputs back, and what a dead core owes its callers.
+"""AsyncLLM over a core in its own process: requests across, outputs back, and what a dead core owes its callers.
 
 The core runs conftest's fake engine, built by the factories below in the spawned process.
 """
@@ -16,8 +16,9 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
-from lean_vllm.engine.async_engine import EngineDeadError
+from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.core_client import AsyncMPClient
+from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVTransferConfig
@@ -61,8 +62,8 @@ def failing_engine():
 def make_client():
     clients = []
 
-    def _make(tokenizer=None, **kwargs) -> AsyncMPClient:
-        client = AsyncMPClient(fake_engine, kwargs=kwargs, tokenizer=tokenizer, shutdown_timeout=10)
+    def _make(tokenizer=None, **kwargs) -> AsyncLLM:
+        client = AsyncLLM(AsyncMPClient(fake_engine, kwargs=kwargs, shutdown_timeout=10), tokenizer)
         client.start()
         clients.append(client)
         return client
@@ -72,7 +73,7 @@ def make_client():
         client.stop()
 
 
-async def collect(client: AsyncMPClient, prompt: list[int], params: SamplingParams):
+async def collect(client: AsyncLLM, prompt: list[int], params: SamplingParams):
     return [output async for output in await client.add_request(prompt, params)]
 
 
@@ -133,7 +134,7 @@ class TestAdmissionAndAbort:
         await first.aclose()
         summary = await client.metrics_summary()    # processed after any abort sent by cleanup
         assert summary["requests"]["aborted"] == 0
-        assert "reused" in client._streams
+        assert "reused" in client.output_processor.request_states
         client.abort("reused")
         await second.aclose()
 
@@ -187,7 +188,7 @@ class TestDeath:
         client = make_client()
         outputs = await client.add_request(list(range(8)), FOREVER)
         await anext(outputs)
-        client._process.kill()
+        client.engine_core._process.kill()
         with pytest.raises(EngineDeadError, match="exited"):
             async for _ in outputs:
                 pass
@@ -198,7 +199,7 @@ class TestDeath:
         client = make_client()
         await collect(client, list(range(8)), SamplingParams(max_tokens=2, ignore_eos=True))
         client.stop()
-        assert client._process.exitcode == 0
+        assert client.engine_core._process.exitcode == 0
 
 
 ENGINE_ARGS = dict(enforce_eager=True, kvcache_memory_gb=0.25, max_model_len=256, max_num_batched_tokens=256)
@@ -218,7 +219,7 @@ async def test_a_real_core_streams_what_the_engine_generates(monkeypatch):
     prompt, params = "The capital of France is", SamplingParams(temperature=0, max_tokens=12)
     with ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as pool:
         want = pool.submit(generate, prompt, params).result()
-    client = AsyncMPClient.from_engine_args(MODEL, **ENGINE_ARGS)
+    client = AsyncLLM.from_engine_args(MODEL, **ENGINE_ARGS)
     client.start()
     try:
         outputs = await collect(client, prompt, params)

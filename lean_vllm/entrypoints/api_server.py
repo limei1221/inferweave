@@ -1,4 +1,4 @@
-"""OpenAI-compatible HTTP server over `AsyncMPClient`, or `AsyncLLMEngine` in-process; both have one surface."""
+"""OpenAI-compatible HTTP server over `AsyncLLM`, whichever core client it runs."""
 
 import asyncio
 import json
@@ -12,7 +12,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
+from lean_vllm.engine.async_llm import AsyncLLM
+from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
 from lean_vllm.entrypoints import protocol
@@ -36,7 +37,7 @@ DROP_STATUS = {"capacity": 503, "timeout": 504}
 class _RequestStreamingResponse(StreamingResponse):
     """Own admission cleanup even if sending headers or the first chunk fails."""
 
-    def __init__(self, stream, engine: AsyncLLMEngine, request_id: str):
+    def __init__(self, stream, engine: AsyncLLM, request_id: str):
         super().__init__(stream, media_type="text/event-stream")
         self.engine = engine
         self.request_id = request_id
@@ -50,7 +51,7 @@ class _RequestStreamingResponse(StreamingResponse):
             await self.body_iterator.aclose()
 
 
-def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
+def build_app(engine: AsyncLLM, model: str) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -69,6 +70,20 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
         kind = "server_error" if exc.status_code >= 500 else "invalid_request_error"
         return JSONResponse(status_code=exc.status_code, content=_error(kind, exc.detail))
 
+    # What admission and a dead engine raise, answered once here rather than in every route.
+    @app.exception_handler(InvalidRequest)
+    async def _invalid_request(request: Request, exc: InvalidRequest):
+        return JSONResponse(status_code=400, content=_error("invalid_request_error", str(exc)))
+
+    @app.exception_handler(QueueFull)
+    async def _queue_full(request: Request, exc: QueueFull):
+        message = f"the engine is at capacity: {exc}"
+        return JSONResponse(status_code=429, content=_error("invalid_request_error", message))
+
+    @app.exception_handler(EngineDeadError)
+    async def _engine_dead(request: Request, exc: EngineDeadError):
+        return JSONResponse(status_code=503, content=_error("server_error", str(exc)))
+
     @app.get("/health")
     async def health():
         if engine.is_dead:
@@ -77,18 +92,11 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
 
     @app.get("/metrics")
     async def metrics():
-        try:
-            text = await engine.render_metrics()    # the counters live with the engine, maybe in another process
-        except EngineDeadError as dead:
-            raise HTTPException(503, str(dead))
-        return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
+        return PlainTextResponse(await engine.render_metrics(), media_type="text/plain; version=0.0.4")
 
     @app.get("/metrics.json")
     async def metrics_json():
-        try:
-            return await engine.metrics_summary()
-        except EngineDeadError as dead:
-            raise HTTPException(503, str(dead))
+        return await engine.metrics_summary()
 
     @app.get("/v1/models")
     async def models():
@@ -112,7 +120,7 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
 
 
 async def _serve(
-    engine: AsyncLLMEngine,
+    engine: AsyncLLM,
     model: str,
     body: BaseRequest,
     prompt_token_ids: list[int],
@@ -136,23 +144,13 @@ async def _serve(
         priority=body.priority,
         kv_transfer_params=kv_transfer_params,
     )
-    try:
-        outputs = await engine.add_request(prompt_token_ids, sampling_params, request_id)
-    except InvalidRequest as invalid:
-        raise HTTPException(400, str(invalid))
-    except QueueFull as full:
-        raise HTTPException(429, f"the engine is at capacity: {full}")
-    except EngineDeadError as dead:
-        raise HTTPException(503, str(dead))
+    outputs = await engine.add_request(prompt_token_ids, sampling_params, request_id)
 
     deltas = _deltas(outputs, StopChecker(body.stop_strings), engine, request_id)
     if body.stream:
         stream = _stream(deltas, request_id, model, body, len(prompt_token_ids), chat)
         return _RequestStreamingResponse(stream, engine, request_id)
-    try:
-        reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
-    except EngineDeadError as dead:
-        raise HTTPException(503, str(dead))
+    reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
     if reply is None:
         engine.abort(request_id)    # the generators may never have started, so no finally ran
         return Response(status_code=499)    # nobody is left to read it
@@ -180,7 +178,7 @@ async def _disconnected(request: Request):
 
 
 async def _deltas(
-    outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLMEngine, request_id: str,
+    outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLM, request_id: str,
 ):
     """Yields (text, finish_reason, num_completion_tokens, kv_transfer_params); the last has a reason."""
     num_tokens = 0

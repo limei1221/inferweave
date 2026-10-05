@@ -19,7 +19,7 @@ from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
 
 logger = logging.getLogger(__name__)
 
-IDLE_POLL_MS = 5    # backoff after a step that ran nothing although work is outstanding, as AsyncLLMEngine's
+IDLE_POLL_MS = 5    # backoff after a step that ran nothing although work is outstanding
 PARENT_POLL_MS = 1000    # how often an idle core checks that the client is still there
 
 

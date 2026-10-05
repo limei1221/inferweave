@@ -154,13 +154,16 @@ DeepSeek-V2-Lite has its own [3 October report](benchmark-2026-10-03-DeepSeek-V2
   --------------                       -------------------
   HTTP (FastAPI / uvicorn)             EngineCore busy loop
     tokenize, stop strings, SSE          requests in, between steps
-  AsyncMPClient          -- ZMQ -->      LLMEngine.step()
-    per-request asyncio.Queue              Scheduler: one token budget per step
-    detokenize           <-- ZMQ --        ModelRunner: one mixed batch
+  AsyncLLM                               LLMEngine.step()
+    per-request stream, detokenize         Scheduler: one token budget per step
+  AsyncMPClient          -- ZMQ -->      ModelRunner: one mixed batch
+                         <-- ZMQ --
 ```
 
 As in vLLM, the engine runs in a process of its own (`engine/core.py`), and the
-server talks to it over two ZMQ sockets (`engine/core_client.py`). The server's
+server talks to it over two ZMQ sockets (`engine/core_client.py`). `AsyncLLM`
+(`engine/async_llm.py`) owns every request's stream and detokenizer, in an
+`OutputProcessor`; the client under it only moves requests and outputs. The server's
 event loop and the step loop then each hold their own GIL, so streaming many
 responses does not slow down a step's Python dispatch. The core sends token ids,
 and the server turns them into text.
@@ -172,9 +175,6 @@ so a full queue is still a 429 and an invalid prompt a 400. `/metrics` asks the
 core, since that is where the counters live. On Ctrl-C the server tells the core
 to finish its step and exit. If the server process disappears, the core notices
 and exits on its own.
-
-`--no-engine-process` keeps the old layout, for the A/B: the engine runs in the
-server process, each `step()` on one worker thread, and detokenizes there.
 
 If the engine raises or its process dies, every outstanding request fails,
 `/health` turns 503, and the server exits for a supervisor to restart.
@@ -202,8 +202,8 @@ launch step k                    reconcile step k-1
 detokenize step k-1              detokenize step k-1
 ```
 
-With it off, only detokenization overlaps, and by default that runs in the
-server process anyway; the table is the `--no-engine-process` layout. With it on, scheduling and batch
+With it off, only detokenization overlaps. That is offline `generate()`, which
+detokenizes inside `step()`; the server detokenizes in its own process. With it on, scheduling and batch
 preparation overlap too, but a stop is seen one step late. A request that ends
 on EOS or a stop string therefore has one extra token computed and discarded.
 Requests that end at `max_tokens` do not pay this.

@@ -178,7 +178,7 @@ class FakeEngine:
 
 
 class FakeLLMEngine(FakeEngine):
-    """LLMEngine's surface, so AsyncLLMEngine can be driven without a model."""
+    """LLMEngine's surface, so the core clients can drive it without a model."""
 
     tokenizer = None    # the async engine only needs one for str prompts
 

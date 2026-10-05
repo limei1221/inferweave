@@ -31,8 +31,6 @@ def main(argv: list[str] | None = None):
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--served-model-name", default=None, help="the id reported by /v1/models")
     serve.add_argument("--log-level", default="info")
-    serve.add_argument("--engine-process", action=argparse.BooleanOptionalAction, default=True,
-                       help="step the engine in its own process, as vLLM does; off, on a thread of the server")
     add_engine_args(serve)
     proxy = subparsers.add_parser("proxy", help="split each request between prefill and decode servers")
     proxy.add_argument("--prefill", nargs="+", required=True, help="prefill server URLs, kv_role producer or both")
