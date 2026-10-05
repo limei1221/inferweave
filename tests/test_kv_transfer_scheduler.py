@@ -225,3 +225,30 @@ def test_a_load_counts_as_waiting(make_disagg_engine):
     engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), "d-1")
     engine.step()
     assert engine.metrics.waiting.value == 1 and engine.metrics.running.value == 0
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("transfer", ["sending", "recving"])
+def test_decode_waits_for_blocks_held_by_a_transfer(make_disagg_engine, async_scheduling, transfer):
+    engine = make_disagg_engine(num_kvcache_blocks=3, async_scheduling=async_scheduling)
+    params = {"do_remote_decode": True} if transfer == "sending" else remote_prefill(num_blocks=2)
+    remote = engine.add(list(range(30, 46)), SamplingParams(max_tokens=1, kv_transfer_params=params), "remote")
+    for _ in range(3):
+        engine.step()
+    assert "remote" in getattr(engine.scheduler, transfer)
+
+    local = engine.add(list(range(10, 18)), SamplingParams(max_tokens=2), "local")
+    outputs = []
+    for _ in range(4):
+        outputs.extend(engine.step())
+    assert not local.is_finished
+    assert local.num_completion_tokens == 1
+
+    done = (KVConnectorOutput(finished_sending={"remote"}) if transfer == "sending"
+            else KVConnectorOutput(finished_recving={"remote"}))
+    engine.model_runner.kv_outputs.append(done)
+    rest = engine.run_to_completion()
+    tokens = [token for output in outputs if output.request_id == "local" for token in output.token_ids]
+    assert len(tokens + rest["local"]) == 2
+    assert local.finish_reason == remote.finish_reason == "length"
+    assert not engine.scheduler.block_manager.used_block_ids

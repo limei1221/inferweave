@@ -235,6 +235,11 @@ class Scheduler:
             elif seq.num_pending_tokens:
                 still_running.append(seq)    # its in-flight token may stop it; decide after reconcile
                 return False
+            elif self.recving or self.sending:
+                # Transfers still own blocks outside running. Wait until they
+                # finish before deciding whether this request can ever fit.
+                still_running.append(seq)
+                return False
             else:
                 # Alone in the cache and still short of a block: it can never fit.
                 self.block_manager.deallocate(seq)
