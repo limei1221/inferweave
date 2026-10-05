@@ -67,8 +67,9 @@ class TorchAttention(AttentionBackend):
         max_seqlen_q, max_seqlen_k = context.max_seqlen_q, context.max_seqlen_k
         q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q)    # [B, Lq, H, D]
         if context.block_tables is not None:    # read every key back from the pages
-            k_pad = self._gather_pages(k_cache, context.block_tables, max_seqlen_k)
-            v_pad = self._gather_pages(v_cache, context.block_tables, max_seqlen_k)
+            seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            k_pad = self._gather_pages(k_cache, context.block_tables, max_seqlen_k, seqlens_k)
+            v_pad = self._gather_pages(v_cache, context.block_tables, max_seqlen_k, seqlens_k)
         else:
             k_pad = self._pad_rows(k, cu_seqlens_k, max_seqlen_k)
             v_pad = self._pad_rows(v, cu_seqlens_k, max_seqlen_k)
@@ -91,8 +92,8 @@ class TorchAttention(AttentionBackend):
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         block_tables = context.block_tables
         seqlen = block_tables.size(1) * k_cache.size(1)    # the table's width, so no length is read back
-        k = self._gather_pages(k_cache, block_tables, seqlen)
-        v = self._gather_pages(v_cache, block_tables, seqlen)
+        k = self._gather_pages(k_cache, block_tables, seqlen, context.context_lens)
+        v = self._gather_pages(v_cache, block_tables, seqlen, context.context_lens)
         mask = self._key_mask(context.context_lens, seqlen)
         return self._sdpa(q.unsqueeze(1), k, v, mask).squeeze(1)
 
@@ -100,7 +101,7 @@ class TorchAttention(AttentionBackend):
         # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
         block_tables = context.block_tables
         seqlen = block_tables.size(1) * latent_cache.size(1)
-        latent = self._gather_pages(latent_cache, block_tables, seqlen)    # [B, Lk, D]
+        latent = self._gather_pages(latent_cache, block_tables, seqlen, context.context_lens)    # [B, Lk, D]
         kv = latent.unsqueeze(1).expand(-1, q.size(1), -1, -1)    # [B, H, Lk, D]
         mask = self._key_mask(context.context_lens, seqlen)
         o = F.scaled_dot_product_attention(q.unsqueeze(2), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale)
@@ -120,12 +121,19 @@ class TorchAttention(AttentionBackend):
         return x[rows, tokens - cu_seqlens[rows]]
 
     @staticmethod
-    def _gather_pages(cache: torch.Tensor, block_tables: torch.Tensor, seqlen: int) -> torch.Tensor:
-        """Each row's first seqlen cached tokens, [B, seqlen, ...]. A table's -1 padding reads block 0, for the mask to hide."""
+    def _gather_pages(
+        cache: torch.Tensor, block_tables: torch.Tensor, seqlen: int, seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Each row's cached tokens, [B, seqlen, ...], with unused slots zeroed."""
         block_size = cache.size(1) # [num_blocks, block_size, ...]
         num_blocks = (seqlen + block_size - 1) // block_size
         blocks = block_tables[:, :num_blocks].long().clamp(min=0)
-        return cache[blocks].flatten(1, 2)[:, :seqlen]
+        gathered = cache[blocks].flatten(1, 2)[:, :seqlen]
+        # The cache is uninitialized outside each row's length. An attention
+        # mask cannot hide NaN/inf keys or values from matrix multiplication.
+        padding = torch.arange(gathered.size(1), device=cache.device) >= seqlens.unsqueeze(1)
+        padding = padding.view(*padding.shape, *([1] * (gathered.ndim - 2)))
+        return gathered.masked_fill_(padding, 0)
 
     @staticmethod
     def _key_mask(seqlens_k: torch.Tensor, max_seqlen_k: int) -> torch.Tensor:

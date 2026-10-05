@@ -128,6 +128,34 @@ def randn(*shape, device, dtype):
     return torch.randn(*shape, device=device).to(dtype)
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill", "mla_decode"])
+@pytest.mark.parametrize("poison", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_torch_attention_ignores_unwritten_cache_slots(mode, poison):
+    backend = TorchAttention(2, 4, 0.5, 1)
+    # The second row forces padding in prefill too. Neither unused slots nor
+    # block-table padding may contribute to the first row's attention.
+    cache = torch.full((3, 2, 1, 4), poison)
+    cache[1, 0] = 1
+    cache[2] = 1
+    cache[0, 0] = 1
+    context = Context(
+        is_prefill=mode == "prefill",
+        block_tables=torch.tensor([[1, -1], [2, 0]], dtype=torch.int32),
+        context_lens=torch.tensor([1, 3], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 1, 4], dtype=torch.int32),
+        max_seqlen_q=1, max_seqlen_k=3,
+    )
+    q = torch.ones(2, 2, 4)
+    if mode == "mla_decode":
+        out = backend.mla_decode(q, cache.squeeze(2), 2, context)
+    elif mode == "prefill":
+        out = backend.prefill(q, torch.empty(0), torch.empty(0), cache, cache, context)
+    else:
+        out = backend.decode(q, cache, cache, context)
+    torch.testing.assert_close(out, torch.ones_like(out))
+
+
 def test_prefill_without_cache(backend, device, dtype, tol):
     """Varlen causal prefill with no cached tokens."""
     seqlens = [5, 1, 12]    # no paging on this path
