@@ -2,12 +2,14 @@ import logging
 import math
 from collections import Counter
 from datetime import timedelta
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
 
 from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
+from lean_vllm.engine.input_buffers import InputBuffers
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, KVOutputAggregator, create_worker_connector
@@ -186,26 +188,43 @@ class ModelRunner:
         for layer, cache in zip(layers, self.kv_cache):
             layer.bind_kv_cache(cache)
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = dev.make_tensor(block_tables, torch.int32, self.device)
-        return block_tables
+    @property
+    def input_buffers(self) -> InputBuffers:
+        """Made on first use, so a runner built without __init__, as the tests build it, has one too."""
+        buffers = self.__dict__.get("_input_buffers")
+        if buffers is None:
+            buffers = self._input_buffers = InputBuffers(self.device)
+        return buffers
 
     def prepare_batch(self, seqs: list[Sequence]):
-        """One batch for any mix of prompt chunks and decode rows, and the context to run it in."""
-        input_ids, positions, slot_mapping = [], [], []
-        cu_seqlens_q, cu_seqlens_k = [0], [0]
-        max_seqlen_q = max_seqlen_k = 0
-        context_lens, logits_indices, temperatures = [], [], []
-        pending_dst, pending_src, sampling_rows = [], [], []
-        is_prefill = any(seq.is_prefill for seq in seqs)
-        last_tokens = {}    # id(seq) -> where a sampling row's last token sits; a worker's copy has no seq_id
-        batch = self.decodes_first(seqs)
+        """One batch for any mix of prompt chunks and decode rows, and the context to run it in.
 
-        for seq in batch:
-            start = seq.num_cached_tokens
-            end = start + seq.num_scheduled_tokens
+        As vLLM's _prepare_inputs: one pass over the rows for their scalars and tokens, then numpy for everything
+        per token, and one copy per tensor into buffers that outlive the step.
+        """
+        buffers = self.input_buffers
+        buffers.begin()
+        num_rows, block_size = len(seqs), self.block_size
+        # Scheduler order first: it is the order the sampled tokens are read back in.
+        lens = np.fromiter((seq.num_scheduled_tokens for seq in seqs), np.int64, num_rows)
+        starts = np.fromiter((seq.num_cached_tokens for seq in seqs), np.int64, num_rows)
+        planned = np.fromiter((seq.num_planned_tokens for seq in seqs), np.int64, num_rows)
+        order = np.argsort(lens > 1, kind="stable")    # decodes_first, as indices
+        batch = [seqs[i] for i in order]
+        row_of = np.empty(num_rows, np.int64)
+        row_of[order] = np.arange(num_rows)    # each scheduled sequence's row in the batch
+
+        lens, starts = lens[order], starts[order]
+        ends = starts + lens
+        cu_q = np.zeros(num_rows + 1, np.int64)
+        np.cumsum(lens, out=cu_q[1:])
+        cu_k = np.zeros(num_rows + 1, np.int64)
+        np.cumsum(ends, out=cu_k[1:])
+        token_rows = np.repeat(np.arange(num_rows), lens)
+        positions = starts[token_rows] + np.arange(cu_q[-1]) - cu_q[token_rows]
+
+        input_ids, pending_dst, pending_src = [], [], []
+        for seq, start, end in zip(batch, starts.tolist(), ends.tolist()):
             if seq.is_prefill:
                 assert not seq.num_pending_tokens, "a prefill row carries a pending token"
                 input_ids.extend(seq[start:end])
@@ -215,53 +234,48 @@ class ModelRunner:
                     pending_dst.append(len(input_ids))
                     pending_src.append(self._prev_row(seq))
                 input_ids.append(seq.last_token)
-            positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seq.num_scheduled_tokens)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
-            max_seqlen_q = max(seq.num_scheduled_tokens, max_seqlen_q)
-            max_seqlen_k = max(end, max_seqlen_k)
-            context_lens.append(end)
-            if end == seq.num_planned_tokens:    # nothing left to prefill, so this row samples
-                last_tokens[id(seq)] = cu_seqlens_q[-1] - 1
-            if not seq.block_table:    # warmup
-                continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size    # exclusive, so one past the last block
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:    # last logical block, half-full probably
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
 
-        for seq in seqs:    # the scheduler's order, which it reads the sampled tokens back in
-            if id(seq) in last_tokens:
-                logits_indices.append(last_tokens[id(seq)])
-                sampling_rows.append(seq)
-                if self.rank == 0:    # only the sampling rank owns sampling parameters
-                    temperatures.append(seq.temperature)
+        # A row with nothing left to prefill samples its last token.
+        sampling = np.flatnonzero(starts[row_of] + lens[row_of] == planned)    # in scheduler order
+        logits_indices = cu_q[row_of[sampling] + 1] - 1
+        sampling_rows = [seqs[i] for i in sampling.tolist()]
+        # Only the sampling rank owns sampling parameters.
+        temperatures = [seq.temperature for seq in sampling_rows] if self.rank == 0 else []
 
-        block_tables = self.prepare_block_tables(batch) if any(seq.block_table for seq in batch) else None
+        block_tables = slot_mapping = None
+        tables = [seq.block_table for seq in batch]
+        if any(tables):
+            table = np.full((num_rows, max(map(len, tables))), -1, np.int32)
+            for i, row in enumerate(tables):
+                table[i, :len(row)] = row
+            # Each token's slot is its block's, plus its offset in it. Rows with no blocks (warmup) store nothing.
+            keep = np.fromiter(map(bool, tables), bool, num_rows)[token_rows]
+            kept = positions[keep]
+            blocks = table[token_rows[keep], kept // block_size].astype(np.int64)
+            slot_mapping = blocks * block_size + kept % block_size
+            block_tables = buffers.put("block_tables", table, torch.int32)
+        is_prefill = any(seq.is_prefill for seq in seqs)
+        cu_seqlens_q, cu_seqlens_k = cu_q.tolist(), cu_k.tolist()
         context = dict(
             is_prefill=is_prefill,
-            cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, self.device),
-            cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, self.device),
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_q=buffers.put("cu_seqlens_q", cu_q, torch.int32),
+            cu_seqlens_k=buffers.put("cu_seqlens_k", cu_k, torch.int32),
+            max_seqlen_q=int(lens.max()),
+            max_seqlen_k=int(ends.max()),
             cu_seqlens_q_host=cu_seqlens_q,
             cu_seqlens_k_host=cu_seqlens_k,
-            # Equal cumulative lengths: no row reads cached keys, so the cache can be skipped.
-            keys_are_new=cu_seqlens_k == cu_seqlens_q,
-            slot_mapping=dev.make_tensor(slot_mapping, torch.int32, self.device),
-            context_lens=dev.make_tensor(context_lens, torch.int32, self.device),
+            # No row reads cached keys, so the cache can be skipped.
+            keys_are_new=not starts.any(),
+            slot_mapping=buffers.put("slot_mapping", [] if slot_mapping is None else slot_mapping, torch.int32),
+            context_lens=buffers.put("context_lens", ends, torch.int32),
             block_tables=block_tables,
             # A pure-decode batch samples on every row, so the gather is skipped.
-            logits_indices=dev.make_tensor(logits_indices, torch.int64, self.device) if is_prefill else None,
+            logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
         )
-        input_ids = dev.make_tensor(input_ids, torch.int64, self.device)
+        input_ids = buffers.put("input_ids", np.array(input_ids, np.int64), torch.int64)
+        positions = buffers.put("positions", positions, torch.int64)
+        all_greedy = all(temperature == 0 for temperature in temperatures)
+        temperatures = None if all_greedy else buffers.put("temperatures", temperatures, torch.float32)
         if pending_dst:
             prev = self._prev_tokens.device_tokens()
             num_pending = len(pending_dst)
@@ -269,12 +283,10 @@ class ModelRunner:
                 # Pending rows are the first n of both; prev may have more if a request finished.
                 input_ids[:num_pending] = prev[:num_pending]
             else:
-                dst = dev.make_tensor(pending_dst, torch.int64, self.device)
-                src = dev.make_tensor(pending_src, torch.int64, self.device)
+                dst = buffers.put("pending_dst", pending_dst, torch.int64)
+                src = buffers.put("pending_src", pending_src, torch.int64)
                 input_ids.index_copy_(0, dst, prev.index_select(0, src))
-        positions = dev.make_tensor(positions, torch.int64, self.device)
-        all_greedy = all(temperature == 0 for temperature in temperatures)
-        temperatures = None if all_greedy else dev.make_tensor(temperatures, torch.float32, self.device)
+        buffers.end()
         self._sampling_rows = sampling_rows
         return input_ids, positions, temperatures, context
 

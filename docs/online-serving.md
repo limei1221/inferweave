@@ -208,13 +208,22 @@ preparation overlap too, but a stop is seen one step late. A request that ends
 on EOS or a stop string therefore has one extra token computed and discarded.
 Requests that end at `max_tokens` do not pay this.
 
-Two details keep it safe:
+Three details keep it safe:
 
 - `SampledTokens` copies sampled tokens to pinned memory on a separate CUDA
   stream, so waiting for step k-1 does not block on step k's kernels.
 - All other device work stays on one stream, so a step always runs after the
   previous step's KV writes. That makes it safe to free or share a KV block
-  while a step is in flight.
+  while a step is in flight. It also lets each step's inputs reuse the same
+  device buffers (`engine/input_buffers.py`), as vLLM's do: a step's copy into
+  them queues behind the last step's reads.
+- Those inputs are staged in pinned host buffers that also outlive a step, and
+  their copies run asynchronously. An event recorded after a step's copies is
+  waited on before the next step writes them, as in vLLM.
+
+Batch preparation, like vLLM's `_prepare_inputs`, touches each row once in
+Python and computes everything per token with numpy: positions, sequence
+offsets, slot mapping and which rows sample.
 
 Tensor parallelism turns it off, because the other ranks never see the sampled
 tokens. On an H100 it cuts offline GPU idle time from 22.4% to 3.2%.

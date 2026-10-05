@@ -1,6 +1,7 @@
 """Batch preparation on CPU, including the sequence state sent to TP workers."""
 
 import pickle
+import random
 
 import pytest
 import torch
@@ -435,3 +436,89 @@ class TestDummySamplerRun:
         sampling_runner.sampler = oom
         with pytest.raises(RuntimeError, match="lower max_num_seqs or gpu_memory_utilization"):
             sampling_runner._dummy_sampler_run()
+
+
+def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
+    """The per-token loops prepare_batch replaced, kept as its oracle; pending tokens aside."""
+    out = dict(input_ids=[], positions=[], slot_mapping=[], cu_seqlens_q=[0], cu_seqlens_k=[0], context_lens=[])
+    last_tokens = {}
+    for seq in ModelRunner.decodes_first(seqs):
+        start, end = seq.num_cached_tokens, seq.num_cached_tokens + seq.num_scheduled_tokens
+        out["input_ids"] += seq[start:end] if seq.is_prefill else [seq.last_token]
+        out["positions"] += range(start, end)
+        out["cu_seqlens_q"].append(out["cu_seqlens_q"][-1] + seq.num_scheduled_tokens)
+        out["cu_seqlens_k"].append(out["cu_seqlens_k"][-1] + end)
+        out["context_lens"].append(end)
+        if end == seq.num_planned_tokens:
+            last_tokens[id(seq)] = out["cu_seqlens_q"][-1] - 1
+        if seq.block_table:
+            out["slot_mapping"] += [seq.block_table[p // block_size] * block_size + p % block_size
+                                    for p in range(start, end)]
+    sampling = [seq for seq in seqs if id(seq) in last_tokens]
+    out["logits_indices"] = [last_tokens[id(seq)] for seq in sampling]
+    temperatures = [seq.temperature for seq in sampling] if rank == 0 else []
+    out["temperatures"] = None if all(t == 0 for t in temperatures) else temperatures
+    tables = [seq.block_table for seq in ModelRunner.decodes_first(seqs)]
+    width = max(map(len, tables))
+    out["block_tables"] = [table + [-1] * (width - len(table)) for table in tables] if width else None
+    return out
+
+
+def random_batch(rng, block_size: int, with_tables: bool = True) -> list[Sequence]:
+    """Decodes, cold prompts, resumed chunks and prefix-cache hits, in the scheduler's shuffled order."""
+    next_block = iter(rng.sample(range(10_000), 2_000))    # scattered, so a wrong page lookup shows
+    seqs = []
+    for _ in range(rng.randint(1, 24)):
+        kind = rng.choice(["decode", "prompt", "chunk"])
+        prompt = [rng.randrange(1000) for _ in range(rng.randint(1, 90))]
+        seq = Sequence(prompt, SamplingParams(temperature=rng.choice([0, 0, 0.7])))
+        if kind == "decode":
+            seq.append_token(rng.randrange(1000))
+            seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = len(prompt), 1, False
+        else:
+            seq.num_cached_tokens = rng.randrange(len(prompt)) if kind == "chunk" else 0
+            seq.num_scheduled_tokens = rng.randint(1, len(prompt) - seq.num_cached_tokens)
+        if with_tables:
+            end = seq.num_cached_tokens + seq.num_scheduled_tokens
+            seq.block_table = [next(next_block) for _ in range((end + block_size - 1) // block_size)]
+        seqs.append(seq)
+    return seqs
+
+
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])    # cuda stages through pinned buffers
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("rank", [0, 1])
+def test_the_numpy_batch_matches_the_per_token_loops(runner, device, rank):
+    """Twenty random steps through one runner, so on cuda each overwrites the last one's buffers."""
+    runner.rank, runner.device = rank, torch.device(device)
+    rng = random.Random(rank)
+    for step in range(20):
+        seqs = random_batch(rng, runner.block_size, with_tables=step % 5 != 0)    # every fifth is warmup-like
+        check_batch(runner, seqs, reference_batch(seqs, runner.block_size, rank))
+
+
+def check_batch(runner, seqs: list[Sequence], want: dict):
+    ids, positions, temperatures, context = runner.prepare_batch(seqs)
+
+    assert ids.tolist() == want["input_ids"]
+    assert positions.tolist() == want["positions"]
+    for key in ("cu_seqlens_q", "cu_seqlens_k", "context_lens", "slot_mapping"):
+        assert context[key].tolist() == want[key], key
+    assert context["cu_seqlens_q_host"] == want["cu_seqlens_q"]
+    assert context["cu_seqlens_k_host"] == want["cu_seqlens_k"]
+    assert context["max_seqlen_q"] == max(b - a for a, b in zip(want["cu_seqlens_q"], want["cu_seqlens_q"][1:]))
+    assert context["max_seqlen_k"] == max(want["context_lens"])
+    assert context["keys_are_new"] == (want["cu_seqlens_q"] == want["cu_seqlens_k"])
+    if context["is_prefill"]:
+        assert context["logits_indices"].tolist() == want["logits_indices"]
+    else:
+        assert context["logits_indices"] is None and want["logits_indices"] == list(range(len(seqs)))
+    assert (context["block_tables"] is None if want["block_tables"] is None
+            else context["block_tables"].tolist() == want["block_tables"])
+    assert (temperatures is None) == (want["temperatures"] is None)
+    if temperatures is not None:
+        assert temperatures.tolist() == pytest.approx(want["temperatures"])
+    assert runner._sampling_rows == [seq for seq in seqs if seq.num_cached_tokens + seq.num_scheduled_tokens
+                                     == seq.num_planned_tokens]
