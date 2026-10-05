@@ -19,8 +19,13 @@ AttentionBackend                  # the interface
       +-- FlashInferBackend       # FlashInfer's paged kernels + the Triton scatter, Ampere and newer
       |
       +-- FlashAttention3Backend  # FlashAttention-3 + a Triton cache scatter, Hopper only
+      |     |
+      |     +-- FlashMLABackend   # FA3, plus FlashMLA's decode for MLA models
+      |
+      +-- MLACommonBackend        # MLA only: prefill on FA3 (Hopper) or FlashInfer (elsewhere)
             |
-            +-- FlashMLABackend   # FA3, plus FlashMLA's decode for MLA models
+            +-- TritonMLABackend      # plus vLLM's Triton MLA decode, Ampere and newer
+            +-- FlashInferMLABackend  # plus FlashInfer's MLA decode, Ampere and newer
 ```
 
 ## What is supported
@@ -33,13 +38,17 @@ AttentionBackend                  # the interface
 | `flashinfer` | sm80 and newer (A100, H100, ...), Linux | Plain layers; fp16/bf16; head size 64, 128 or 256 | Any multiple of 16 | Full + piecewise | Yes |
 | `flash_attn_3` | H100 / H200 (sm90), Linux x86_64 | Plain and MLA layers; fp16/bf16; head size a multiple of 8, up to 256 | Any multiple of 16 | Full + piecewise | No |
 | `flashmla` | H100 / H200, with FlashMLA built from source | MLA layers with 512 + 64 latents; as FA3 otherwise | 64 | Full + piecewise | MLA layers split themselves |
+| `triton_mla` | sm80 and newer, with FA3 or FlashInfer for prefill | MLA layers with 512 + 64 latents; fp16/bf16 | Any | Full + piecewise | MLA layers split themselves |
+| `flashinfer_mla` | sm80 and newer, Linux | As `triton_mla` | Any | Full + piecewise | MLA layers split themselves |
 
 `torch` is written to be obviously correct, not fast. It is the backend for
-development and tests, not for benchmarks. `torch` and `flashmla` also decode MLA
-latents directly (`mla_decode`); `flash_attn_3` expands them.
+development and tests, not for benchmarks. `torch`, `flashmla`, `triton_mla` and
+`flashinfer_mla` decode MLA latents directly (`mla_decode`); `flash_attn_3`
+expands them.
 
-An A100 now has a fast backend for plain layers, `flashinfer`; MLA layers there
-still fall back to `torch`. FlashAttention-2 is not supported.
+An A100 has a fast backend for plain layers, `flashinfer`, and for MLA layers,
+`triton_mla`, which prefills there on FlashInfer. FlashAttention-2 is not
+supported.
 
 ### Selection
 
@@ -50,14 +59,17 @@ a plain `decoder` layer, or `mla` when it caches latents. Then:
 
 1. the name passed to `get_attention_backend()`, if any;
 2. otherwise `LEAN_VLLM_ATTENTION_BACKEND`;
-3. otherwise the first backend, in the order `flashmla`, `flash_attn_3`,
-   `flashinfer`, `torch`, that is available and whose `validate(spec)` returns
-   no reason against the layer.
+3. otherwise the first backend, in the order `flashmla`, `triton_mla`,
+   `flashinfer_mla`, `flash_attn_3`, `flashinfer`, `torch`, that is available
+   and whose `validate(spec)` returns no reason against the layer.
+
+The MLA order is vLLM's on Hopper and Ampere: FlashMLA, then Triton MLA. So
+`flashinfer_mla` is only reached by name, until measurements say otherwise.
 
 `validate` is vLLM's `validate_configuration`: it checks `supported_dtypes`,
 `supports_head_size`, that query heads group evenly over key heads, and
-`supported_kinds`, and a backend can add its own checks (`flashmla` requires
-576-wide latents). So an fp32 layer takes `torch` even on an H100, an MLA layer
+`supported_kinds`, and a backend can add its own checks (the MLA decode backends
+require 576-wide latents). So an fp32 layer takes `torch` even on an H100, an MLA layer
 never takes `flashinfer`, and `flashmla` never serves a plain layer. Layers of
 one model may end up on different backends; the runner logs the count per
 backend.
@@ -88,6 +100,7 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
   That wheel compiles its kernels on first use, so the machine needs `nvcc`.
 - **FlashMLA**: build it from source; see
   [deepseek-v2.md](deepseek-v2.md#running-it).
+- **Triton**: in the `cuda` extra. `triton_mla`'s kernels compile on first use.
 
 ## What has been verified
 
@@ -102,6 +115,10 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | The decode/prefill split: its slices, and a split step against the reference | Every machine (`torch` splits) | Pass |
 | FlashInfer's page table built from host lengths | CPU | Pass |
 | FlashInfer's full-graph wrappers: one per batch size over shared buffers, padded rows, re-planned before replay | CPU, with a fake wrapper | Pass; never captured on a GPU |
+| `triton_mla` and `flashinfer_mla` decode against the reference, at 16- and 64-token pages, short and split-length rows | Any sm80+ GPU | **Never run.** Written against Triton 3.6 and the `flashinfer-python` 0.7.0 API without a GPU |
+| FlashInfer's ragged plans: one per problem per step, reused across steps, the overflow sharing one wrapper; its lse turned to base e | CPU, with a fake wrapper | Pass |
+| FlashInfer MLA's CSR plan, its graph wrappers and re-planning before replay | CPU, with a fake wrapper | Pass; never captured on a GPU |
+| MLA backend order, and their prefill on FA3 or else FlashInfer | Every machine | Pass |
 
 The reference is `dense_attention` in `tests/test_attention_backends.py`: the
 textbook formula, looped over heads, with no SDPA and no paging, so agreeing with
@@ -261,11 +278,20 @@ fresh context plans again.
 | Decode rows | `BatchDecodeWithPagedKVCacheWrapper`, on tensor cores when a key head serves more than 4 query heads, as vLLM chose |
 | Prompt rows, some resuming from cached keys | `BatchPrefillWithPagedKVCacheWrapper`, causal (bottom-right aligned) |
 | Prompt rows, no cached keys | `BatchPrefillWithRaggedKVCacheWrapper` on this step's k and v, as FA3's varlen path |
+| `varlen_with_lse`, for MLA prefill | The same ragged wrapper, with its base-2 lse multiplied by ln 2 |
 
 FlashInfer wants each row's pages packed (a CSR table), not the padded
 `block_tables`. The index pointers and last-page lengths come from the host
 lengths the runner already keeps, and the page gather runs on the device, so
 planning costs no sync. All wrappers share one zeroed 256 MiB workspace.
+
+Ragged plans are keyed by the problem itself, its host lengths and
+causality, rather than by layer shape: an MLA step poses several, one for its
+new tokens and one per chunk of cached keys, and every layer poses the same
+ones. Each gets its own wrapper from a small pool, so it is planned once a step,
+and a later step that poses it again reuses the plan. Past `MAX_RAGGED_PLANS`
+problems in one step, the rest share the last wrapper and re-plan as they
+alternate. `MLAAttention` passes the host lengths in, so this costs no sync.
 
 The KV cache keeps the layout every backend uses (`[blocks, block_size, heads,
 dim]`, FlashInfer's `NHD`), and keys are stored by the same Triton scatter as
@@ -292,6 +318,30 @@ from the batch size alone (`scheduler.cuh`), so a re-plan never asks for kernels
 the graph did not capture. Each wrapper also allocates its own int workspace,
 so roughly 36 captured sizes cost a few hundred MiB on top of the KV cache.
 
+### MLA decode: Triton and FlashInfer
+
+Both backends take the latent cache as it is, `[blocks, block_size, 576]`, and
+read any page size, so an MLA model keeps the 16-token default. Their prefill
+expands latents, as every vLLM MLA backend's does, on FA3 on Hopper and on
+FlashInfer's ragged prefill elsewhere (`mla_common.prefill_backend()`, standing
+in for vLLM's FlashAttention-2).
+
+`triton_mla` is vLLM's `TRITON_MLA` kernel (`triton_mla_decode.py`), ported to
+this cache. A first launch splits each row's keys into 4 parts. Each program
+attends 16 heads to one part, 16 keys at a time, and writes that part's output
+and log-sum-exp. A second launch merges the parts. It plans nothing on the host
+and reads lengths and pages on the device, so a full graph captures it as it
+is. A row with no keys, as a graph's padding rows have, comes out zero.
+
+`flashinfer_mla` is FlashInfer's `BatchMLAPagedAttentionWrapper`, its FA2/FA3
+MLA kernel for Ampere and Hopper. vLLM's `FLASHINFER_MLA` is a different
+kernel, trtllm-gen, which runs only on Blackwell. The wrapper takes the 576-wide
+query and cache packed, so nothing is copied. It is planned once per step from a
+CSR page table built from the host lengths, as `flashinfer` is. Full graphs
+follow the same scheme: a wrapper per batch size, over reserved buffers sliced
+from shared ones, re-planned before each replay. Padding rows hold one key on
+page 0, so no planned row is empty.
+
 ### Trade-offs of the torch backend
 
 `TorchAttention` pads every row to the step's longest, gathers all rows' pages
@@ -306,9 +356,12 @@ trade for a reference and for laptop development, and the wrong one for speed.
 
 ## Next steps
 
-1. Run the suite with `flashinfer` on an A100 or H100, then serve a Qwen3 model
-   on it with FA3 disabled and compare against vLLM's FlashInfer backend.
-2. Capture a FlashInfer model's full graphs on a GPU and check its decode
+1. Run the suite with `flashinfer`, `triton_mla` and `flashinfer_mla` on an
+   H100, then serve a Qwen3 model on `flashinfer` with FA3 disabled and compare
+   against vLLM's FlashInfer backend.
+2. Serve DeepSeek-V2-Lite on each MLA decode backend at loads 1 and 48, and
+   order them by what they measure.
+3. Capture a FlashInfer model's full graphs on a GPU and check its decode
    against eager, then compare decode throughput with piecewise only.
-3. Let `decode` and `prefill` write into the split's output (`out=`), so a
+4. Let `decode` and `prefill` write into the split's output (`out=`), so a
    split step skips the copy.

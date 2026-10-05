@@ -154,10 +154,12 @@ class AttentionBackend(ABC):
         max_seqlen_q: int,
         max_seqlen_k: int,
         causal: bool,
+        host_cu_seqlens: tuple[list[int], list[int]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Uncached attention, bottom-right aligned, plus its log-sum-exp [num_tokens, num_heads] for merging.
 
-        Only MLA layers call it, to merge chunks of expanded latents.
+        Only MLA layers call it, to merge chunks of expanded latents. host_cu_seqlens, the two on the host, spares
+        a backend that plans on the host a sync.
         """
         raise NotImplementedError(f"the {self.get_name()} backend has no varlen_with_lse, so serves no MLA layer")
 

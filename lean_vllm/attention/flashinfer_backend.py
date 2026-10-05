@@ -1,8 +1,10 @@
+import math
+
 import torch
 
 from lean_vllm.attention import triton_cache
 from lean_vllm.attention.abstract import AttentionBackend
-from lean_vllm.utils.context import Context
+from lean_vllm.utils.context import Context, get_context
 
 _IMPORT_ERROR: ImportError | None = None
 try:
@@ -16,14 +18,17 @@ except ImportError as e:    # the cuda extra installs it on Linux
 
 # Scratch for split-KV partial results, shared by every wrapper as vLLM shares one.
 WORKSPACE_BYTES = 256 * 1024 * 1024
+# Ragged wrappers kept planned at once: an MLA step poses one problem per chunk of cached keys, and few steps have more.
+MAX_RAGGED_PLANS = 8
 
 
 class FlashInferBackend(AttentionBackend):
     """FlashInfer's paged prefill and decode, planned once per step, with the Triton KV-cache scatter. sm80 and up."""
 
-    supported_kinds = ("decoder",)    # no varlen_with_lse, which MLA layers need
+    supported_kinds = ("decoder",)    # MLA layers take flashinfer_mla, which runs this prefill
     _workspace: torch.Tensor | None = None
     _wrappers: dict[tuple, object] = {}    # by kernel, layer shape and graph size; each holds one plan at a time
+    _ragged: list[list] = []    # [wrapper, the problem it is planned for], reused across steps
     _graph_pages: tuple[torch.Tensor, ...] | None = None    # the page table full graphs read, sized at the largest
 
     @staticmethod
@@ -47,17 +52,50 @@ class FlashInferBackend(AttentionBackend):
     def supports_head_size(head_size: int) -> bool:
         return head_size in (64, 128, 256)    # as vLLM's FlashInfer backend
 
+    @staticmethod
+    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
+        return head_size == v_head_size or (head_size, v_head_size) == (192, 128)    # its prefill builds DeepSeek's
+
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         if context.keys_are_new or context.block_tables is None:
             # k and v hold every key this batch attends (cold prompts), so skip the pages, as FA3 does.
-            return self._planned("ragged", q, k.dtype, context).run(q, k, v)
+            cu_q = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
+            cu_k = _host_cumulative(context.cu_seqlens_k_host, context.cu_seqlens_k)
+            return self._planned_ragged(q, k, v, cu_q, cu_k, causal=True).run(q, k, v)
         return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache))
+
+    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
+                        host_cu_seqlens=None):
+        host_q, host_k = host_cu_seqlens or (None, None)
+        cu_q, cu_k = _host_cumulative(host_q, cu_seqlens_q), _host_cumulative(host_k, cu_seqlens_k)
+        o, lse = self._planned_ragged(q, k, v, cu_q, cu_k, causal).run(q, k, v, return_lse=True)
+        return o, lse * math.log(2)    # FlashInfer's log-sum-exp is base 2
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache))
+
+    def _planned_ragged(self, q, k, v, cu_q: torch.Tensor, cu_k: torch.Tensor, causal: bool):
+        """A ragged wrapper planned for this problem. Every layer of a step poses the same few, so each is planned
+        by the first layer to pose it, on a wrapper of its own; past MAX_RAGGED_PLANS they share the last."""
+        key = (self.num_heads, self.num_kv_heads, self.head_dim, v.size(-1), self.scale, q.dtype, k.dtype, causal,
+               tuple(cu_q.tolist()), tuple(cu_k.tolist()))
+        step = get_context()
+        if step.attn_metadata is None:
+            step.attn_metadata = {}
+        problems = step.attn_metadata.setdefault("ragged", {})
+        slot = min(problems.setdefault(key, len(problems)), MAX_RAGGED_PLANS - 1)
+        pool = FlashInferBackend._ragged
+        while len(pool) <= slot:
+            pool.append([BatchPrefillWithRaggedKVCacheWrapper(self._workspace_for(q.device), "NHD"), None])
+        entry = pool[slot]
+        if entry[1] != key:    # a plan is reused while nothing else has planned its wrapper
+            entry[0].plan(cu_q, cu_k, self.num_heads, self.num_kv_heads, self.head_dim, v.size(-1), causal=causal,
+                          sm_scale=self.scale, q_data_type=q.dtype, kv_data_type=k.dtype)
+            entry[1] = key
+        return entry[0]
 
     def _planned(self, kind: str, q: torch.Tensor, kv_dtype: torch.dtype, context: Context, page_size: int = 0):
         """This step's wrapper for kind, planned by the first layer to ask and reused by every layer alike."""
@@ -75,14 +113,10 @@ class FlashInferBackend(AttentionBackend):
         options = dict(sm_scale=self.scale, q_data_type=q.dtype, kv_data_type=kv_dtype)
         if kind == "decode":
             _plan_decode(wrapper, key, self._pages(context, page_size, graph_size))
-        else:
+        else:    # FlashInfer's causal mask is bottom-right aligned, as the contract asks
             qo_indptr = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
-            if kind == "ragged":
-                kv_indptr = _host_cumulative(context.cu_seqlens_k_host, context.cu_seqlens_k)
-                wrapper.plan(qo_indptr, kv_indptr, *shape, causal=True, **options)
-            else:    # FlashInfer's causal mask is bottom-right aligned, as the contract asks
-                indptr, indices, last_page_len = self._pages(context, page_size)
-                wrapper.plan(qo_indptr, indptr, indices, last_page_len, *shape, page_size, causal=True, **options)
+            indptr, indices, last_page_len = self._pages(context, page_size)
+            wrapper.plan(qo_indptr, indptr, indices, last_page_len, *shape, page_size, causal=True, **options)
         context.attn_metadata[key] = wrapper
         return wrapper
 
@@ -98,13 +132,15 @@ class FlashInferBackend(AttentionBackend):
                     pages[page_size] = cls._pages(context, page_size, batch_size)
                 _plan_decode(wrapper, key, pages[page_size])
 
-    def _make_wrapper(self, kind: str, device: torch.device, context: Context, graph_size: int | None):
+    @staticmethod
+    def _workspace_for(device: torch.device) -> torch.Tensor:
         if FlashInferBackend._workspace is None:
             # Zeroed, as FlashInfer requires on its first use.
             FlashInferBackend._workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        workspace = FlashInferBackend._workspace
-        if kind == "ragged":
-            return BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
+        return FlashInferBackend._workspace
+
+    def _make_wrapper(self, kind: str, device: torch.device, context: Context, graph_size: int | None):
+        workspace = self._workspace_for(device)
         if kind == "paged":
             return BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
         # Wide query groups decode on tensor cores, as vLLM chose; the CUDA-core kernel takes few group sizes.

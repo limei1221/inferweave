@@ -61,7 +61,8 @@ class FlashAttention3Backend(AttentionBackend):
             softmax_scale=self.scale, causal=True,
         )
 
-    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
+                        host_cu_seqlens=None):
         o, lse = flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,

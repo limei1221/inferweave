@@ -13,7 +13,7 @@ hardware.
 
 | | Project | Status |
 |---|---|---|
-| 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done (FlashInfer not yet run on a GPU) |
+| 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done, plus Triton and FlashInfer MLA decode (FlashInfer and both MLA backends not yet run on a GPU) |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-10-03-Qwen3-8B.md) |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md)); GPU reference checks still to record |
 | 3 | Speculative decoding | |

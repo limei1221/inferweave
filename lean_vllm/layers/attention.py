@@ -120,6 +120,7 @@ class ContextChunk:
     max_seqlen_q: int
     max_seqlen_k: int
     slots: torch.Tensor    # the cache slot of each key
+    host_cu_seqlens: tuple[list[int], list[int]]    # cu_seqlens_q and _k on the host, for backends that plan there
 
 
 def plan_context_chunks(context_lens: list[int], budget: int) -> list[tuple[int, list[int], list[int]]]:
@@ -159,13 +160,15 @@ def context_chunks(context: Context, block_size: int, budget: int) -> list[Conte
             offsets = dev.make_tensor([s - c for s, c in zip(starts, cu_seqlens_k)], torch.int64, device)
             positions = torch.arange(num_keys, device=device) + offsets[key_rows]
             blocks = context.block_tables[first + key_rows, positions // block_size].long()
+            cu_seqlens_q = [n - cu_q[first] for n in cu_q[first:last + 1]]
             context.context_chunks.append(ContextChunk(
                 queries=slice(cu_q[first], cu_q[last]),
-                cu_seqlens_q=dev.make_tensor([n - cu_q[first] for n in cu_q[first:last + 1]], torch.int32, device),
+                cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, device),
                 cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, device),
                 max_seqlen_q=max(cu_q[i + 1] - cu_q[i] for i in range(first, last)),
                 max_seqlen_k=max(lens),
                 slots=blocks * block_size + positions % block_size,
+                host_cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
             ))
     return context.context_chunks
 
@@ -265,8 +268,10 @@ class MLAAttention(Attention):
             return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged))
         # New tokens attend each other causally, then each chunk of cached keys unmasked.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
+        host = context.cu_seqlens_q_host
         o, lse = self.backend.varlen_with_lse(
             q, k, self._pad(v), cu_seqlens_q, cu_seqlens_q, max_seqlen_q, max_seqlen_q, causal=True,
+            host_cu_seqlens=None if host is None else (host, host),
         )
         del k, v
         latents = cache.view(-1, self.latent_dim)
@@ -275,7 +280,7 @@ class MLAAttention(Attention):
             rows = chunk.queries
             o_chunk, lse_chunk = self.backend.varlen_with_lse(
                 q[rows], k, self._pad(v), chunk.cu_seqlens_q, chunk.cu_seqlens_k,
-                chunk.max_seqlen_q, chunk.max_seqlen_k, causal=False,
+                chunk.max_seqlen_q, chunk.max_seqlen_k, causal=False, host_cu_seqlens=chunk.host_cu_seqlens,
             )
             del k, v
             merge_attention_(o[rows], lse[rows], o_chunk, lse_chunk)    # rows is a slice, so these are views

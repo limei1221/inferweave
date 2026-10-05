@@ -76,7 +76,8 @@ class TorchAttention(AttentionBackend):
         mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True)
         return self._unpad_rows(self._sdpa(q_pad, k_pad, v_pad, mask), cu_seqlens_q, q.size(0))
 
-    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal):
+    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
+                        host_cu_seqlens=None):
         # Written out, since SDPA does not return the log-sum-exp.
         repeats = self.num_heads // self.num_kv_heads
         q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q).transpose(1, 2).float()    # [B, H, Lq, D]

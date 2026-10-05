@@ -30,18 +30,22 @@ transformers ≥ 4.56 and need no `trust_remote_code`.
 ### Hardware and attention backends
 
 Each MLA layer chooses its backend at init. The preference is `flashmla`, then
-`flash_attn_3`, then `torch`; `flashinfer` serves no MLA layer, as it has no
-`varlen_with_lse`. Set `LEAN_VLLM_ATTENTION_BACKEND` to force one.
+`triton_mla`, as in vLLM, then `flashinfer_mla`, `flash_attn_3` and `torch`;
+`flashinfer` serves no MLA layer itself. Set `LEAN_VLLM_ATTENTION_BACKEND` to
+force one.
 
 | Backend | Runs on | How decode reads the cache | CUDA graphs |
 |---|---|---|---|
 | `flashmla` | H100/H200, with FlashMLA built from source | FlashMLA kernel over the latents | full + piecewise |
+| `triton_mla` | sm80 and newer | vLLM's Triton MLA kernel over the latents | full + piecewise |
+| `flashinfer_mla` | sm80 and newer | FlashInfer's FA2/FA3 MLA kernel over the latents | full + piecewise |
 | `flash_attn_3` | H100/H200 | expands latents into keys and values | piecewise only |
 | `torch` | anything: CPU, Apple Silicon, any CUDA GPU | over the latents, in plain torch | none (eager) |
 
 `flashmla` switches the KV cache to 64-token pages, the only size its kernel
-reads. On a non-Hopper GPU only `torch` is available, so there is no fast MLA
-path there yet.
+reads; `triton_mla` and `flashinfer_mla` read any. Those two prefill on FA3 on
+Hopper and on FlashInfer elsewhere, so an A100 now has a fast MLA path. Neither
+has run on a GPU yet ([attention-backends.md](attention-backends.md#mla-decode-triton-and-flashinfer)).
 
 The routed experts run a Triton kernel on CUDA and `F.grouped_mm` elsewhere.
 Set `LEAN_VLLM_MOE_BACKEND=triton|torch` to force one. The kernel's tile sizes
@@ -139,8 +143,8 @@ layer for its `kv_cache_shape` rather than reading head counts off the config.
    memory, but the context is re-expanded in every layer.
 
 Values are 128 wide and keys 192. FA3 on Hopper takes them as they are, as
-vLLM's MLA prefill does there, and so does `torch`. A backend that takes one
-head size (`supports_value_head_size` false, as `flashinfer` here) gets values
+vLLM's MLA prefill does there, and so do FlashInfer's prefill and `torch`. A
+backend that takes one head size (`supports_value_head_size` false) gets values
 zero-padded to 192 and its output cut back to 128.
 
 **Decode** skips the expansion. Since `q · (W_UK c) = (W_UKᵀ q) · c`, each head's
@@ -261,8 +265,7 @@ rotates adjacent pairs (GPT-J style), so its rope uses `is_neox_style=False`.
    the end-to-end gain of latent decode in mixed batches.
 3. Profile and optimize: prefill cost, routing, latent projections and context
    gathering. Tune the Triton MoE on an H100 and ship the file.
-4. Add features when a workload needs them: an MLA decode kernel beyond Hopper,
-   quantization, pipeline parallelism, and data parallelism with all-to-all
+4. Add features when a workload needs them: quantization, pipeline parallelism, and data parallelism with all-to-all
    expert dispatch.
 
 Upstream references, tracking vLLM `main`:
