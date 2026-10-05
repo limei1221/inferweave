@@ -14,7 +14,9 @@ from lean_vllm.layers.fused_moe import (
     align_blocks, fused_experts, get_config_file_name, get_default_config, get_moe_configs,
     try_get_optimal_moe_config, use_triton,
 )
-from lean_vllm.layers.moe import FusedMoE, determine_expert_map, silu_and_mul, torch_experts, torch_select_experts
+from lean_vllm.layers.moe import (
+    FusedMoE, determine_expert_map, shared_mlp, silu_and_mul, torch_experts, torch_select_experts,
+)
 
 HIDDEN, INTERMEDIATE = 32, 16
 NUM_EXPERTS, TOP_K, TOKENS = 8, 3, 20
@@ -398,3 +400,57 @@ def test_triton_silu_and_mul_matches_torch(width):
     x = torch.randn(37, 2 * width, device="cuda", dtype=torch.bfloat16)
     gate, up = x.float().chunk(2, dim=-1)
     torch.testing.assert_close(fused_moe.silu_and_mul(x), (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))
+
+
+def shared_weights(device="cpu", dtype=torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two shared experts' worth, as DeepSeek-V2 merges them into one MLP."""
+    torch.manual_seed(2)
+    gate_up = torch.randn(4 * INTERMEDIATE, HIDDEN, device=device) * 0.1
+    down = torch.randn(HIDDEN, 2 * INTERMEDIATE, device=device) * 0.1
+    return gate_up.to(dtype), down.to(dtype)
+
+
+def test_the_layer_adds_the_shared_experts(moe, batch):
+    x, topk_weights, topk_ids = batch
+    gate_up, down = shared_weights()
+    with torch.inference_mode():
+        want = torch_experts(x, moe.gate_up_proj, moe.down_proj, topk_weights, topk_ids)
+        want = want + shared_mlp(x, gate_up, down, silu_and_mul)
+        torch.testing.assert_close(moe(x, topk_weights, topk_ids, gate_up, down), want)
+
+
+@requires_triton_gpu
+@pytest.mark.parametrize("threshold", [0, 1024], ids=["one_stream", "side_stream"])
+def test_the_side_stream_changes_nothing_but_timing(moe, batch, threshold, monkeypatch):
+    """Same kernels on the same inputs, so the two orders agree to the bit."""
+    monkeypatch.setenv("LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", str(threshold))
+    layer = moe.to("cuda", torch.bfloat16)
+    x, topk_weights, topk_ids = batch
+    x, topk_weights, topk_ids = x.to("cuda", torch.bfloat16), topk_weights.float().cuda(), topk_ids.int().cuda()
+    gate_up, down = shared_weights("cuda", torch.bfloat16)
+    with torch.inference_mode():
+        routed = fused_experts(x, layer.gate_up_proj, layer.down_proj, topk_weights, topk_ids, fused_moe.silu_and_mul)
+        want = routed + shared_mlp(x, gate_up, down, fused_moe.silu_and_mul)
+        got = layer(x, topk_weights, topk_ids, gate_up, down)
+    assert torch.equal(got, want)
+
+
+@requires_triton_gpu
+def test_the_side_stream_replays_in_a_cuda_graph(moe, batch, monkeypatch):
+    """Forked from and joined back to the capturing stream, so a full decode graph can hold it."""
+    monkeypatch.setenv("LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "1024")
+    layer = moe.to("cuda", torch.bfloat16)
+    x, topk_weights, topk_ids = batch
+    x, topk_weights, topk_ids = x.to("cuda", torch.bfloat16), topk_weights.float().cuda(), topk_ids.int().cuda()
+    gate_up, down = shared_weights("cuda", torch.bfloat16)
+    with torch.inference_mode():
+        layer(x, topk_weights, topk_ids, gate_up, down)    # warmup, which also makes the side stream
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = layer(x, topk_weights, topk_ids, gate_up, down)
+        x.copy_(torch.randn_like(x))    # new inputs in the captured buffers
+        graph.replay()
+        torch.cuda.synchronize()
+        want = layer(x, topk_weights, topk_ids, gate_up, down)
+    assert torch.equal(out, want)

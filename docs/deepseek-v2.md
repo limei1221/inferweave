@@ -163,7 +163,13 @@ reused by every layer.
 of shape `[E, 2I, H]` and one `down_proj` of shape `[E, H, I]`. Routing follows
 vLLM's `grouped_topk`: softmax scores, `greedy` or `group_limited_greedy`
 selection, then `norm_topk_prob` and `routed_scaling_factor`. Shared experts
-reuse the dense gated MLP.
+load into the dense gated MLP, but `FusedMoE` runs them, in the same op as the
+routed experts. Their output is added before the all-reduce, so under TP a layer
+reduces once rather than twice, as vLLM's `SharedFusedMoE` does. A step of at
+most 256 tokens (`LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`; 0 turns it
+off) runs them on a side CUDA stream beside the routed experts, as in vLLM, so
+a decode step's small GEMMs share the GPU. The side stream forks from and joins
+the current one, so full decode graphs capture it.
 
 Both expert paths sort token-expert pairs by expert without a host sync. On
 CUDA, the Triton kernel in `layers/fused_moe.py` pads each expert's rows to

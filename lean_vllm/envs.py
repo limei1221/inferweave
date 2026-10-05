@@ -16,6 +16,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LEAN_VLLM_ATTENTION_BACKEND": lambda: os.getenv("LEAN_VLLM_ATTENTION_BACKEND") or None,
     # Forces "triton" or "torch" for the routed experts; unset takes Triton where it runs.
     "LEAN_VLLM_MOE_BACKEND": lambda: os.getenv("LEAN_VLLM_MOE_BACKEND") or None,
+    # Steps of at most this many tokens run the shared experts on a second stream, beside the routed ones; 0 never.
+    # As vLLM's VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+    "LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD":
+        lambda: int(os.getenv("LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "256")),
     # A folder of tuned MoE launch configs, searched before the shipped ones; as vLLM's VLLM_TUNED_CONFIG_FOLDER.
     "LEAN_VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("LEAN_VLLM_TUNED_CONFIG_FOLDER") or None,
     # Seconds a prefill instance holds a request's KV blocks for a decode instance to read; as VLLM_NIXL_ABORT_REQUEST_TIMEOUT.

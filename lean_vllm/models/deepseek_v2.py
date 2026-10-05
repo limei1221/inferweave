@@ -152,6 +152,7 @@ class DeepseekV2MoE(nn.Module):
                                 enable_expert_parallel)
         self.shared_experts = None
         if config.n_shared_experts:
+            # Holds the weights only: FusedMoE runs them, beside the routed experts, and reduces both at once.
             self.shared_experts = DeepseekV2MLP(
                 config.hidden_size,
                 config.moe_intermediate_size * config.n_shared_experts,
@@ -168,10 +169,9 @@ class DeepseekV2MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        final_hidden_states = self.experts(hidden_states, *self.route(hidden_states))
-        if self.shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(hidden_states)
-        return final_hidden_states
+        shared = self.shared_experts
+        shared_weights = () if shared is None else (shared.gate_up_proj.weight, shared.down_proj.weight)
+        return self.experts(hidden_states, *self.route(hidden_states), *shared_weights)
 
 
 class DeepseekV2DecoderLayer(nn.Module):

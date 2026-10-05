@@ -3,12 +3,27 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from lean_vllm import envs
 from lean_vllm.layers import fused_moe
 from lean_vllm.layers.activation import SiluAndMul
 from lean_vllm.layers.linear import divide
 
 
 silu_and_mul = SiluAndMul()
+_aux_stream: torch.cuda.Stream | None = None
+
+
+def aux_stream() -> torch.cuda.Stream:
+    """One side stream per process, made on first use, which a warmup reaches before any graph captures."""
+    global _aux_stream
+    if _aux_stream is None:
+        _aux_stream = torch.cuda.Stream()
+    return _aux_stream
+
+
+def shared_mlp(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor, act_fn) -> torch.Tensor:
+    """The shared experts, one gated MLP. Under TP its output is a partial sum, for the routed experts' all-reduce."""
+    return F.linear(act_fn(F.linear(x, gate_up)), down)
 
 
 def determine_expert_map(ep_size: int, ep_rank: int, num_experts: int) -> tuple[int, torch.Tensor | None]:
@@ -121,11 +136,33 @@ def moe_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor | None,
+    shared_gate_up: torch.Tensor | None = None,
+    shared_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if fused_moe.use_triton(x):
-        return fused_moe.fused_experts(
-            x, gate_up_proj, down_proj, topk_weights, topk_ids, fused_moe.silu_and_mul, expert_map)
-    return torch_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, expert_map)
+    """The routed experts, plus the shared ones when given."""
+    if not fused_moe.use_triton(x):
+        out = torch_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, expert_map)
+        if shared_gate_up is not None:
+            out = out + shared_mlp(x, shared_gate_up, shared_down, silu_and_mul)
+        return out
+    has_shared = shared_gate_up is not None
+    # A small step leaves SMs idle, so the shared experts take them on a side stream, as in vLLM.
+    overlap = has_shared and x.size(0) <= envs.LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+    if overlap:
+        stream, current = aux_stream(), torch.cuda.current_stream()
+        stream.wait_stream(current)
+        # No record_stream for x or the output: the current stream waits on the side one before either is freed.
+        with torch.cuda.stream(stream):
+            shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)
+    out = fused_moe.fused_experts(
+        x, gate_up_proj, down_proj, topk_weights, topk_ids, fused_moe.silu_and_mul, expert_map)
+    if overlap:
+        current.wait_stream(stream)
+    elif has_shared:
+        shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)
+    if has_shared:
+        out += shared
+    return out
 
 
 @moe_experts.register_fake
@@ -136,6 +173,8 @@ def _(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor | None,
+    shared_gate_up: torch.Tensor | None = None,
+    shared_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -187,9 +226,17 @@ class FusedMoE(nn.Module):
         shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
         param.data[expert_id].narrow(0, offset, self.intermediate_size).copy_(shard)
 
-    def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_gate_up: torch.Tensor | None = None,
+        shared_down: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """With the shared experts' weights, their output is added in, before the one all-reduce both need."""
         out = torch.ops.lean_vllm.moe_experts(
-            x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.expert_map)
+            x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.expert_map, shared_gate_up, shared_down)
         if self.tp_size > 1 or self.ep_size > 1:
             dist.all_reduce(out)
         return out
