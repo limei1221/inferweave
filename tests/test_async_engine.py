@@ -215,6 +215,23 @@ class TestAbort:
 class TestAdmission:
 
     @asyncio_test
+    async def test_closing_a_finished_stream_preserves_a_reused_request_id(self, make_async_engine):
+        engine = make_async_engine(gated=True)
+        first = await engine.add_request([10], SamplingParams(max_tokens=1), "reused")
+        runner_of(engine).release()
+        assert (await asyncio.wait_for(anext(first), 1)).finished
+        second = await engine.add_request([20], SamplingParams(max_tokens=2), "reused")
+        await first.aclose()
+        runner_of(engine).release(2)
+
+        async def read_second():
+            return [output async for output in second]
+
+        outputs = await asyncio.wait_for(read_second(), 1)
+        assert sum(len(output.token_ids) for output in outputs) == 2
+        assert outputs[-1].finish_reason == "length"
+
+    @asyncio_test
     async def test_a_full_queue_is_refused_before_any_output(self, make_async_engine):
         """The 429 must surface from add_request, while a status code can still be chosen."""
         engine = make_async_engine(gated=True, max_waiting_requests=1, num_kvcache_blocks=1)

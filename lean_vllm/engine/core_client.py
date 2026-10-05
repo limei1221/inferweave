@@ -150,7 +150,9 @@ class AsyncMPClient:
             async for output in stream:
                 yield output
         finally:
-            self.abort(request_id)    # this is what makes a disconnect free KV blocks
+            # A finished request's id may already belong to a newer stream.
+            if self._streams.get(request_id) is stream:
+                self.abort(request_id)    # this is what makes a disconnect free KV blocks
 
     def abort(self, request_id: str, reason: str = "abort"):
         """Non-blocking and never raising, so it is safe in a generator's finally."""

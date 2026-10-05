@@ -20,6 +20,7 @@ from lean_vllm.engine.async_engine import EngineDeadError
 from lean_vllm.engine.core_client import AsyncMPClient
 from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.engine.sequence import Sequence
+from lean_vllm.kv_transfer import KVTransferConfig
 from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -116,6 +117,25 @@ class TestAcrossTheProcess:
 
 
 class TestAdmissionAndAbort:
+
+    @asyncio_test
+    async def test_closing_a_finished_stream_preserves_a_reused_request_id(self, make_client):
+        client = make_client(kv_transfer=KVTransferConfig(kv_role="kv_consumer"))
+        first = await client.add_request([10], SamplingParams(max_tokens=1), "reused")
+        assert (await asyncio.wait_for(anext(first), 10)).finished
+        # The fake worker leaves this transfer pending, so the replacement
+        # cannot finish before the old generator's cleanup reaches the core.
+        params = SamplingParams(max_tokens=2, kv_transfer_params=dict(
+            do_remote_prefill=True, remote_request_id="producer", remote_engine_id="producer-engine",
+            remote_block_ids=[0], remote_host="127.0.0.1", remote_port=14579,
+        ))
+        second = await client.add_request([20], params, "reused")
+        await first.aclose()
+        summary = await client.metrics_summary()    # processed after any abort sent by cleanup
+        assert summary["requests"]["aborted"] == 0
+        assert "reused" in client._streams
+        client.abort("reused")
+        await second.aclose()
 
     @asyncio_test
     async def test_a_full_queue_is_refused_before_any_output(self, make_client):
