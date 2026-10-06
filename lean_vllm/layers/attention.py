@@ -39,7 +39,7 @@ def _actual_rows(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
 @torch.library.custom_op("lean_vllm::attention", mutates_args=("out",))
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
     q, k, v = _actual_rows(q, k, v)
-    out[: q.size(0)] = _layer(layer_name).attend(q, k, v)
+    _layer(layer_name).attend(q, k, v, out[: q.size(0)])
 
 
 @attention.register_fake
@@ -50,7 +50,7 @@ def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, laye
 @torch.library.custom_op("lean_vllm::mla_attention", mutates_args=("out",))
 def mla_attention(q: torch.Tensor, latent: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
     q, latent = _actual_rows(q, latent)
-    out[: q.size(0)] = cast("MLAAttention", _layer(layer_name)).attend(q, latent)
+    cast("MLAAttention", _layer(layer_name)).attend(q, latent, out[: q.size(0)])
 
 
 @mla_attention.register_fake
@@ -103,13 +103,13 @@ class Attention(nn.Module):
         torch.ops.lean_vllm.attention(q, k, v, out, self.layer_name)
         return out
 
-    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        """The op's body. Its KV cache write is undeclared, as the cache is module state."""
+    def attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor | None = None):
+        """The op's body, writing into out if given. Its KV cache write is undeclared, as the cache is module state."""
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             self.backend.store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        return self.backend.forward(q, k, v, k_cache, v_cache, context)
+        return self.backend.forward(q, k, v, k_cache, v_cache, context, out)
 
 
 @dataclasses.dataclass(slots=True)
@@ -185,13 +185,14 @@ def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]
     return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
 
 
-def merge_attention_(o_a, lse_a, o_b, lse_b) -> None:
-    """merge_attention written over o_a and lse_a: one Triton launch on CUDA, as vLLM's merge_attn_states."""
+def merge_attention_(o_a, lse_a, o_b, lse_b, out=None) -> None:
+    """merge_attention written over out, or else o_a, and lse_a: one Triton launch on CUDA, as vLLM's
+    merge_attn_states."""
     if o_a.is_cuda and triton_merge._IMPORT_ERROR is None:
-        triton_merge.merge_attn_states_(o_a, lse_a, o_b, lse_b)
+        triton_merge.merge_attn_states_(o_a, lse_a, o_b, lse_b, out)
         return
     o, lse = merge_attention(o_a, lse_a, o_b, lse_b)
-    o_a.copy_(o)
+    (o_a if out is None else out).copy_(o)
     lse_a.copy_(lse)
 
 
@@ -245,36 +246,42 @@ class MLAAttention(Attention):
         torch.ops.lean_vllm.mla_attention(q, latent, out, self.layer_name)
         return out
 
-    def attend(self, q: torch.Tensor, latent: torch.Tensor):  # type: ignore[override]
+    def attend(self, q: torch.Tensor, latent: torch.Tensor, out: torch.Tensor | None = None):  # type: ignore[override]
         context = get_context()
         cache = self.latent_cache
         if not cache.numel():
-            return self._prefill(q, latent, context)  # warmup: no cache yet, so every key is new
+            return self._prefill(q, latent, context, out)  # warmup: no cache yet, so every key is new
         self.backend.store_latents(latent, cache, context.slot_mapping)
         if not self.backend.supports_mla_decode():
-            return self._prefill(q, latent, context)  # decode rows expand like prompt rows
+            return self._prefill(q, latent, context, out)  # decode rows expand like prompt rows
         if not context.is_prefill:
-            return self._decode_latents(q, context)  # pure decode
+            return self._decode_latents(q, context, out)  # pure decode
         n, decodes, prefills = split_decodes_and_prefills(context)
         if decodes is None:
             assert prefills is not None
-            return self._prefill(q, latent, prefills)
+            return self._prefill(q, latent, prefills, out)
         if prefills is None:
-            return self._decode_latents(q, decodes)
-        out = q.new_empty(self.output_shape(q.size(0)))
-        out[:n] = self._decode_latents(q[:n], decodes)
-        out[n:] = self._prefill(q[n:], latent[n:], prefills)
+            return self._decode_latents(q, decodes, out)
+        if out is None:
+            out = q.new_empty(self.output_shape(q.size(0)))
+        self._decode_latents(q[:n], decodes, out[:n])
+        self._prefill(q[n:], latent[n:], prefills, out[n:])
         return out
 
-    def _prefill(self, q: torch.Tensor, latent: torch.Tensor, context: Context) -> torch.Tensor:
+    def _prefill(
+        self, q: torch.Tensor, latent: torch.Tensor, context: Context, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         cache = self.latent_cache
         k, v = self.expand(latent)
         chunks = [] if context.block_tables is None else context_chunks(context, cache.size(1), self.max_context_chunk)
         if not chunks:
             # No row has cached context (vLLM's has_context), so a plain prefill with no page table covers it.
             unpaged = dataclasses.replace(context, block_tables=None)
-            return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged))
-        # New tokens attend each other causally, then each chunk of cached keys unmasked.
+            if not self.pad_values:
+                return self.backend.prefill(q, k, v, self.k_cache, self.v_cache, unpaged, out)
+            return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged), out)
+        # New tokens attend each other causally, and each chunk of cached keys unmasked. As vLLM's, the chunks
+        # merge among themselves, then with the new tokens straight into out.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
         assert cu_seqlens_q is not None
         host = context.cu_seqlens_q_host
@@ -290,6 +297,9 @@ class MLAAttention(Attention):
             host_cu_seqlens=None if host is None else (host, host),
         )
         del k, v
+        # Rows with no cached keys keep an lse of -inf, which the merge weighs at zero.
+        context_o = o.new_zeros(o.size(0), self.num_heads, self.v_head_dim)
+        context_lse = torch.full_like(lse, float("-inf"))
         latents = cache.view(-1, self.latent_dim)
         for chunk in chunks:
             k, v = self.expand(latents[chunk.slots])
@@ -306,10 +316,12 @@ class MLAAttention(Attention):
                 host_cu_seqlens=chunk.host_cu_seqlens,
             )
             del k, v
-            merge_attention_(o[rows], lse[rows], o_chunk, lse_chunk)  # rows is a slice, so these are views
-        return self._unpad(o)
+            # rows is a slice, so these are views
+            merge_attention_(context_o[rows], context_lse[rows], o_chunk[..., : self.v_head_dim], lse_chunk)
+        merge_attention_(context_o, context_lse, o[..., : self.v_head_dim], lse, out)
+        return context_o if out is None else out
 
-    def _decode_latents(self, q: torch.Tensor, context: Context) -> torch.Tensor:
+    def _decode_latents(self, q: torch.Tensor, context: Context, out: torch.Tensor | None = None) -> torch.Tensor:
         """Attention over the cached latents as they are, so nothing expands.
 
         q . W_UK c = W_UK^T q . c moves the query into latent space; W_UV applies after, as attention is linear in values.
@@ -321,12 +333,14 @@ class MLAAttention(Attention):
         ql_nope = torch.bmm(q_nope.transpose(0, 1), W_UK_T).transpose(0, 1)
         o = self.backend.mla_decode(torch.cat([ql_nope, q_pe], dim=-1), self.latent_cache, L, context)
         # Multiply + Transpose (N, B, L) x (N, L, V) -> (N, B, V) -> (B, N, V)
-        out = o.new_empty(o.size(0), N, self.v_head_dim)
+        if out is None:
+            out = o.new_empty(o.size(0), N, self.v_head_dim)
         torch.bmm(o.transpose(0, 1), W_UV, out=out.transpose(0, 1))
         return out
 
     def _pad(self, v: torch.Tensor) -> torch.Tensor:
         return F.pad(v, (0, self.head_dim - self.v_head_dim)) if self.pad_values else v
 
-    def _unpad(self, o: torch.Tensor) -> torch.Tensor:
-        return o[..., : self.v_head_dim].contiguous() if self.pad_values else o
+    def _unpad(self, o: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        o = o[..., : self.v_head_dim] if self.pad_values else o
+        return o.contiguous() if out is None else out.copy_(o)

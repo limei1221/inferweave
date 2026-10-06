@@ -79,6 +79,20 @@ def test_rows_past_the_step_are_padding_and_left_alone(model, decode_step):
     assert (out[1:] == 7).all()
 
 
+def test_the_op_hands_its_output_to_the_backend(model, decode_step, monkeypatch):
+    """So the kernel writes the op's rows itself, as vLLM's unified_attention_with_output, and nothing copies."""
+    q, k, v = decode_step
+    outs = []
+    decode = model.first.backend.decode
+    monkeypatch.setattr(
+        model.first.backend, "decode", lambda *args, out=None: outs.append(out) or decode(*args, out=out)
+    )
+    get_context().num_actual_tokens = 1
+    out = torch.empty(3, NUM_HEADS, HEAD_DIM)
+    torch.ops.lean_vllm.attention(*(torch.cat([t, t, t]) for t in (q, k, v)), out, "first")
+    assert outs[0].data_ptr() == out.data_ptr() and outs[0].size(0) == 1
+
+
 def test_an_unregistered_layer_fails_loudly(model, decode_step):
     q, k, v = decode_step
     with pytest.raises(KeyError, match="never registered"):

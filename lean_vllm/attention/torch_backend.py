@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from lean_vllm.attention.abstract import AttentionBackend
+from lean_vllm.attention.abstract import AttentionBackend, write_into
 from lean_vllm.utils.context import Context
 
 
@@ -62,7 +62,7 @@ class TorchAttention(AttentionBackend):
 
         latent_cache.view(-1, dim)[slots] = latent
 
-    def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
+    def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         cu_seqlens_q, cu_seqlens_k = context.cu_seqlens_q, context.cu_seqlens_k
         assert cu_seqlens_q is not None and cu_seqlens_k is not None
         max_seqlen_q, max_seqlen_k = context.max_seqlen_q, context.max_seqlen_k
@@ -75,7 +75,7 @@ class TorchAttention(AttentionBackend):
             k_pad = self._pad_rows(k, cu_seqlens_k, max_seqlen_k)
             v_pad = self._pad_rows(v, cu_seqlens_k, max_seqlen_k)
         mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True)
-        return self._unpad_rows(self._sdpa(q_pad, k_pad, v_pad, mask), cu_seqlens_q, q.size(0))
+        return write_into(out, self._unpad_rows(self._sdpa(q_pad, k_pad, v_pad, mask), cu_seqlens_q, q.size(0)))
 
     def varlen_with_lse(
         self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
@@ -92,14 +92,14 @@ class TorchAttention(AttentionBackend):
         lse = scores.logsumexp(dim=-1).transpose(1, 2)  # [B, Lq, H]
         return self._unpad_rows(o, cu_seqlens_q, q.size(0)), self._unpad_rows(lse, cu_seqlens_q, q.size(0))
 
-    def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
+    def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         block_tables, context_lens = context.block_tables, context.context_lens
         assert block_tables is not None and context_lens is not None
         seqlen = block_tables.size(1) * k_cache.size(1)  # the table's width, so no length is read back
         k = self._gather_pages(k_cache, block_tables, seqlen, context_lens)
         v = self._gather_pages(v_cache, block_tables, seqlen, context_lens)
         mask = self._key_mask(context_lens, seqlen)
-        return self._sdpa(q.unsqueeze(1), k, v, mask).squeeze(1)
+        return write_into(out, self._sdpa(q.unsqueeze(1), k, v, mask).squeeze(1))
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
         # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank

@@ -64,8 +64,8 @@ class MLACommonBackend(AttentionBackend):
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
         triton_cache.store_latents(latent, latent_cache, slot_mapping)
 
-    def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
-        return self.expanded.prefill(q, k, v, k_cache, v_cache, context)
+    def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
+        return self.expanded.prefill(q, k, v, k_cache, v_cache, context, out)
 
     def varlen_with_lse(
         self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
@@ -74,5 +74,5 @@ class MLACommonBackend(AttentionBackend):
             q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens
         )
 
-    def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
+    def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         raise NotImplementedError(f"the {self.get_name()} backend decodes MLA latents only")

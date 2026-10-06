@@ -64,13 +64,13 @@ class FlashInferBackend(AttentionBackend):
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
-    def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
+    def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         if context.block_tables is None:
             # No pages (warmup, or MLA's new tokens): k and v hold every key, as FA3's.
             cu_q = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
             cu_k = _host_cumulative(context.cu_seqlens_k_host, context.cu_seqlens_k)
-            return self._planned_ragged(q, k, v, cu_q, cu_k, causal=True).run(q, k, v)
-        return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache))
+            return self._planned_ragged(q, k, v, cu_q, cu_k, causal=True).run(q, k, v, out=out)
+        return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache), out=out)
 
     def varlen_with_lse(
         self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
@@ -80,8 +80,8 @@ class FlashInferBackend(AttentionBackend):
         o, lse = self._planned_ragged(q, k, v, cu_q, cu_k, causal).run(q, k, v, return_lse=True)
         return o, lse * math.log(2)  # FlashInfer's log-sum-exp is base 2
 
-    def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
-        return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache))
+    def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
+        return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache), out=out)
 
     def _planned_ragged(self, q, k, v, cu_q: torch.Tensor, cu_k: torch.Tensor, causal: bool):
         """A ragged wrapper planned for this problem. Every layer of a step poses the same few, so each is planned

@@ -1,7 +1,7 @@
 import torch
 
 from lean_vllm.attention import triton_cache
-from lean_vllm.attention.abstract import AttentionBackend
+from lean_vllm.attention.abstract import AttentionBackend, write_into
 from lean_vllm.utils.context import Context
 
 _IMPORT_ERROR: ImportError | None = None
@@ -47,10 +47,11 @@ class FlashAttention3Backend(AttentionBackend):
     def store_latents(self, latent, latent_cache, slot_mapping) -> None:
         triton_cache.store_latents(latent, latent_cache, slot_mapping)
 
-    def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
+    def prefill(self, q, k, v, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
+        # FA3 never splits, so only MLA layers pass out; its entry points take none.
         if context.block_tables is None:
             # No pages (warmup, or MLA's new tokens): k and v hold every key.
-            return flash_attn_varlen_func(
+            o = flash_attn_varlen_func(
                 q,
                 k,
                 v,
@@ -61,10 +62,11 @@ class FlashAttention3Backend(AttentionBackend):
                 softmax_scale=self.scale,
                 causal=True,
             )
+            return write_into(out, o)
         # Keys come from the pages, cold rows too, as vLLM's V1; FA3's varlen entry takes no page table.
         assert context.cu_seqlens_k is not None
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
-        return flash_attn_with_kvcache(
+        o = flash_attn_with_kvcache(
             q,
             k_cache,
             v_cache,
@@ -75,6 +77,7 @@ class FlashAttention3Backend(AttentionBackend):
             softmax_scale=self.scale,
             causal=True,
         )
+        return write_into(out, o)
 
     def varlen_with_lse(
         self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
@@ -93,7 +96,7 @@ class FlashAttention3Backend(AttentionBackend):
         )
         return o, lse.transpose(0, 1)  # FA3's varlen lse is [heads, tokens]
 
-    def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
+    def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         o = flash_attn_with_kvcache(
             q.unsqueeze(1),
             k_cache,
@@ -103,4 +106,4 @@ class FlashAttention3Backend(AttentionBackend):
             softmax_scale=self.scale,
             causal=True,
         )
-        return o.squeeze(1)  # match the [batch, heads, dim] contract
+        return write_into(out, o.squeeze(1))  # match the [batch, heads, dim] contract

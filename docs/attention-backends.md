@@ -356,5 +356,3 @@ trade for a reference and for laptop development, and the wrong one for speed.
    order them by what they measure.
 3. Capture a FlashInfer model's full graphs on a GPU and check its decode
    against eager, then compare decode throughput with piecewise only.
-4. Let `decode` and `prefill` write into the split's output (`out=`), so a
-   split step skips the copy.

@@ -137,10 +137,11 @@ layer for its `kv_cache_shape` rather than reading head counts off the config.
 1. The step's new tokens attend each other causally.
 2. If a row resumes from cached context, that context is read in chunks of at
    most `max_num_batched_tokens` keys, expanded and attended. Each chunk's
-   output is merged into the running result by log-sum-exp, as in vLLM's
-   chunked context. On CUDA the merge is one Triton launch, vLLM's
-   `merge_attn_states`, written over the running result in place. This bounds
-   memory, but the context is re-expanded in every layer.
+   output is merged into the context's running result by log-sum-exp, and that
+   with the new tokens' straight into the layer's output, as in vLLM's chunked
+   context. On CUDA each merge is one Triton launch, vLLM's
+   `merge_attn_states`. This bounds memory, but the context is re-expanded in
+   every layer.
 
 Values are 128 wide and keys 192. FA3 on Hopper takes them as they are, as
 vLLM's MLA prefill does there, and so do FlashInfer's prefill and `torch`. A

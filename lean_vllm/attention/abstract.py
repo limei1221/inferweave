@@ -21,6 +21,11 @@ class LayerSpec:
         return "mla" if self.latent_dim else "decoder"
 
 
+def write_into(out: torch.Tensor | None, o: torch.Tensor) -> torch.Tensor:
+    """o, copied into out if given: for a kernel that cannot write into it."""
+    return o if out is None else out.copy_(o)
+
+
 class AttentionBackend(ABC):
     """Execution strategy for one attention layer. See docs/attention-backends.md."""
 
@@ -138,11 +143,12 @@ class AttentionBackend(ABC):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         context: Context,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Causal attention over packed varlen sequences, bottom-right aligned.
 
         q is [num_tokens, num_heads, head_dim]; k and v hold new tokens only.
-        Keys come from the paged cache when context.block_tables is set.
+        Keys come from the paged cache when context.block_tables is set. Writes into out, if given, and returns it.
         """
 
     def varlen_with_lse(
@@ -171,8 +177,9 @@ class AttentionBackend(ABC):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         context: Context,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Single-query attention against the paged cache. q is [batch, heads, dim]."""
+        """Single-query attention against the paged cache. q is [batch, heads, dim]. Writes into out, if given."""
 
     def forward(
         self,
@@ -182,22 +189,26 @@ class AttentionBackend(ABC):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         context: Context,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """One step of a layer, after its keys are stored. A splitting backend runs the leading one-query rows
-        through decode and the rest through prefill, as vLLM does; others hand a step with prompt rows to prefill."""
+        """One step of a layer, after its keys are stored, written into out if given. A splitting backend runs the
+        leading one-query rows through decode and the rest through prefill, as vLLM does; others hand a step with
+        prompt rows to prefill."""
         if not context.is_prefill:
-            return self.decode(q, k_cache, v_cache, context)
+            return self.decode(q, k_cache, v_cache, context, out=out)
         if not self.split_decodes():
-            return self.prefill(q, k, v, k_cache, v_cache, context)
+            return self.prefill(q, k, v, k_cache, v_cache, context, out=out)
         n, decodes, prefills = split_decodes_and_prefills(context)
         if decodes is None:
             assert prefills is not None
-            return self.prefill(q, k, v, k_cache, v_cache, prefills)
+            return self.prefill(q, k, v, k_cache, v_cache, prefills, out=out)
         if prefills is None:
-            return self.decode(q, k_cache, v_cache, decodes)
-        out = torch.empty_like(q)
-        out[:n] = self.decode(q[:n], k_cache, v_cache, decodes)
-        out[n:] = self.prefill(q[n:], k[n:], v[n:], k_cache, v_cache, prefills)
+            return self.decode(q, k_cache, v_cache, decodes, out=out)
+        # Each half writes its rows of one output, as vLLM's, so no copy joins them.
+        if out is None:
+            out = torch.empty_like(q)
+        self.decode(q[:n], k_cache, v_cache, decodes, out=out[:n])
+        self.prefill(q[n:], k[n:], v[n:], k_cache, v_cache, prefills, out=out[n:])
         return out
 
     def mla_decode(

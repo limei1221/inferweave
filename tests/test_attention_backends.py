@@ -272,17 +272,23 @@ def test_narrow_values_match_padded_ones(backend, device, dtype, tol, causal):
     reason="the Triton merge needs a CUDA device and a Triton build",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_the_triton_merge_matches_torch(dtype):
-    """In place, with lse in FA3's transposed layout, so the strides are exercised too."""
+@pytest.mark.parametrize("into", [False, True], ids=["in_place", "into_out"])
+def test_the_triton_merge_matches_torch(dtype, into):
+    """In place or into an output strided as a split's rows, with lse in FA3's transposed layout."""
     num_tokens, num_heads, head_dim = 37, 16, 128
     o_a = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=dtype)
     o_b = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=dtype)
     lse_a = (torch.randn(num_heads, num_tokens, device="cuda") * 3).T
     lse_b = (torch.randn(num_heads, num_tokens, device="cuda") * 3).T
+    lse_a[0] = float("-inf")  # a row with no cached keys
     want_o, want_lse = merge_attention(o_a, lse_a, o_b, lse_b)
-    merge_attention_(o_a, lse_a, o_b, lse_b)
-    torch.testing.assert_close(o_a, want_o, atol=1e-2, rtol=1e-2)
+    before = o_a.clone()
+    out = torch.empty(num_tokens + 3, num_heads, head_dim, device="cuda", dtype=dtype)[3:] if into else None
+    merge_attention_(o_a, lse_a, o_b, lse_b, out)
+    torch.testing.assert_close(o_a if out is None else out, want_o, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse_a, want_lse)
+    if into:
+        assert torch.equal(o_a, before)
 
 
 def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):
@@ -855,7 +861,8 @@ def test_a_step_split_at_no_row_is_left_whole(device):
 
 
 def test_forward_splits_a_mixed_step_into_decode_and_prefill(backend, device, block_size, dtype, tol, monkeypatch):
-    """Rows of one query run through decode when the backend splits; together they match the reference."""
+    """Rows of one query run through decode when the backend splits, each half writing into the step's output;
+    together they match the reference."""
     num_cached = [2 * block_size + 5, 3, block_size + 1, 0]
     num_new = [1, 1, 7, 4]  # two decode rows lead, then a resumed chunk and a cold prompt
     block_tables_list = [[0, 1, 2], [3, -1, -1], [4, 5, -1], [6, -1, -1]]
@@ -863,9 +870,16 @@ def test_forward_splits_a_mixed_step_into_decode_and_prefill(backend, device, bl
         device, block_size, dtype, num_cached, num_new, block_tables_list, 7
     )
     backend.store_kvcache(k_new, v_new, k_cache, v_cache, torch.tensor(slots, dtype=torch.int32, device=device))
-    decoded = []
-    decode = backend.decode
-    monkeypatch.setattr(backend, "decode", lambda q, *args: decoded.append(q.size(0)) or decode(q, *args))
+    decoded, outs = [], []
+    decode, prefill = backend.decode, backend.prefill
+
+    def record_decode(q, *args, out=None):
+        decoded.append(q.size(0))
+        outs.append(out)
+        return decode(q, *args, out=out)
+
+    monkeypatch.setattr(backend, "decode", record_decode)
+    monkeypatch.setattr(backend, "prefill", lambda *args, out=None: outs.append(out) or prefill(*args, out=out))
 
     out = backend.forward(
         torch.cat(q_list), k_new, v_new, k_cache, v_cache, _host_context(device, num_cached, num_new, block_tables_list)
@@ -874,6 +888,8 @@ def test_forward_splits_a_mixed_step_into_decode_and_prefill(backend, device, bl
     expected = torch.cat([dense_attention(q, k, v) for q, k, v in zip(q_list, k_full, v_full)])
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
     assert decoded == ([2] if backend.split_decodes() else [])
+    if backend.split_decodes():
+        assert all(o._base is out for o in outs)  # views of the step's output, so no copy joins the halves
 
 
 def test_flashinfer_pages_list_each_rows_used_pages():
@@ -924,8 +940,8 @@ class FakeDecodeWrapper:
             self.buffers[1][: len(indices)].copy_(indices)
             self.buffers[2].copy_(last_page_len)
 
-    def run(self, q, kv_cache):
-        return torch.zeros_like(q)
+    def run(self, q, kv_cache, out=None):
+        return torch.zeros_like(q) if out is None else out.zero_()
 
 
 @pytest.fixture
@@ -979,8 +995,8 @@ class FakeRaggedWrapper:
     def plan(self, qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, causal, **options):
         self.plans.append((qo_indptr.tolist(), kv_indptr.tolist(), head_dim_vo, causal))
 
-    def run(self, q, k, v, return_lse=False):
-        out = q.new_zeros(*q.shape[:2], v.size(-1))
+    def run(self, q, k, v, return_lse=False, out=None):
+        out = q.new_zeros(*q.shape[:2], v.size(-1)) if out is None else out.zero_()
         return (out, torch.full(q.shape[:2], 2.0)) if return_lse else out
 
 
