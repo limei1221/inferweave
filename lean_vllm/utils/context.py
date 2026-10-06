@@ -11,7 +11,6 @@ class Context:
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
-    keys_are_new: bool = False  # no row carries cached keys, so k/v holds the whole batch
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
@@ -66,7 +65,6 @@ def split_decodes_and_prefills(context: Context) -> tuple[int, Context | None, C
                 cu_seqlens_k_host=sub_k,
                 max_seqlen_q=max(b - a for a, b in zip(sub_q, sub_q[1:])),
                 max_seqlen_k=max(b - a for a, b in zip(sub_k, sub_k[1:])),
-                keys_are_new=sub_q == sub_k,
                 context_lens=context.context_lens[n:],
                 block_tables=context.block_tables[n:],
             )

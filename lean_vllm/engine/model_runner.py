@@ -286,8 +286,6 @@ class ModelRunner:
             max_seqlen_k=int(np.max(ends)),
             cu_seqlens_q_host=cu_seqlens_q,
             cu_seqlens_k_host=cu_seqlens_k,
-            # No row reads cached keys, so the cache can be skipped.
-            keys_are_new=not starts.any(),
             slot_mapping=buffers.put("slot_mapping", [] if slot_mapping is None else slot_mapping, torch.int32),
             context_lens=buffers.put("context_lens", ends, torch.int32),
             block_tables=block_tables,

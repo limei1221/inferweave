@@ -48,8 +48,8 @@ class FlashAttention3Backend(AttentionBackend):
         triton_cache.store_latents(latent, latent_cache, slot_mapping)
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
-        if context.keys_are_new or context.block_tables is None:
-            # k and v hold every key this batch attends (cold prompts), so skip the pages.
+        if context.block_tables is None:
+            # No pages (warmup, or MLA's new tokens): k and v hold every key.
             return flash_attn_varlen_func(
                 q,
                 k,
@@ -61,7 +61,7 @@ class FlashAttention3Backend(AttentionBackend):
                 softmax_scale=self.scale,
                 causal=True,
             )
-        # Some row reads cached keys, and FA3's varlen entry takes no page table.
+        # Keys come from the pages, cold rows too, as vLLM's V1; FA3's varlen entry takes no page table.
         assert context.cu_seqlens_k is not None
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         return flash_attn_with_kvcache(

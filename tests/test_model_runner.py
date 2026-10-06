@@ -153,19 +153,6 @@ def test_an_all_greedy_batch_sends_no_temperatures(runner):
     assert temperatures is None
 
 
-def test_keys_are_new_follows_the_cached_tokens(runner):
-    """It decides which entry point a flash prefill takes, so it must not lag the batch."""
-    cold = Sequence([10, 11, 12], SamplingParams())
-    cold.num_scheduled_tokens = 3
-    _, _, _, context = runner.prepare_batch([cold])
-    assert context["keys_are_new"]
-
-    resumed = Sequence([20, 21, 22, 23], SamplingParams())
-    resumed.num_cached_tokens, resumed.num_scheduled_tokens = 2, 2
-    _, _, _, context = runner.prepare_batch([cold, resumed])
-    assert not context["keys_are_new"]
-
-
 def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner):
     """A splitting backend slices decode rows off the front; the scheduler reads tokens back by its own order."""
     prompt = Sequence([10, 11, 12], SamplingParams(temperature=0.5))
@@ -519,7 +506,6 @@ def check_batch(runner, seqs: list[Sequence], want: dict):
     assert context["cu_seqlens_k_host"] == want["cu_seqlens_k"]
     assert context["max_seqlen_q"] == max(b - a for a, b in zip(want["cu_seqlens_q"], want["cu_seqlens_q"][1:]))
     assert context["max_seqlen_k"] == max(want["context_lens"])
-    assert context["keys_are_new"] == (want["cu_seqlens_q"] == want["cu_seqlens_k"])
     if context["is_prefill"]:
         assert context["logits_indices"].tolist() == want["logits_indices"]
     else:

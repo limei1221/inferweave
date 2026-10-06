@@ -65,8 +65,8 @@ class FlashInferBackend(AttentionBackend):
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
-        if context.keys_are_new or context.block_tables is None:
-            # k and v hold every key this batch attends (cold prompts), so skip the pages, as FA3 does.
+        if context.block_tables is None:
+            # No pages (warmup, or MLA's new tokens): k and v hold every key, as FA3's.
             cu_q = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
             cu_k = _host_cumulative(context.cu_seqlens_k_host, context.cu_seqlens_k)
             return self._planned_ragged(q, k, v, cu_q, cu_k, causal=True).run(q, k, v)

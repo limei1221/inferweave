@@ -196,8 +196,8 @@ in decode, so the flash backend transposes and squeezes to match.
 ### Causal masking is bottom-right aligned
 
 Under chunked prefill or prefix caching a row has fewer queries than keys, and
-its queries are the *last* `lq` of its `lk` keys. Query `j` attends keys
-`0 ..= lk - lq + j`.
+its queries are the *last* `lq` of its `lk` keys. Query `j` (0-indexed) attends
+keys `0, …, lk - lq + j`.
 
 `scaled_dot_product_attention(is_causal=True)` aligns top-left instead, and
 when `lq != lk` it silently returns a plausible but wrong answer. So
@@ -243,23 +243,16 @@ prompt chunk. Checking that every query length is 1 would be wrong there: a
 prompt chunk can be one token long when the budget runs down to one, and unless
 it ends the prompt it must not sample.
 
-### FlashAttention-3's two prefill calls
+### FlashAttention-3's prefill reads the pages
 
-FA3 has two entry points, and which one a step uses depends on where its keys
-are:
+As vLLM's V1, a prefill reads every key from the pages, cold rows included:
+`attend` stores the step's keys first, then prefill calls
+`flash_attn_with_kvcache` with `page_table`. FA3's `flash_attn_varlen_func`
+takes no page table, so it serves only calls with no pages: warmup, before the
+cache exists, and MLA's new tokens.
 
-| Step | Call |
-|---|---|
-| No row resumes from cached keys | `flash_attn_varlen_func` on this step's k and v |
-| Some row resumes | `flash_attn_with_kvcache` with `page_table` |
-
-The runner answers this on the host as `keys_are_new`: cumulative query and key
-lengths are equal exactly when no row starts from cached tokens. Reading it from
-the tensors would cost a sync per layer.
-
-Under chunked prefill, new prompts share a step with running decodes, so a
-loaded server rarely takes the varlen path. Offline runs and steps with nothing
-else running do. Whether that path is faster is unmeasured.
+V0 skipped the pages when no row resumed from cached keys; V1 dropped that
+second path, and so does this backend.
 
 FA3 reads pages of any size, which is what made 16 tokens the default block
 size. FA2 required multiples of 256.
@@ -276,8 +269,8 @@ fresh context plans again.
 | Rows | Wrapper |
 |---|---|
 | Decode rows | `BatchDecodeWithPagedKVCacheWrapper`, on tensor cores when a key head serves more than 4 query heads, as vLLM chose |
-| Prompt rows, some resuming from cached keys | `BatchPrefillWithPagedKVCacheWrapper`, causal (bottom-right aligned) |
-| Prompt rows, no cached keys | `BatchPrefillWithRaggedKVCacheWrapper` on this step's k and v, as FA3's varlen path |
+| Prompt rows | `BatchPrefillWithPagedKVCacheWrapper`, causal (bottom-right aligned), cold rows too, as vLLM's V1 |
+| No pages (warmup, MLA's new tokens) | `BatchPrefillWithRaggedKVCacheWrapper` on this step's k and v |
 | `varlen_with_lse`, for MLA prefill | The same ragged wrapper, with its base-2 lse multiplied by ln 2 |
 
 FlashInfer wants each row's pages packed (a CSR table), not the padded

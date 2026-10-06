@@ -269,9 +269,10 @@ class MLAAttention(Attention):
     def _prefill(self, q: torch.Tensor, latent: torch.Tensor, context: Context) -> torch.Tensor:
         cache = self.latent_cache
         k, v = self.expand(latent)
-        if context.keys_are_new or context.block_tables is None:
-            # Every key the step reads is new, so a plain prefill with no page table covers it.
-            unpaged = dataclasses.replace(context, block_tables=None, keys_are_new=True)
+        chunks = [] if context.block_tables is None else context_chunks(context, cache.size(1), self.max_context_chunk)
+        if not chunks:
+            # No row has cached context (vLLM's has_context), so a plain prefill with no page table covers it.
+            unpaged = dataclasses.replace(context, block_tables=None)
             return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged))
         # New tokens attend each other causally, then each chunk of cached keys unmasked.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
@@ -290,7 +291,7 @@ class MLAAttention(Attention):
         )
         del k, v
         latents = cache.view(-1, self.latent_dim)
-        for chunk in context_chunks(context, cache.size(1), self.max_context_chunk):
+        for chunk in chunks:
             k, v = self.expand(latents[chunk.slots])
             rows = chunk.queries
             o_chunk, lse_chunk = self.backend.varlen_with_lse(

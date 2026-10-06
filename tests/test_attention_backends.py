@@ -259,7 +259,6 @@ def test_narrow_values_match_padded_ones(backend, device, dtype, tol, causal):
             cu_seqlens_k=args[1],
             max_seqlen_q=args[2],
             max_seqlen_k=args[3],
-            keys_are_new=True,
         )
         empty = torch.tensor([], device=device, dtype=dtype)
         got = mla.prefill(q, k, v, empty, empty, context)
@@ -315,7 +314,6 @@ def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, 
         cu_seqlens_k=cu,
         max_seqlen_q=max(seqlens),
         max_seqlen_k=max(seqlens),
-        keys_are_new=True,
         context_lens=torch.tensor(seqlens, dtype=torch.int32, device=device),
         block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
     )
@@ -846,7 +844,7 @@ def test_the_split_slices_the_leading_one_query_rows(device):
     assert decodes.block_tables.tolist() == [[0, -1, -1], [1, -1, -1]]
     assert prefills.cu_seqlens_q.tolist() == prefills.cu_seqlens_q_host == [0, 5, 8]
     assert prefills.cu_seqlens_k.tolist() == prefills.cu_seqlens_k_host == [0, 9, 12 + 2 * BLOCK_SIZE]
-    assert (prefills.max_seqlen_q, prefills.max_seqlen_k, prefills.keys_are_new) == (5, 3 + 2 * BLOCK_SIZE, False)
+    assert (prefills.max_seqlen_q, prefills.max_seqlen_k) == (5, 3 + 2 * BLOCK_SIZE)
     assert prefills.block_tables.tolist() == [[2, -1, -1], [3, 4, 5]]
     assert split_decodes_and_prefills(context)[1] is decodes  # built once, for every layer
 
