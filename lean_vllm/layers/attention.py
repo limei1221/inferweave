@@ -2,11 +2,13 @@ import dataclasses
 from itertools import accumulate
 from typing import Callable, cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend, triton_merge
+from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend
+from lean_vllm.attention.merge import merge_attention_
 from lean_vllm.utils import device as dev
 from lean_vllm.utils.context import Context, get_context, split_decodes_and_prefills
 
@@ -97,6 +99,10 @@ class Attention(nn.Module):
         """Whether a full graph may hold this layer's decode."""
         return self.backend.supports_full_cudagraph()
 
+    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
+        """Whether this layer would attend the rows' shared prefix once for all of them this step."""
+        return self.backend.use_cascade_attention(common_prefix_len, query_lens)
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # Through an opaque op, so the compiled model splits here and attention runs eager between the pieces.
         out = q.new_empty(self.output_shape(q.size(0)))
@@ -178,24 +184,6 @@ def context_chunks(context: Context, block_size: int, budget: int) -> list[Conte
     return context.context_chunks
 
 
-def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]:
-    """Attention over two disjoint key sets, from each one's output and log-sum-exp."""
-    weight_b = torch.sigmoid(lse_b - lse_a).unsqueeze(-1)  # exp(lse_b) / (exp(lse_a) + exp(lse_b))
-    o = torch.lerp(o_a.float(), o_b.float(), weight_b)
-    return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
-
-
-def merge_attention_(o_a, lse_a, o_b, lse_b, out=None) -> None:
-    """merge_attention written over out, or else o_a, and lse_a: one Triton launch on CUDA, as vLLM's
-    merge_attn_states."""
-    if o_a.is_cuda and triton_merge._IMPORT_ERROR is None:
-        triton_merge.merge_attn_states_(o_a, lse_a, o_b, lse_b, out)
-        return
-    o, lse = merge_attention(o_a, lse_a, o_b, lse_b)
-    (o_a if out is None else out).copy_(o)
-    lse_a.copy_(lse)
-
-
 class MLAAttention(Attention):
     """Multi-head latent attention: the cache holds one compressed latent per token.
 
@@ -236,6 +224,9 @@ class MLAAttention(Attention):
 
     def output_shape(self, num_tokens: int) -> tuple[int, ...]:
         return (num_tokens, self.num_heads, self.v_head_dim)
+
+    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
+        return False  # it attends through mla_decode and _prefill, which have no cascade path
 
     def supports_full_cudagraph(self) -> bool:
         # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.

@@ -43,6 +43,8 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
 
 
 class ModelRunner:
+    cascade_layers: list[Attention] = []  # one layer per kind, backend and head count; each must agree to cascade
+
     def __init__(self, config: Config, rank: int):
         self.config = config
         hf_config = config.hf_config
@@ -80,6 +82,8 @@ class ModelRunner:
             counts = Counter(layer.backend.get_name() for layer in layers)
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
         self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))  # replay hooks
+        groups = {(type(layer), type(layer.backend), layer.num_heads, layer.num_kv_heads): layer for layer in layers}
+        self.cascade_layers = list(groups.values())
         self.enforce_eager = (
             config.enforce_eager
             or self.device.type != "cuda"
@@ -265,6 +269,7 @@ class ModelRunner:
         row_temperatures = [seq.temperature for seq in sampling_rows] if self.rank == 0 else []
 
         block_tables = slot_mapping = None
+        common_prefix_len = 0
         tables = [seq.block_table for seq in batch]
         if any(tables):
             table = np.full((num_rows, max(map(len, tables))), -1, np.int32)
@@ -276,6 +281,7 @@ class ModelRunner:
             blocks = table[token_rows[keep], kept // block_size].astype(np.int64)
             slot_mapping = blocks * block_size + kept % block_size
             block_tables = buffers.put("block_tables", table, torch.int32)
+            common_prefix_len = self._cascade_prefix_len(table, starts, lens)
         is_prefill = any(seq.is_prefill for seq in seqs)
         cu_seqlens_q, cu_seqlens_k = cu_q.tolist(), cu_k.tolist()
         context = dict(
@@ -291,6 +297,7 @@ class ModelRunner:
             block_tables=block_tables,
             # A pure-decode batch samples on every row, so the gather is skipped.
             logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
+            common_prefix_len=common_prefix_len,
         )
         input_ids = buffers.put("input_ids", np.array(token_ids, np.int64), torch.int64)
         positions_t = buffers.put("positions", positions, torch.int64)
@@ -310,6 +317,21 @@ class ModelRunner:
         buffers.end()
         self._sampling_rows = sampling_rows
         return input_ids, positions_t, temperatures, context
+
+    def _cascade_prefix_len(self, table: np.ndarray, starts: np.ndarray, lens: np.ndarray) -> int:
+        """vLLM's _compute_cascade_attn_prefix_len: the pages every row shares, cut to the fewest cached tokens so no
+        query falls inside them, in whole pages; 0 unless every kind of layer would cascade on it. vLLM counts
+        blocks every request holds; this compares the step's own tables, so a request not scheduled cannot hide it."""
+        if len(starts) < 2 or not self.cascade_layers:
+            return 0
+        num_pages = int(starts.min()) // self.block_size
+        shared = (table[:, :num_pages] == table[0, :num_pages]).all(axis=0)
+        common_prefix_len = (num_pages if shared.all() else int(shared.argmin())) * self.block_size
+        if common_prefix_len and all(
+            layer.use_cascade_attention(common_prefix_len, lens) for layer in self.cascade_layers
+        ):
+            return common_prefix_len
+        return 0
 
     @staticmethod
     def decodes_first(seqs: list[Sequence]) -> list[Sequence]:
@@ -331,11 +353,12 @@ class ModelRunner:
             return "piecewise" if mode in PIECEWISE_MODES else "none"
         return mode
 
-    def _step_kind(self, is_prefill: bool, num_tokens: int) -> str:
-        """How this step runs: "graph", "piecewise", or why no graph covers it. num_tokens is the batch size for decode."""
+    def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False) -> str:
+        """How this step runs: "graph", "piecewise", or why no graph covers it. num_tokens is the batch size for decode.
+        A cascade step takes no full graph, as in vLLM: the graphs hold the one-kernel decode."""
         if self.cudagraph_mode == "none":
             return "enforced"
-        if not is_prefill and self.cudagraph_mode in FULL_MODES and self.graph_bs:
+        if not is_prefill and not cascade and self.cudagraph_mode in FULL_MODES and self.graph_bs:
             if num_tokens <= self.graph_bs[-1]:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
@@ -345,7 +368,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        self.step_kind = self._step_kind(is_prefill, input_ids.size(0))
+        self.step_kind = self._step_kind(is_prefill, input_ids.size(0), get_context().common_prefix_len > 0)
         if self.compile_backend is not None and not self.compile_backend.pieces:  # this call traces
             mark_dynamic_tokens(input_ids, positions)
         if self.step_kind == "graph":

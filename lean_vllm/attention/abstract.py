@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from lean_vllm.utils.context import Context, split_decodes_and_prefills
@@ -68,6 +69,11 @@ class AttentionBackend(ABC):
     def split_decodes() -> bool:
         """True if forward sends a step's one-query rows to decode and the rest to prefill, as vLLM's backends with
         reorder_batch_threshold = 1 do. False sends any step with a prompt row to prefill whole."""
+        return False
+
+    def use_cascade_attention(self, common_prefix_len: int, query_lens: np.ndarray) -> bool:
+        """Whether rows sharing their first common_prefix_len cached tokens should attend them once for all, as
+        vLLM's use_cascade_attention decides per backend. False for a backend with no cascade path."""
         return False
 
     @staticmethod

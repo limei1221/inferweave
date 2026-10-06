@@ -119,6 +119,8 @@ any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
 | FlashInfer's ragged plans: one per problem per step, reused across steps, the overflow sharing one wrapper; its lse turned to base e | CPU, with a fake wrapper | Pass |
 | FlashInfer MLA's CSR plan, its graph wrappers and re-planning before replay | CPU, with a fake wrapper | Pass; never captured on a GPU |
 | MLA backend order, and their prefill on FA3 or else FlashInfer | Every machine | Pass |
+| FA3's cascade against attending each row whole; one schedule per problem per step; full-graph schedules refilled before replay; vLLM's cascade heuristic | CPU, with a fake kernel that does the arithmetic | Pass; never run on an H100 |
+| The runner's cascade prefix: shared pages, cut to the fewest cached tokens; no full graph on a cascade step | Every machine | Pass |
 
 The reference is `dense_attention` in `tests/test_attention_backends.py`: the
 textbook formula, looped over heads, with no SDPA and no paging, so agreeing with
@@ -257,6 +259,30 @@ second path, and so does this backend.
 FA3 reads pages of any size, which is what made 16 tokens the default block
 size. FA2 required multiples of 256.
 
+### FlashAttention-3: one tile schedule per step, and cascade attention
+
+Without a schedule, every paged FA3 call first runs a pass that splits the
+work across SMs. As vLLM does on FA3, the step's first layer to pose a
+problem builds that schedule with `get_scheduler_metadata`, and every later
+layer is handed it. The schedule and the kernel must be given the same
+arguments. Both take the longest key length from the page table's width, as
+`flash_attn_with_kvcache` does. A full graph reads its decode schedule from a
+buffer that `before_full_graph_replay` refills for the step's lengths, with
+the tail zeroed, as vLLM's `_store_scheduler_metadata` does.
+
+When the step's rows share cached pages, as a common system prompt leaves
+them under prefix caching, the runner offers that prefix for cascade
+attention. As vLLM's `_compute_cascade_attn_prefix_len`, it is cut to the
+fewest cached tokens of any row, so it holds no query, then to whole pages.
+vLLM counts blocks held by every request; the runner compares the step's own
+block tables, so a request that was not scheduled cannot hide the prefix.
+The backend's `use_cascade_attention` is vLLM's heuristic: at least 256
+tokens and 8 rows, and for an all-decode GQA step, fewer waves than flash
+decoding. If every kind of layer agrees, FA3 attends the prefix once for all
+queries, unmasked, then each row's own keys causally, and merges the two into
+the output. A cascade step takes no full graph, as in vLLM. Other backends
+have no cascade path and decline.
+
 ### FlashInfer: planned once per step
 
 FlashInfer splits each call into a host-side `plan()`, which builds the work
@@ -356,3 +382,5 @@ trade for a reference and for laptop development, and the wrong one for speed.
    order them by what they measure.
 3. Capture a FlashInfer model's full graphs on a GPU and check its decode
    against eager, then compare decode throughput with piecewise only.
+4. Run FA3's schedule and cascade on an H100: the suite, then Qwen3-8B with a
+   shared system prompt, cascade on and off, against vLLM.

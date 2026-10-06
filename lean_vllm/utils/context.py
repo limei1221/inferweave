@@ -24,6 +24,7 @@ class Context:
     piecewise_size: int | None = None  # the bucket whose piecewise graphs this pass captures or replays
     full_graph_size: int | None = None  # the batch size whose full graph this pass captures
     num_actual_tokens: int | None = None  # the step's own rows, when a piecewise bucket pads it; None is all
+    common_prefix_len: int = 0  # cached tokens every row shares, for a backend to attend once (cascade); 0 is none
 
 
 def split_decodes_and_prefills(context: Context) -> tuple[int, Context | None, Context | None]:

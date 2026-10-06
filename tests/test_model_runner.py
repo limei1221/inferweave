@@ -172,6 +172,55 @@ def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner
     assert runner._sampling_rows == [prompt, decoding]
 
 
+class CascadeLayer:
+    """Stands in for a layer: records what it was asked and answers as told."""
+
+    def __init__(self, answer: bool):
+        self.answer, self.asked = answer, []
+
+    def use_cascade_attention(self, common_prefix_len, query_lens):
+        self.asked.append((common_prefix_len, query_lens.tolist()))
+        return self.answer
+
+
+def decoding_rows(tables: list[list[int]], cached: list[int]) -> list[Sequence]:
+    rows = []
+    for table, num_cached in zip(tables, cached):
+        seq = Sequence(list(range(num_cached)))
+        seq.append_token(7)
+        seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = num_cached, 1, False
+        seq.block_table = table
+        rows.append(seq)
+    return rows
+
+
+@pytest.mark.parametrize("answers, want", [((True, True), 16), ((True, False), 0)], ids=["all_agree", "one_declines"])
+def test_cascade_takes_the_pages_every_row_shares_up_to_the_fewest_cached(runner, answers, want):
+    """Rows share blocks 1 and 2, and the third page only in part; every layer kind must agree, as vLLM's groups."""
+    runner.cascade_layers = [CascadeLayer(answer) for answer in answers]
+    rows = decoding_rows([[1, 2, 3, 9], [1, 2, 3, 10], [1, 2, 4, 11]], [30, 25, 28])
+
+    *_, context = runner.prepare_batch(rows)
+
+    assert context["common_prefix_len"] == want
+    assert runner.cascade_layers[0].asked == [(16, [1, 1, 1])]
+
+
+def test_cascade_never_covers_a_query(runner):
+    """Shared pages past a row's cached tokens hold its new ones, which must stay masked: the prefix stops short."""
+    runner.cascade_layers = [CascadeLayer(True)]
+    rows = decoding_rows([[1, 2, 3, 4], [1, 2, 3, 4]], [30, 15])  # the second row's token is on page 1
+
+    *_, context = runner.prepare_batch(rows)
+
+    assert context["common_prefix_len"] == 8
+
+
+def test_a_runner_without_layers_never_cascades(runner):
+    *_, context = runner.prepare_batch(decoding_rows([[1, 2, 3, 9], [1, 2, 3, 10]], [30, 30]))
+    assert context["common_prefix_len"] == 0
+
+
 def test_a_failed_step_leaves_no_context_behind(runner):
     """The next step, or a graph capture, must not read this one's layout."""
     seq = Sequence([10, 11, 12], SamplingParams())
@@ -226,6 +275,11 @@ class TestStepKind:
 
     def test_a_small_decode_batch_replays_a_full_graph(self, runner):
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "graph"
+
+    def test_a_cascade_decode_skips_the_full_graph(self, runner):
+        """The full graphs hold one-kernel decode, so a cascade step falls back, as vLLM's dispatcher does."""
+        assert runner._step_kind(is_prefill=False, num_tokens=8, cascade=True) == "decode"
+        assert runner._step_kind(is_prefill=False, num_tokens=512, cascade=True) == "piecewise"
 
     def test_a_decode_batch_past_the_buckets_runs_eager(self, runner):
         assert runner._step_kind(is_prefill=False, num_tokens=17) == "decode"

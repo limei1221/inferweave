@@ -3,6 +3,7 @@
 import math
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -15,11 +16,13 @@ from lean_vllm.attention import (
     LayerSpec,
     TorchAttention,
     TritonMLABackend,
+    flash_backend,
     flashinfer_backend,
     get_attention_backend,
     triton_merge,
 )
-from lean_vllm.layers.attention import Attention, merge_attention, merge_attention_
+from lean_vllm.attention.merge import merge_attention, merge_attention_
+from lean_vllm.layers.attention import Attention
 from lean_vllm.utils.context import Context, set_context, split_decodes_and_prefills
 
 torch.manual_seed(0)
@@ -1130,3 +1133,170 @@ def test_flashinfer_mla_full_graphs_get_a_wrapper_per_batch_size_replanned_befor
     backend.mla_decode(torch.zeros(3, NUM_HEADS, LATENT_DIM), cache, LATENT_V_DIM, step)  # an eager step
     eager = [w for key, w in FlashInferMLABackend._wrappers.items() if key[-1] is None]
     assert len(eager) == 1 and not eager[0].use_cuda_graph
+
+
+def _paged_attention_with_lse(q, k_cache, v_cache, n: int, pages, causal: bool):
+    """One row against its first n cached keys: output [lq, H, D] and log-sum-exp [H, lq]."""
+    page_size = k_cache.size(1)
+    pages = pages[: -(-n // page_size)].long()
+    k, v = (cache[pages].flatten(0, 1)[:n].float() for cache in (k_cache, v_cache))
+    group = q.size(1) // k.size(1)
+    k, v = k.repeat_interleave(group, dim=1), v.repeat_interleave(group, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k) * SCALE
+    if causal:  # bottom-right aligned
+        lq = q.size(0)
+        visible = torch.arange(n) <= (n - lq + torch.arange(lq)).unsqueeze(1)
+        scores = scores.masked_fill(~visible, float("-inf"))
+    return torch.einsum("hqk,khd->qhd", scores.softmax(-1), v).to(q.dtype), scores.logsumexp(-1)
+
+
+class FakeFA3:
+    """flash_attn_with_kvcache and get_scheduler_metadata on the CPU: the real arithmetic, and a schedule that
+    records its problem, so a kernel call can be matched to the schedule it was handed."""
+
+    def __init__(self):
+        self.schedules, self.calls = [], []
+
+    def get_scheduler_metadata(self, cache_seqlens, **problem):
+        self.schedules.append(problem)
+        return torch.tensor([problem["batch_size"], *cache_seqlens.tolist()], dtype=torch.int32)
+
+    def flash_attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens,
+        page_table,
+        cu_seqlens_q=None,
+        max_seqlen_q=None,
+        softmax_scale=None,
+        causal=False,
+        scheduler_metadata=None,
+        return_softmax_lse=False,
+    ):
+        assert softmax_scale == SCALE
+        self.calls.append(scheduler_metadata)
+        bounds = None if cu_seqlens_q is None else cu_seqlens_q.tolist()
+        rows = list(q) if bounds is None else [q[a:b] for a, b in zip(bounds, bounds[1:])]
+        results = [
+            _paged_attention_with_lse(row, k_cache, v_cache, int(n), pages, causal)
+            for row, n, pages in zip(rows, cache_seqlens, page_table)
+        ]
+        if bounds is None:  # batched: out [B, lq, H, D], lse [B, H, lq]
+            out, lse = torch.stack([o for o, _ in results]), torch.stack([lse for _, lse in results])
+        else:  # packed: out [N, H, D], lse [H, N]
+            out, lse = torch.cat([o for o, _ in results]), torch.cat([lse for _, lse in results], dim=1)
+        return (out, lse) if return_softmax_lse else out
+
+
+@pytest.fixture
+def fake_fa3(monkeypatch):
+    from lean_vllm.attention import flash_backend
+
+    fake = FakeFA3()
+    monkeypatch.setattr(flash_backend, "flash_attn_with_kvcache", fake.flash_attn_with_kvcache, raising=False)
+    monkeypatch.setattr(flash_backend, "get_scheduler_metadata", fake.get_scheduler_metadata, raising=False)
+    monkeypatch.setattr(FlashAttention3Backend, "_graph_problems", {})
+    monkeypatch.setattr(FlashAttention3Backend, "_graph_schedules", {})
+    return FlashAttention3Backend(NUM_HEADS, HEAD_DIM, SCALE, NUM_KV_HEADS), fake
+
+
+def _shared_prefix_step(decode: bool):
+    """Three rows whose first two pages are the same blocks, then pages of their own, as a prefix-cache hit leaves
+    them; each has cached keys past the shared pages, so the prefix covers no query."""
+    torch.manual_seed(1)
+    k_cache, v_cache = (torch.randn(12, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM) for _ in range(2))
+    tables = torch.tensor([[0, 1, 2, 3], [0, 1, 4, 5], [0, 1, 6, 7]], dtype=torch.int32)
+    starts, lens = [2 * BLOCK_SIZE + 3, 2 * BLOCK_SIZE + 9, 3 * BLOCK_SIZE], [1, 1, 1] if decode else [4, 1, 6]
+    ends = [s + n for s, n in zip(starts, lens)]
+    cu_q = [0, *torch.tensor(lens).cumsum(0).tolist()]
+    context = Context(
+        is_prefill=not decode,
+        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, *torch.tensor(ends).cumsum(0).tolist()], dtype=torch.int32),
+        max_seqlen_q=max(lens),
+        context_lens=torch.tensor(ends, dtype=torch.int32),
+        block_tables=tables,
+    )
+    q = torch.randn(cu_q[-1], NUM_HEADS, HEAD_DIM)
+    expected = torch.cat(
+        [
+            _paged_attention_with_lse(q[a:b], k_cache, v_cache, n, pages, causal=True)[0]
+            for a, b, n, pages in zip(cu_q, cu_q[1:], ends, tables)
+        ]
+    )
+    return q, k_cache, v_cache, context, expected
+
+
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "prefill"])
+def test_fa3_cascade_matches_attending_each_row_whole(fake_fa3, decode):
+    """The shared pages read once for every query, unmasked, merged with each row's own keys past them."""
+    backend, fake = fake_fa3
+    q, k_cache, v_cache, context, expected = _shared_prefix_step(decode)
+    context.common_prefix_len = 2 * BLOCK_SIZE
+    attend = backend.decode if decode else lambda *args, **kw: backend.prefill(q, None, None, *args[1:], **kw)
+    out = torch.full_like(q, float("nan"))
+
+    got = attend(q, k_cache, v_cache, context, out=out)
+
+    assert got is out
+    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+    prefix, suffix = fake.schedules
+    assert (prefix["batch_size"], prefix["max_seqlen_q"], prefix["max_seqlen_k"]) == (1, q.size(0), 2 * BLOCK_SIZE)
+    assert not prefix["causal"] and prefix["cu_seqlens_q"] is None
+    assert (suffix["batch_size"], suffix["max_seqlen_k"], suffix["causal"]) == (3, 2 * BLOCK_SIZE, True)
+    suffix_lens = (context.context_lens - 2 * BLOCK_SIZE).tolist()
+    assert fake.calls[1].tolist() == [3, *suffix_lens]  # the suffix call ran on its schedule: each row's keys past it
+
+
+def test_fa3_makes_one_schedule_per_problem_per_step(fake_fa3):
+    """As vLLM's AOT schedule: the first layer to pose a problem makes it, and the rest are handed the same one."""
+    backend, fake = fake_fa3
+    q, k_cache, v_cache, context, expected = _shared_prefix_step(decode=True)
+    for _ in range(3):  # layers
+        torch.testing.assert_close(backend.decode(q, k_cache, v_cache, context), expected, atol=1e-5, rtol=1e-5)
+    assert len(fake.schedules) == 1
+    assert fake.schedules[0]["max_seqlen_k"] == 4 * BLOCK_SIZE  # the page table's width, as the kernel reads it
+    assert all(schedule is fake.calls[0] for schedule in fake.calls)
+
+
+def test_fa3_full_graphs_read_a_schedule_refilled_before_replay(fake_fa3):
+    """Captured largest first; each graph bakes the shared buffer, which a replay refills for its step's lengths."""
+    backend, fake = fake_fa3
+    k_cache, v_cache = make_cache(4, "cpu", BLOCK_SIZE, torch.float32)
+    width = 2
+    for bs in (4, 2):
+        context = Context(
+            context_lens=torch.full((bs,), width * BLOCK_SIZE, dtype=torch.int32),
+            block_tables=torch.zeros(bs, width, dtype=torch.int32),
+            full_graph_size=bs,
+        )
+        for _ in range(2):  # layers
+            backend.decode(torch.zeros(bs, NUM_HEADS, HEAD_DIM), k_cache, v_cache, context)
+    (buffer,) = FlashAttention3Backend._graph_schedules.values()
+    assert len(fake.schedules) == 2 and buffer.numel() == 5
+    assert fake.calls[-1].data_ptr() == buffer.data_ptr()
+
+    step = Context(context_lens=torch.tensor([5, 9], dtype=torch.int32))
+    FlashAttention3Backend.before_full_graph_replay(step, 4)
+
+    assert buffer.tolist() == [4, 5, 9, 0, 0]  # the graph's padding rows hold no keys
+    assert fake.schedules[-1]["batch_size"] == 4 and fake.schedules[-1]["max_seqlen_k"] == width * BLOCK_SIZE
+    FlashAttention3Backend.before_full_graph_replay(step, 2)
+    assert buffer.tolist() == [2, 5, 9, 0, 0]  # a smaller graph's schedule, its stale tail zeroed
+
+
+@pytest.mark.parametrize(
+    "prefix, query_lens, want",
+    [
+        (255, [5] * 8, False),  # too short a prefix
+        (1024, [5] * 7, False),  # too few rows
+        (256, [5] * 8, True),  # prefill: no flash decoding to compete with
+        (4096, [1] * 256, True),  # a wide decode batch: cascade reads the prefix in fewer waves
+        (256, [1] * 8, False),  # a narrow one: flash decoding fills the SMs
+    ],
+)
+def test_fa3_cascades_as_vllms_heuristic_decides(prefix, query_lens, want):
+    """Qwen3-8B's 32 query heads over 8 key heads, on an H100's 132 SMs."""
+    assert flash_backend.use_cascade_attention(prefix, np.array(query_lens), 32, 8, 132) is want
