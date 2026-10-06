@@ -3,24 +3,25 @@ from dataclasses import dataclass, field
 from time import perf_counter
 
 from lean_vllm.config import Config
-from lean_vllm.engine.sequence import Sequence, SequenceStatus
 from lean_vllm.engine.block_manager import BlockManager
 from lean_vllm.engine.policy import SchedulingPolicy
+from lean_vllm.engine.sequence import Sequence, SequenceStatus
 from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, create_scheduler_connector
 
 
 @dataclass(slots=True)
 class SchedulerOutput:
     """What one step should run. A sequence carries its own num_scheduled_tokens."""
+
     scheduled: list[Sequence] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
-    dropped: list[Sequence] = field(default_factory=list)    # finished without ever sampling
+    dropped: list[Sequence] = field(default_factory=list)  # finished without ever sampling
     # Counted while scheduling: advance() clears num_scheduled_tokens.
     num_prefill_tokens: int = 0
     num_decode_tokens: int = 0
-    num_queried_blocks: int = 0    # prefix cache, counted at admission
+    num_queried_blocks: int = 0  # prefix cache, counted at admission
     num_cached_blocks: int = 0
-    kv_connector_metadata: KVConnectorMetadata | None = None    # None without a connector
+    kv_connector_metadata: KVConnectorMetadata | None = None  # None without a connector
 
     def __bool__(self):
         return bool(self.scheduled)
@@ -29,6 +30,7 @@ class SchedulerOutput:
 @dataclass(slots=True)
 class LaunchedRow:
     """One sampling row of a launched step. A requeue after launch voids its token."""
+
     seq: Sequence
     num_preemptions: int
 
@@ -46,7 +48,6 @@ class DuplicateRequestId(InvalidRequest):
 
 
 class Scheduler:
-
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -61,10 +62,10 @@ class Scheduler:
         )
         self.waiting = SchedulingPolicy.create(config.scheduling_policy)
         self.running: deque[Sequence] = deque()
-        self.seqs: dict[str, Sequence] = {}    # live requests, for abort
+        self.seqs: dict[str, Sequence] = {}  # live requests, for abort
         self.connector = create_scheduler_connector(config) if config.kv_transfer is not None else None
-        self.recving: dict[str, Sequence] = {}    # admitted, their blocks loading from a prefill instance
-        self.sending: dict[str, Sequence] = {}    # finished, their blocks held for a decode instance to read
+        self.recving: dict[str, Sequence] = {}  # admitted, their blocks loading from a prefill instance
+        self.sending: dict[str, Sequence] = {}  # finished, their blocks held for a decode instance to read
 
     def is_finished(self):
         return not self.waiting and not self.running and not self.recving and not self.sending
@@ -84,10 +85,10 @@ class Scheduler:
         if seq is None:
             return False
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-            self._finish(seq, reason)    # its blocks are being written; they are freed once the load ends
+            self._finish(seq, reason)  # its blocks are being written; they are freed once the load ends
             return True
         queue = self.waiting if seq.status == SequenceStatus.WAITING else self.running
-        queue.remove(seq)    # both queues expose remove()
+        queue.remove(seq)  # both queues expose remove()
         seq.drop_pending()
         self._finish(seq, reason)
         self._free(seq)
@@ -100,8 +101,8 @@ class Scheduler:
             output = self._schedule_whole_prompts()
             output.dropped = dropped + output.dropped
             if output:
-                return self._with_connector_meta(output)    # prefill-only step
-            dropped = output.dropped    # nothing to run, but the drops still owe an output
+                return self._with_connector_meta(output)  # prefill-only step
+            dropped = output.dropped  # nothing to run, but the drops still owe an output
         output = SchedulerOutput(dropped=dropped)
         budget = self.max_num_batched_tokens
         still_running: deque[Sequence] = deque()
@@ -111,12 +112,12 @@ class Scheduler:
         while self.running:
             seq = self.running.popleft()
             if budget <= 0 or len(output.scheduled) >= self.max_num_seqs:
-                still_running.append(seq)    # left untouched this step
+                still_running.append(seq)  # left untouched this step
                 continue
             if seq.num_planned_tokens - seq.num_prompt_tokens >= seq.max_tokens:
-                still_running.append(seq)    # its reserved tokens already reach the limit
+                still_running.append(seq)  # its reserved tokens already reach the limit
                 continue
-            if not seq.is_prefill:    # decoding, so the cache grows
+            if not seq.is_prefill:  # decoding, so the cache grows
                 if not self._make_room(seq, still_running, output):
                     continue
                 self.block_manager.may_append(seq)
@@ -129,7 +130,7 @@ class Scheduler:
             while self.waiting and len(output.scheduled) < self.max_num_seqs and budget > 0:
                 seq = self.waiting.peek()
                 if seq.num_blocks > len(self.block_manager.blocks):
-                    self.waiting.pop()    # impossible even with the entire cache free
+                    self.waiting.pop()  # impossible even with the entire cache free
                     self._drop(seq, "capacity", output)
                     continue
                 num_cached_blocks = self.block_manager.can_allocate(seq)
@@ -149,10 +150,7 @@ class Scheduler:
         if not self.request_timeout:
             return []
         deadline = perf_counter() - self.request_timeout
-        expired = [
-            seq for seq in self.waiting
-            if seq.first_scheduled_time is None and seq.arrival_time < deadline
-        ]
+        expired = [seq for seq in self.waiting if seq.first_scheduled_time is None and seq.arrival_time < deadline]
         for seq in expired:
             self.waiting.remove(seq)
             self._drop(seq, "timeout")
@@ -173,9 +171,9 @@ class Scheduler:
                 break
             num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             if self._loads_remotely(seq):
-                num_tokens = 0    # it waits for its blocks, then computes one token
+                num_tokens = 0  # it waits for its blocks, then computes one token
             if num_tokens > self.max_num_batched_tokens:
-                self.waiting.pop()    # will never fit in one step, and splitting is off
+                self.waiting.pop()  # will never fit in one step, and splitting is off
                 self._drop(seq, "capacity", output)
                 continue
             if num_tokens > budget:
@@ -233,7 +231,7 @@ class Scheduler:
                 self._preempt(seq, output)
                 return False
             elif seq.num_pending_tokens:
-                still_running.append(seq)    # its in-flight token may stop it; decide after reconcile
+                still_running.append(seq)  # its in-flight token may stop it; decide after reconcile
                 return False
             elif self.recving or self.sending:
                 # Transfers still own blocks outside running. Wait until they
@@ -251,7 +249,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         seq.num_preemptions += 1
-        seq.drop_pending()    # the in-flight token is discarded and recomputed
+        seq.drop_pending()  # the in-flight token is discarded and recomputed
         self.block_manager.deallocate(seq)
         self.waiting.requeue(seq)
         output.preempted.append(seq)
@@ -266,7 +264,7 @@ class Scheduler:
         seq.drop_pending()
         del self.seqs[seq.request_id]
         if output is not None:
-            output.dropped.append(seq)    # the caller is still owed a final output
+            output.dropped.append(seq)  # the caller is still owed a final output
 
     def advance(self, seqs: list[Sequence]) -> list[LaunchedRow]:
         """Move bookkeeping forward with no token values. Returns the sampling rows, in the sampler's order."""
@@ -277,7 +275,7 @@ class Scheduler:
             # Before the skip, so a chunked prefill publishes each block as it lands.
             self.block_manager.hash_blocks(seq, seq.num_cached_tokens)
             if seq.num_cached_tokens < seq.num_planned_tokens:
-                continue    # prefill or recomputation unfinished, so this row samples nothing
+                continue  # prefill or recomputation unfinished, so this row samples nothing
             seq.is_prefill = False
             seq.reserve_token()
             rows.append(LaunchedRow(seq, seq.num_preemptions))
@@ -289,18 +287,18 @@ class Scheduler:
         for row, token_id in zip(rows, token_ids):
             seq = row.seq
             if seq.is_finished or seq.num_preemptions != row.num_preemptions:
-                continue    # aborted, finished or requeued since the launch; the token is void
+                continue  # aborted, finished or requeued since the launch; the token is void
             seq.commit_token(token_id)
             if seq.first_token_time is None:
-                seq.first_token_time = perf_counter()    # when the token reaches the host, not at launch
+                seq.first_token_time = perf_counter()  # when the token reaches the host, not at launch
             stepped.append(seq)
             if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
-                reason = "stop"    # ignore_eos covers the eos token only, not client stop tokens
+                reason = "stop"  # ignore_eos covers the eos token only, not client stop tokens
             elif seq.num_completion_tokens == seq.max_tokens:
                 reason = "length"
             else:
                 continue
-            seq.drop_pending()    # a later step may already have reserved one
+            seq.drop_pending()  # a later step may already have reserved one
             self.running.remove(seq)
             self._drop(seq, reason)
             self._free(seq)
@@ -323,7 +321,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
         for request_id in kv_output.finished_recving | kv_output.failed_recving:
             seq = self.recving.pop(request_id)
-            if seq.is_finished:    # aborted while its blocks loaded
+            if seq.is_finished:  # aborted while its blocks loaded
                 self.block_manager.deallocate(seq)
                 continue
             if request_id in kv_output.finished_recving:

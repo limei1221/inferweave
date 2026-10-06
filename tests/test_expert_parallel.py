@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from test_deepseek_v2 import BLOCK_SIZE, reference_logits, row, tiny_config
 from transformers import AutoConfig
 from transformers import DeepseekV2ForCausalLM as HFDeepseekV2ForCausalLM
 
@@ -15,7 +16,6 @@ from lean_vllm.layers.moe import FusedMoE
 from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from lean_vllm.utils.context import set_context
 from lean_vllm.utils.loader import load_model
-from test_deepseek_v2 import BLOCK_SIZE, reference_logits, row, tiny_config
 
 WORLD_SIZE = 2
 PROMPT = [5, 17, 99, 3, 64, 120, 8, 42, 77, 1, 30]
@@ -30,6 +30,7 @@ def free_port() -> int:
 def run_rank(rank: int, port: int, path: str, enable_expert_parallel: bool, out: str):
     """One prefill on this rank's shard. Rank 0 saves the gathered logits and how its experts were split."""
     from lean_vllm.engine.model_runner import ModelRunner
+
     os.environ["LEAN_VLLM_ATTENTION_BACKEND"] = "torch"
     dist.init_process_group("gloo", init_method=f"tcp://localhost:{port}", rank=rank, world_size=WORLD_SIZE)
     try:
@@ -40,9 +41,9 @@ def run_rank(rank: int, port: int, path: str, enable_expert_parallel: bool, out:
         runner._prev_tokens = runner._prev_rows = None
         register_layers(model)
         input_ids, positions, _, context = runner.prepare_batch([row(PROMPT, 0, len(PROMPT), block_table=[])])
-        context["logits_indices"] = None    # every position, not just the last
+        context["logits_indices"] = None  # every position, not just the last
         with torch.inference_mode(), set_context(**context):
-            logits = model.compute_logits(model(input_ids, positions))    # None off rank 0
+            logits = model.compute_logits(model(input_ids, positions))  # None off rank 0
         if rank == 0:
             layers = [m for m in model.modules() if isinstance(m, FusedMoE)]
             split = [(m.ep_size, m.tp_size, m.gate_up_proj.size(0), m.gate_up_proj.size(1)) for m in layers]

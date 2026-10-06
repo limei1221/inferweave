@@ -23,29 +23,48 @@ NUM_BLOCKS = 16
 
 CONFIGS = {
     "lite": {},
-    "q_lora": dict(q_lora_rank=24, attention_bias=True),    # biases load into the fused down-projection too
+    "q_lora": dict(q_lora_rank=24, attention_bias=True),  # biases load into the fused down-projection too
     "grouped_routing": dict(topk_method="group_limited_greedy", n_group=4, topk_group=2),
 }
 
 
 def tiny_config(**overrides) -> DeepseekV2Config:
     """DeepSeek-V2-Lite's shape in miniature: one dense layer, then MoE with a shared expert."""
-    return DeepseekV2Config(**{
-        **dict(
-            hidden_size=64, num_attention_heads=4, num_key_value_heads=4, intermediate_size=96,
-            moe_intermediate_size=24, n_routed_experts=8, num_experts_per_tok=3, n_shared_experts=1,
-            first_k_dense_replace=1, num_hidden_layers=3, vocab_size=128, max_position_embeddings=256,
-            q_lora_rank=None, kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=8,
-            v_head_dim=10,    # not the qk head size, so narrower values, and padding them, are exercised
-            rope_parameters={
-                "rope_type": "yarn", "rope_theta": 10000.0, "factor": 4.0,
-                "mscale": 1.0, "mscale_all_dim": 0.707,    # unequal, so cos and sin are scaled too
-                "original_max_position_embeddings": 32, "beta_fast": 32, "beta_slow": 1,
-            },
-            initializer_range=0.1,
-        ),
-        **overrides,
-    })
+    return DeepseekV2Config(
+        **{
+            **dict(
+                hidden_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                intermediate_size=96,
+                moe_intermediate_size=24,
+                n_routed_experts=8,
+                num_experts_per_tok=3,
+                n_shared_experts=1,
+                first_k_dense_replace=1,
+                num_hidden_layers=3,
+                vocab_size=128,
+                max_position_embeddings=256,
+                q_lora_rank=None,
+                kv_lora_rank=16,
+                qk_nope_head_dim=12,
+                qk_rope_head_dim=8,
+                v_head_dim=10,  # not the qk head size, so narrower values, and padding them, are exercised
+                rope_parameters={
+                    "rope_type": "yarn",
+                    "rope_theta": 10000.0,
+                    "factor": 4.0,
+                    "mscale": 1.0,
+                    "mscale_all_dim": 0.707,  # unequal, so cos and sin are scaled too
+                    "original_max_position_embeddings": 32,
+                    "beta_fast": 32,
+                    "beta_slow": 1,
+                },
+                initializer_range=0.1,
+            ),
+            **overrides,
+        }
+    )
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +105,7 @@ def reference_logits(reference, tokens: list[int]) -> torch.Tensor:
 
 def row(tokens: list[int], num_cached: int, num_new: int, block_table: list[int], decode: bool = False) -> Sequence:
     """A sequence with num_cached tokens already in the cache and the next num_new scheduled."""
-    seq = Sequence(tokens[:num_cached + num_new])
+    seq = Sequence(tokens[: num_cached + num_new])
     seq.num_cached_tokens, seq.num_scheduled_tokens = num_cached, num_new
     seq.is_prefill = not decode
     seq.block_table = block_table
@@ -95,12 +114,12 @@ def row(tokens: list[int], num_cached: int, num_new: int, block_table: list[int]
 
 def step(runner, model, seqs: list[Sequence]) -> list[torch.Tensor]:
     """Logits at every scheduled position, split by row."""
-    register_layers(model)    # the op finds layers by name, and each config's model reuses the names
+    register_layers(model)  # the op finds layers by name, and each config's model reuses the names
     input_ids, positions, _, context = runner.prepare_batch(seqs)
     context["logits_indices"] = None
     with torch.inference_mode(), set_context(**context):
         logits = model.compute_logits(model(input_ids, positions))
-    batch = ModelRunner.decodes_first(seqs)    # the batch's row order, decode rows first
+    batch = ModelRunner.decodes_first(seqs)  # the batch's row order, decode rows first
     by_row = dict(zip(map(id, batch), logits.split([seq.num_scheduled_tokens for seq in batch])))
     return [by_row[id(seq)] for seq in seqs]
 
@@ -131,7 +150,7 @@ def test_paged_steps_match_transformers(models, runner, max_context_chunk, laten
         layer.max_context_chunk = max_context_chunk
         monkeypatch.setattr(layer, "pad_values", pad_values)
     a, b, c = (torch.randint(0, 128, (n,)).tolist() for n in (11, 8, 3))
-    table_a, table_b, table_c = [5, 2, 9], [7, 0], [3]    # scattered, so a wrong page walk shows
+    table_a, table_b, table_c = [5, 2, 9], [7, 0], [3]  # scattered, so a wrong page walk shows
 
     want_a, want_b, want_c = (reference_logits(reference, tokens) for tokens in (a, b, c))
 
@@ -145,13 +164,17 @@ def test_paged_steps_match_transformers(models, runner, max_context_chunk, laten
         seqs = [seq for seq, _ in rows]
         for (seq, want), got in zip(rows, step(runner, model, seqs)):
             start = seq.num_cached_tokens
-            torch.testing.assert_close(got, want[start:start + seq.num_scheduled_tokens], rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(got, want[start : start + seq.num_scheduled_tokens], rtol=1e-4, atol=1e-4)
 
 
 def test_context_chunks_split_long_rows_and_skip_empty_ones():
     # (first row, starts, lengths): row 0 splits three ways, row 1 has nothing cached, 2 and 3 share a chunk.
     assert plan_context_chunks([9, 0, 2, 3], budget=4) == [
-        (0, [0], [4]), (0, [4], [4]), (0, [8], [1]), (2, [0, 0], [2, 2]), (3, [2], [1]),
+        (0, [0], [4]),
+        (0, [4], [4]),
+        (0, [8], [1]),
+        (2, [0, 0], [2, 2]),
+        (3, [2], [1]),
     ]
 
 
@@ -187,10 +210,14 @@ def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkey
             return expand(latent)
 
         monkeypatch.setattr(layer, "expand", record_expand)
-    seqs = [row(c, 6, 2, tables[2]), row(a, 9, 1, tables[0], decode=True),
-            row(d, 0, 1, tables[3]), row(b, 6, 1, tables[1], decode=True)]
+    seqs = [
+        row(c, 6, 2, tables[2]),
+        row(a, 9, 1, tables[0], decode=True),
+        row(d, 0, 1, tables[3]),
+        row(b, 6, 1, tables[1], decode=True),
+    ]
     for seq, tokens, got in zip(seqs, [c, a, d, b], step(runner, model, seqs)):
-        want = reference_logits(reference, tokens)[seq.num_cached_tokens:]
+        want = reference_logits(reference, tokens)[seq.num_cached_tokens :]
         torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
     assert decoded == ([[10, 1, 7]] * len(layers) if latent_decode else [])
     if latent_decode:
@@ -206,7 +233,7 @@ class FakeAttention(torch.nn.Module):
         self.v_head_dim = v_head_dim
 
     def forward(self, q, latent):
-        return q[..., :self.v_head_dim] * 0.5
+        return q[..., : self.v_head_dim] * 0.5
 
 
 def pieces(model) -> tuple:
@@ -227,13 +254,16 @@ def unsplit(layer, positions, hidden_states, residual, attend):
         kv_lora = attn.kv_a_proj_with_mqa(hidden_states)
     else:
         q_c, kv_lora = attn.fused_qkv_a_proj(hidden_states).split(
-            [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim], dim=-1,
+            [attn.q_lora_rank, attn.kv_lora_rank + attn.qk_rope_head_dim],
+            dim=-1,
         )
         q = attn.q_b_proj(attn.q_a_layernorm(q_c))
     q = q.view(-1, attn.num_local_heads, attn.qk_head_dim)
     kv_c, k_pe = kv_lora.split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
     kv_c_normed = attn.kv_a_layernorm(kv_c)
-    q[..., attn.qk_nope_head_dim:], k_pe = attn.rotary_emb(positions, q[..., attn.qk_nope_head_dim:], k_pe.unsqueeze(1))
+    q[..., attn.qk_nope_head_dim :], k_pe = attn.rotary_emb(
+        positions, q[..., attn.qk_nope_head_dim :], k_pe.unsqueeze(1)
+    )
     o = attend(q, torch.cat([kv_c_normed, k_pe.squeeze(1)], dim=-1))
     hidden_states = attn.o_proj(o.view(-1, attn.num_local_heads * attn.v_head_dim))
     hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
@@ -261,7 +291,7 @@ def test_the_split_layer_matches_the_unsplit_one(models, first_layer):
 
 def test_the_pieces_need_no_attention_context(models):
     """What a graph replays cannot depend on this step's sequence layout."""
-    reset_context()    # any read of it would see an empty Context and misbehave
+    reset_context()  # any read of it would see an empty Context and misbehave
     _, model = models
     layer, attend, hidden_size = pieces(model)
     attn = layer.self_attn

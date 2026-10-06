@@ -6,8 +6,8 @@ import random
 import pytest
 import torch
 
-from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes
 from lean_vllm.attention import TorchAttention
+from lean_vllm.engine.model_runner import ModelRunner, cudagraph_capture_sizes
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import Attention, MLAAttention
 from lean_vllm.sampling_params import SamplingParams
@@ -57,6 +57,7 @@ def test_batch_preparation_on_tensor_parallel_ranks(runner, rank, decode):
 def test_run_returns_tokens_that_are_not_yet_fetched(runner, make_engine):
     """The engine awaits them later, so run() must not block on the device."""
     from lean_vllm.engine.sampled_tokens import SampledTokens
+
     engine = make_engine()
     engine.add([10, 11, 12], SamplingParams(temperature=0.0))
     scheduled = engine.scheduler.schedule().scheduled
@@ -73,6 +74,7 @@ def test_run_returns_tokens_that_are_not_yet_fetched(runner, make_engine):
 def test_a_pending_row_takes_its_input_from_the_previous_tokens(runner):
     """Its token was sampled by a step still in flight, so the host value is stale."""
     from lean_vllm.engine.sampled_tokens import SampledTokens
+
     seq = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
     seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = 3, 1, False
     seq.reserve_token()
@@ -88,6 +90,7 @@ def test_a_pending_row_takes_its_input_from_the_previous_tokens(runner):
 def test_the_fast_path_slices_a_previous_tensor_with_extra_rows(runner):
     """A request can finish between steps, so the previous tensor may outgrow this one."""
     from lean_vllm.engine.sampled_tokens import SampledTokens
+
     seq1 = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
     seq1.num_cached_tokens, seq1.num_scheduled_tokens, seq1.is_prefill = 3, 1, False
     seq1.reserve_token()
@@ -105,6 +108,7 @@ def test_the_fast_path_slices_a_previous_tensor_with_extra_rows(runner):
 def test_a_reordered_mapping_takes_the_general_path(runner):
     """Rows need not line up with the previous tensor, so each looks up its own index."""
     from lean_vllm.engine.sampled_tokens import SampledTokens
+
     seq1 = Sequence([10, 11, 12], SamplingParams(temperature=0.0))
     seq1.num_cached_tokens, seq1.num_scheduled_tokens, seq1.is_prefill = 3, 1, False
     seq1.reserve_token()
@@ -169,7 +173,7 @@ def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner
     decoding = Sequence([20, 21], SamplingParams(temperature=0.25))
     decoding.append_token(22)
     decoding.num_cached_tokens, decoding.num_scheduled_tokens, decoding.is_prefill = 2, 1, False
-    decoding.block_table = prompt.block_table = [0]    # any table, so the batch carries one
+    decoding.block_table = prompt.block_table = [0]  # any table, so the batch carries one
 
     ids, positions, temperatures, context = runner.prepare_batch([prompt, decoding])
 
@@ -278,7 +282,9 @@ class TestCudagraphMode:
     """What the layers' backends leave capturable. Pure: config and layers."""
 
     def mode(self, mode, *full_safe):
-        layers = [type("FakeLayer", (), {"supports_full_cudagraph": lambda self, safe=safe: safe})() for safe in full_safe]
+        layers = [
+            type("FakeLayer", (), {"supports_full_cudagraph": lambda self, safe=safe: safe})() for safe in full_safe
+        ]
         return ModelRunner._cudagraph_mode(mode, layers)
 
     def test_one_layer_that_cannot_be_captured_costs_the_full_graphs(self):
@@ -296,11 +302,15 @@ class TestFullCudagraphSupport:
 
     @staticmethod
     def backend(decodes_latents=True, full_safe=True, full=True):
-        return type("FakeBackend", (), {
-            "supports_mla_decode": staticmethod(lambda: decodes_latents),
-            "supports_full_cudagraph_mla_decode": staticmethod(lambda: full_safe),
-            "supports_full_cudagraph": staticmethod(lambda: full),
-        })
+        return type(
+            "FakeBackend",
+            (),
+            {
+                "supports_mla_decode": staticmethod(lambda: decodes_latents),
+                "supports_full_cudagraph_mla_decode": staticmethod(lambda: full_safe),
+                "supports_full_cudagraph": staticmethod(lambda: full),
+            },
+        )
 
     @staticmethod
     def mla_layer(backend):
@@ -381,7 +391,7 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
         assert context["is_prefill"]
         assert ids.tolist() == expected_ids
         assert positions.tolist() == expected_positions
-        assert len(seq.block_table) == 2    # replay uses the blocks reserved at admission
+        assert len(seq.block_table) == 2  # replay uses the blocks reserved at admission
         last = expected_positions == [8]
         # None until the chunk that samples: no row asks for a temperature before it.
         assert (temperatures.tolist() if last else temperatures) == ([1.0] if last else None)
@@ -402,8 +412,10 @@ class TestDummySamplerRun:
     @pytest.fixture
     def sampling_runner(self, runner):
         from types import SimpleNamespace
+
         runner.config = SimpleNamespace(
-            max_num_seqs=6, max_num_batched_tokens=1024, hf_config=SimpleNamespace(hidden_size=8))
+            max_num_seqs=6, max_num_batched_tokens=1024, hf_config=SimpleNamespace(hidden_size=8)
+        )
         runner.model = SimpleNamespace(compute_logits=lambda hidden: torch.zeros(hidden.size(0), 32))
         runner.sampled = []
         runner.sampler = lambda logits, temperatures: runner.sampled.append((logits.shape, temperatures))
@@ -411,7 +423,7 @@ class TestDummySamplerRun:
 
     def test_it_samples_one_row_per_sequence_off_the_greedy_path(self, sampling_runner):
         sampling_runner._dummy_sampler_run()
-        (shape, temperatures), = sampling_runner.sampled
+        ((shape, temperatures),) = sampling_runner.sampled
         assert shape == (6, 32)
         assert (temperatures > 0).all()
 
@@ -428,6 +440,7 @@ class TestDummySamplerRun:
     def test_running_out_of_memory_names_the_knobs(self, sampling_runner):
         def oom(logits, temperatures):
             raise torch.OutOfMemoryError("CUDA out of memory")
+
         sampling_runner.sampler = oom
         with pytest.raises(RuntimeError, match="lower max_num_seqs or gpu_memory_utilization"):
             sampling_runner._dummy_sampler_run()
@@ -447,8 +460,9 @@ def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
         if end == seq.num_planned_tokens:
             last_tokens[id(seq)] = out["cu_seqlens_q"][-1] - 1
         if seq.block_table:
-            out["slot_mapping"] += [seq.block_table[p // block_size] * block_size + p % block_size
-                                    for p in range(start, end)]
+            out["slot_mapping"] += [
+                seq.block_table[p // block_size] * block_size + p % block_size for p in range(start, end)
+            ]
     sampling = [seq for seq in seqs if id(seq) in last_tokens]
     out["logits_indices"] = [last_tokens[id(seq)] for seq in sampling]
     temperatures = [seq.temperature for seq in sampling] if rank == 0 else []
@@ -461,7 +475,7 @@ def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
 
 def random_batch(rng, block_size: int, with_tables: bool = True) -> list[Sequence]:
     """Decodes, cold prompts, resumed chunks and prefix-cache hits, in the scheduler's shuffled order."""
-    next_block = iter(rng.sample(range(10_000), 2_000))    # scattered, so a wrong page lookup shows
+    next_block = iter(rng.sample(range(10_000), 2_000))  # scattered, so a wrong page lookup shows
     seqs = []
     for _ in range(rng.randint(1, 24)):
         kind = rng.choice(["decode", "prompt", "chunk"])
@@ -480,7 +494,7 @@ def random_batch(rng, block_size: int, with_tables: bool = True) -> list[Sequenc
     return seqs
 
 
-DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])    # cuda stages through pinned buffers
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])  # cuda stages through pinned buffers
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -490,7 +504,7 @@ def test_the_numpy_batch_matches_the_per_token_loops(runner, device, rank):
     runner.rank, runner.device = rank, torch.device(device)
     rng = random.Random(rank)
     for step in range(20):
-        seqs = random_batch(rng, runner.block_size, with_tables=step % 5 != 0)    # every fifth is warmup-like
+        seqs = random_batch(rng, runner.block_size, with_tables=step % 5 != 0)  # every fifth is warmup-like
         check_batch(runner, seqs, reference_batch(seqs, runner.block_size, rank))
 
 
@@ -510,10 +524,14 @@ def check_batch(runner, seqs: list[Sequence], want: dict):
         assert context["logits_indices"].tolist() == want["logits_indices"]
     else:
         assert context["logits_indices"] is None and want["logits_indices"] == list(range(len(seqs)))
-    assert (context["block_tables"] is None if want["block_tables"] is None
-            else context["block_tables"].tolist() == want["block_tables"])
+    assert (
+        context["block_tables"] is None
+        if want["block_tables"] is None
+        else context["block_tables"].tolist() == want["block_tables"]
+    )
     assert (temperatures is None) == (want["temperatures"] is None)
     if temperatures is not None:
         assert temperatures.tolist() == pytest.approx(want["temperatures"])
-    assert runner._sampling_rows == [seq for seq in seqs if seq.num_cached_tokens + seq.num_scheduled_tokens
-                                     == seq.num_planned_tokens]
+    assert runner._sampling_rows == [
+        seq for seq in seqs if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_planned_tokens
+    ]

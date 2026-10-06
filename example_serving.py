@@ -1,7 +1,7 @@
 """example.py's two prompts, over HTTP with the official OpenAI SDK.
 
-    uv run lean-vllm serve ~/workspace/huggingface/Qwen3-0.6B --served-model-name qwen
-    uv run python example_serving.py
+uv run lean-vllm serve ~/workspace/huggingface/Qwen3-0.6B --served-model-name qwen
+uv run python example_serving.py
 """
 
 import asyncio
@@ -36,8 +36,8 @@ async def main():
         "introduce yourself",
         "list all prime numbers within 100",
     ]
-    async with AsyncOpenAI(api_key="unused", base_url=BASE_URL) as client:    # no auth is checked
-        model = (await client.models.list()).data[0].id    # whatever --served-model-name says
+    async with AsyncOpenAI(api_key="unused", base_url=BASE_URL) as client:  # no auth is checked
+        model = (await client.models.list()).data[0].id  # whatever --served-model-name says
         outputs = await asyncio.gather(*(ask(client, model, prompt) for prompt in prompts))
 
     for prompt, (text, ttft, total) in zip(prompts, outputs):

@@ -35,7 +35,9 @@ class Upstreams:
             return self.prefill_reply
         if body.get("stream"):
             # A stream, as off the network; a response built from text= counts as read already.
-            return httpx.Response(200, stream=httpx.ByteStream(SSE.encode()), headers={"content-type": "text/event-stream"})
+            return httpx.Response(
+                200, stream=httpx.ByteStream(SSE.encode()), headers={"content-type": "text/event-stream"}
+            )
         return httpx.Response(200, json={"choices": [{"text": "decoded"}], "kv_transfer_params": None})
 
 
@@ -61,8 +63,13 @@ def test_the_prefill_runs_one_token_and_hands_off(proxy, upstreams):
     complete(proxy, stream=True, stream_options={"include_usage": True})
     host, body = upstreams.sent[0]
     assert host == "prefill-a"
-    assert body == {"model": "m", "prompt": "hi", "max_tokens": 1, "stream": False,
-                    "kv_transfer_params": {"do_remote_decode": True}}
+    assert body == {
+        "model": "m",
+        "prompt": "hi",
+        "max_tokens": 1,
+        "stream": False,
+        "kv_transfer_params": {"do_remote_decode": True},
+    }
 
 
 def test_the_decode_gets_the_request_whole_and_the_params(proxy, upstreams):

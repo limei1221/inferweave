@@ -56,7 +56,7 @@ def test_dropping_a_reservation_restores_the_planned_count():
 def test_a_reserved_token_is_never_hashed():
     """A hash over an unsampled token would serve another request the wrong blocks."""
     seq = make([10, 11, 12])
-    seq.reserve_token()    # would complete block 0 of size 4
+    seq.reserve_token()  # would complete block 0 of size 4
     assert seq.block_hashes == []
     seq.commit_token(13)
     assert len(seq.block_hashes) == 1

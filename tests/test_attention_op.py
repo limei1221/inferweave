@@ -34,7 +34,7 @@ def decode_step():
     torch.manual_seed(0)
     with set_context(
         False,
-        slot_mapping=torch.tensor([-1], dtype=torch.int32),    # -1 skips the cache write
+        slot_mapping=torch.tensor([-1], dtype=torch.int32),  # -1 skips the cache write
         context_lens=torch.tensor([3], dtype=torch.int32),
         block_tables=torch.tensor([[0]], dtype=torch.int32),
     ):

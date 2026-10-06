@@ -14,7 +14,6 @@ def check(prompt: list[int], max_tokens: int = 1):
 
 
 class TestPromptValidation:
-
     @pytest.mark.parametrize("token_id", [VOCAB, VOCAB + 1, -1])
     def test_a_token_outside_the_vocabulary_is_refused(self, token_id):
         """Otherwise the embedding lookup raises, and that kills the engine thread."""

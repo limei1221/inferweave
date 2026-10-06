@@ -21,9 +21,17 @@ def test_a_variable_is_read_at_access(monkeypatch):
     assert envs.LEAN_PROFILE_STEPS == 7
 
 
-@pytest.mark.parametrize("value, expected", [
-    ("1", True), ("true", True), ("0", False), ("false", False), ("False", False), ("", False),
-])
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("1", True),
+        ("true", True),
+        ("0", False),
+        ("false", False),
+        ("False", False),
+        ("", False),
+    ],
+)
 def test_booleans_parse_like_the_profiler_always_did(monkeypatch, value, expected):
     monkeypatch.setenv("LEAN_PROFILE_CUDA", value)
     assert envs.LEAN_PROFILE_CUDA is expected
@@ -36,19 +44,22 @@ def test_an_empty_string_counts_as_unset(monkeypatch):
 
 def test_an_unknown_name_is_an_attribute_error():
     with pytest.raises(AttributeError, match="LEAN_NOT_A_VARIABLE"):
-        envs.LEAN_NOT_A_VARIABLE
+        _ = envs.LEAN_NOT_A_VARIABLE
 
 
 def test_the_device_override_is_honoured(monkeypatch):
     from lean_vllm.utils.device import get_device
+
     monkeypatch.setenv("LEAN_VLLM_DEVICE", "cpu")
     assert get_device().type == "cpu"
 
 
 def test_the_selector_reads_the_backend_variable(monkeypatch):
     import torch
+
     from lean_vllm.attention import LayerSpec
     from lean_vllm.attention.selector import get_attention_backend
+
     monkeypatch.setenv("LEAN_VLLM_ATTENTION_BACKEND", "nope")
     with pytest.raises(ValueError, match="unknown attention backend 'nope'"):
         get_attention_backend(LayerSpec(64, 4, 4, torch.float32))
@@ -56,6 +67,7 @@ def test_the_selector_reads_the_backend_variable(monkeypatch):
 
 def test_the_profiler_is_built_only_when_asked_for(monkeypatch, tmp_path):
     from lean_vllm.engine.llm_engine import _StepProfiler
+
     monkeypatch.delenv("LEAN_PROFILE_DIR", raising=False)
     assert _StepProfiler.from_env() is None
     monkeypatch.setenv("LEAN_PROFILE_DIR", str(tmp_path / "trace"))

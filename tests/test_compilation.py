@@ -16,14 +16,34 @@ from lean_vllm.utils.context import reset_context, set_context
 
 CONFIGS = {
     "qwen3": Qwen3Config(
-        hidden_size=32, num_attention_heads=4, num_key_value_heads=2, head_dim=8, intermediate_size=64,
-        num_hidden_layers=2, vocab_size=128, max_position_embeddings=64, architectures=["Qwen3ForCausalLM"],
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        vocab_size=128,
+        max_position_embeddings=64,
+        architectures=["Qwen3ForCausalLM"],
     ),
-    "deepseek_v2": DeepseekV2Config(    # MLA, then MoE after a dense layer
-        hidden_size=64, num_attention_heads=4, num_key_value_heads=4, intermediate_size=96,
-        moe_intermediate_size=24, n_routed_experts=8, num_experts_per_tok=3, n_shared_experts=1,
-        first_k_dense_replace=1, num_hidden_layers=3, vocab_size=128, max_position_embeddings=256,
-        q_lora_rank=None, kv_lora_rank=16, qk_nope_head_dim=12, qk_rope_head_dim=8, v_head_dim=10,
+    "deepseek_v2": DeepseekV2Config(  # MLA, then MoE after a dense layer
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        intermediate_size=96,
+        moe_intermediate_size=24,
+        n_routed_experts=8,
+        num_experts_per_tok=3,
+        n_shared_experts=1,
+        first_k_dense_replace=1,
+        num_hidden_layers=3,
+        vocab_size=128,
+        max_position_embeddings=256,
+        q_lora_rank=None,
+        kv_lora_rank=16,
+        qk_nope_head_dim=12,
+        qk_rope_head_dim=8,
+        v_head_dim=10,
         architectures=["DeepseekV2ForCausalLM"],
     ),
 }
@@ -39,13 +59,13 @@ def process_group():
 @pytest.fixture(params=list(CONFIGS))
 def model(request, process_group, monkeypatch):
     torch.manual_seed(0)
-    torch._dynamo.reset()    # unguarded entries must not outlive the model they were traced for
+    torch._dynamo.reset()  # unguarded entries must not outlive the model they were traced for
     config = CONFIGS[request.param]
     monkeypatch.setenv("LEAN_VLLM_ATTENTION_BACKEND", "torch")
     with torch.inference_mode():
         model = get_model_class(config)(config)
         for param in model.parameters():
-            param.normal_(0, 0.1)    # the weights are torch.empty until a checkpoint lands
+            param.normal_(0, 0.1)  # the weights are torch.empty until a checkpoint lands
     register_layers(model)
     yield model
     torch._dynamo.reset()
@@ -73,7 +93,7 @@ def prompt(runner, num_tokens: int) -> dict:
 @torch.inference_mode()
 def forward(model, input_ids, positions, context, traces=False, **extra) -> torch.Tensor:
     if traces:
-        mark_dynamic_tokens(input_ids, positions)    # as the runner does before the call that traces
+        mark_dynamic_tokens(input_ids, positions)  # as the runner does before the call that traces
     with set_context(**context, **extra):
         return model(input_ids, positions)
 
@@ -92,7 +112,7 @@ def test_the_compiled_model_matches_eager_at_every_size_from_one_compile(model, 
 
     got = [forward(model, **step, traces=i == 0) for i, step in enumerate(steps)]
 
-    assert len(backend.pieces) == len(model.model.layers) + 1    # a recompile would add pieces
+    assert len(backend.pieces) == len(model.model.layers) + 1  # a recompile would add pieces
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol=1e-4, atol=1e-4)
 
@@ -133,9 +153,9 @@ def test_a_piece_captures_once_per_size_then_replays(monkeypatch):
     x = torch.ones(3)
 
     with set_context(True):
-        assert torch.equal(piece(x), x * 2)    # no bucket: compiled code, no graph
+        assert torch.equal(piece(x), x * 2)  # no bucket: compiled code, no graph
     with set_context(True, piecewise_size=4):
-        captured = piece(x)    # warmup, then capture; a real graph's pool would keep this memory
+        captured = piece(x)  # warmup, then capture; a real graph's pool would keep this memory
         replayed = piece(x)
     assert len(calls) == 3 and FakeGraph.replays == 1 and list(piece.graphs) == [4]
     assert replayed.data_ptr() == captured.data_ptr() and torch.equal(replayed, x * 2)

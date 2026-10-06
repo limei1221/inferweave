@@ -32,6 +32,9 @@ class _Metric:
         self.name = name
         self.documentation = documentation
 
+    def render(self) -> list[str]:
+        raise NotImplementedError
+
     def _header(self) -> list[str]:
         return [f"# HELP {self.name} {self.documentation}", f"# TYPE {self.name} {self.kind}"]
 
@@ -124,21 +127,22 @@ def gpu_utilization() -> float | None:
             return None
         return float(torch.cuda.utilization())
     except Exception:
-        return None    # no NVML, no CUDA, or a driver that will not answer
+        return None  # no NVML, no CUDA, or a driver that will not answer
 
 
 class Metrics:
-
     def __init__(self):
         self.start_time = perf_counter()
-        self.lock = threading.Lock()    # so a render never catches a histogram mid-update
+        self.lock = threading.Lock()  # so a render never catches a histogram mid-update
 
         self.running = Gauge("lean_vllm:num_requests_running", "Requests in the running set.")
         self.waiting = Gauge("lean_vllm:num_requests_waiting", "Requests in the waiting queue.")
         self.kv_usage = Gauge("lean_vllm:kv_cache_usage_perc", "Fraction of KV blocks in use.")
 
         self.requests_received = Counter("lean_vllm:num_requests_received_total", "Requests admitted.")
-        self.requests_rejected = Counter("lean_vllm:num_requests_rejected_total", "Requests refused by admission control.")
+        self.requests_rejected = Counter(
+            "lean_vllm:num_requests_rejected_total", "Requests refused by admission control."
+        )
         self.requests_aborted = Counter("lean_vllm:num_requests_aborted_total", "Requests cancelled by their client.")
         self.requests_finished = Counter(
             "lean_vllm:request_success_total", "Requests that ran to a finish.", label="finished_reason"
@@ -155,19 +159,29 @@ class Metrics:
 
         self.steps = Counter("lean_vllm:num_steps_total", "Forward passes.")
         self.graph_steps = Counter("lean_vllm:num_graph_steps_total", "Forward passes replayed from a CUDA graph.")
-        self.eager_steps = Counter("lean_vllm:num_eager_steps_total", "Forward passes no CUDA graph covered.", label="reason")
+        self.eager_steps = Counter(
+            "lean_vllm:num_eager_steps_total", "Forward passes no CUDA graph covered.", label="reason"
+        )
         # Share of the clock, not the count: eager steps take longer each.
         self.step_seconds = Counter("lean_vllm:step_seconds_total", "Time in forward passes.", label="kind")
         self.model_busy = Counter("lean_vllm:model_busy_seconds_total", "Wall seconds spent inside a step.")
 
         self.ttft = Histogram("lean_vllm:time_to_first_token_seconds", "Arrival to first token.", LATENCY_BUCKETS)
-        self.tpot = Histogram("lean_vllm:request_time_per_output_token_seconds", "Mean seconds per token after the first.", TPOT_BUCKETS)
-        self.queue_time = Histogram("lean_vllm:request_queue_time_seconds", "Arrival to first schedule.", LATENCY_BUCKETS)
+        self.tpot = Histogram(
+            "lean_vllm:request_time_per_output_token_seconds", "Mean seconds per token after the first.", TPOT_BUCKETS
+        )
+        self.queue_time = Histogram(
+            "lean_vllm:request_queue_time_seconds", "Arrival to first schedule.", LATENCY_BUCKETS
+        )
         self.e2e = Histogram("lean_vllm:e2e_request_latency_seconds", "Arrival to finish.", LATENCY_BUCKETS)
         self.request_prompt_tokens = Histogram("lean_vllm:request_prompt_tokens", "Prompt length.", TOKEN_BUCKETS)
-        self.request_generation_tokens = Histogram("lean_vllm:request_generation_tokens", "Completion length.", TOKEN_BUCKETS)
+        self.request_generation_tokens = Histogram(
+            "lean_vllm:request_generation_tokens", "Completion length.", TOKEN_BUCKETS
+        )
         self.step_duration = Histogram("lean_vllm:step_duration_seconds", "Wall time of one step.", STEP_BUCKETS)
-        self.iteration_tokens = Histogram("lean_vllm:iteration_tokens_total", "Tokens in one step's batch.", BATCH_BUCKETS)
+        self.iteration_tokens = Histogram(
+            "lean_vllm:iteration_tokens_total", "Tokens in one step's batch.", BATCH_BUCKETS
+        )
 
     def record_received(self):
         with self.lock:
@@ -181,12 +195,12 @@ class Metrics:
         with self.lock:
             if request_output.finish_reason == "abort":
                 self.requests_aborted.inc()
-            else:    # ended by the server on a stop string: a completion, not a cancel
+            else:  # ended by the server on a stop string: a completion, not a cancel
                 self._record_finished(request_output)
 
     def record_step(self, scheduler, output, outputs, duration: float, step_kind: str):
         with self.lock:
-            if output:    # a step that scheduled nothing ran no model
+            if output:  # a step that scheduled nothing ran no model
                 self.steps.inc()
                 if step_kind in GRAPH_KINDS:
                     self.graph_steps.inc()
@@ -202,7 +216,7 @@ class Metrics:
             self.prefix_cache_queries.inc(output.num_queried_blocks)
             self.prefix_cache_hits.inc(output.num_cached_blocks)
             self.running.set(len(scheduler.running))
-            self.waiting.set(len(scheduler.waiting) + len(scheduler.recving))    # as vLLM, loads count as waiting
+            self.waiting.set(len(scheduler.waiting) + len(scheduler.recving))  # as vLLM, loads count as waiting
             self.kv_usage.set(scheduler.block_manager.usage)
             for request_output in outputs:
                 if request_output.finished:

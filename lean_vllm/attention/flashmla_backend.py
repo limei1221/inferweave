@@ -7,7 +7,7 @@ from lean_vllm.utils.context import Context
 _IMPORT_ERROR: ImportError | None = None
 try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-except ImportError as e:    # built from source, Hopper only
+except ImportError as e:  # built from source, Hopper only
     _IMPORT_ERROR = e
 
 
@@ -27,7 +27,7 @@ class FlashMLABackend(FlashAttention3Backend):
 
     @classmethod
     def validate(cls, spec: LayerSpec) -> list[str]:
-        reasons = super().validate(spec)    # FA3's, which runs the expanded prefill
+        reasons = super().validate(spec)  # FA3's, which runs the expanded prefill
         if spec.latent_dim and spec.latent_dim != 576:
             reasons.append(f"latent width {spec.latent_dim} is not the 512 + 64 FlashMLA decodes")
         return reasons
@@ -54,8 +54,13 @@ class FlashMLABackend(FlashAttention3Backend):
             # A holder the kernel fills with the schedule on the first layer's call; the rest reuse it.
             context.mla_decode_metadata, _ = get_mla_metadata()
         o, _ = flash_mla_with_kvcache(
-            q.unsqueeze(1), latent_cache.unsqueeze(-2),    # add a query length and a head dim of 1
-            context.block_tables, context.context_lens, v_dim,
-            context.mla_decode_metadata, softmax_scale=self.scale, causal=True,
+            q.unsqueeze(1),
+            latent_cache.unsqueeze(-2),  # add a query length and a head dim of 1
+            context.block_tables,
+            context.context_lens,
+            v_dim,
+            context.mla_decode_metadata,
+            softmax_scale=self.scale,
+            causal=True,
         )
-        return o.squeeze(1)    # match the [batch, heads, v_dim] contract
+        return o.squeeze(1)  # match the [batch, heads, v_dim] contract

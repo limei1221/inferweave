@@ -13,6 +13,7 @@ import pytest
 pytest.importorskip("zmq", reason="the serve extra is not installed")
 
 from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
+
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull
@@ -72,8 +73,8 @@ class AsyncInprocClient:
         try:
             self._loop.call_soon_threadsafe(self._has_work.set)
         except (AttributeError, RuntimeError):
-            pass    # never started, or the loop is closed
-        done, _ = wait([self._executor.submit(lambda: None)], timeout)    # queued behind the step in flight
+            pass  # never started, or the loop is closed
+        done, _ = wait([self._executor.submit(lambda: None)], timeout)  # queued behind the step in flight
         self._executor.shutdown(wait=bool(done))
 
     async def add_request_async(self, request_id, prompt, sampling_params):
@@ -121,7 +122,7 @@ class AsyncInprocClient:
                 if not (outputs or num_prefill_tokens or num_decode_tokens):
                     await asyncio.sleep(0.005)
         except Exception as error:
-            if not self._stopped:    # else a step refused by the shut-down executor
+            if not self._stopped:  # else a step refused by the shut-down executor
                 self.error = error
                 self._outputs.put_nowait(dead_error(error))
 
@@ -148,7 +149,7 @@ def make_async_engine():
     yield _make
     for engine, runner in engines:
         if isinstance(runner, GatedModelRunner):
-            runner.release(100)    # so a blocked step lets the stop finish
+            runner.release(100)  # so a blocked step lets the stop finish
         engine.stop(timeout=5)
 
 
@@ -166,7 +167,6 @@ async def collect(engine: AsyncLLM, tokens: int, prompt_ids: list[int]) -> list[
 
 
 class TestStreaming:
-
     @asyncio_test
     async def test_every_token_reaches_the_caller(self, make_async_engine):
         engine = make_async_engine()
@@ -204,15 +204,18 @@ class TestStreaming:
 
 
 class TestAbort:
-
     @pytest.mark.parametrize("spec_version", ["2.0", "2.4"])
     @pytest.mark.parametrize("disconnect_at", ["http.response.start", "http.response.body"])
     @asyncio_test
     async def test_chat_disconnect_before_tokens_frees_the_blocks(
-        self, make_async_engine, spec_version, disconnect_at,
+        self,
+        make_async_engine,
+        spec_version,
+        disconnect_at,
     ):
         pytest.importorskip("fastapi", reason="the serve extra is not installed")
         from starlette.requests import ClientDisconnect
+
         from lean_vllm.entrypoints.api_server import _serve
         from lean_vllm.entrypoints.protocol import ChatCompletionRequest
 
@@ -220,7 +223,9 @@ class TestAbort:
         blocks = fake_of(engine).scheduler.block_manager
         free_before = len(blocks.free_block_ids)
         body = ChatCompletionRequest(
-            model="fake", messages=[{"role": "user", "content": "hi"}], stream=True,
+            model="fake",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
         )
         response = await _serve(engine, "fake", body, prompt(8), chat=True)
         disconnected = asyncio.Event()
@@ -230,7 +235,7 @@ class TestAbort:
                 if spec_version == "2.4":
                     raise OSError("client disconnected")
                 disconnected.set()
-                await asyncio.Future()    # cancelled by the disconnect listener
+                await asyncio.Future()  # cancelled by the disconnect listener
 
         async def receive():
             await disconnected.wait()
@@ -243,7 +248,7 @@ class TestAbort:
         else:
             await asyncio.wait_for(response(scope, receive, send), timeout=1)
 
-        runner_of(engine).release()    # drain the abort after the in-flight step
+        runner_of(engine).release()  # drain the abort after the in-flight step
         await settle(engine)
         assert not engine.output_processor.request_states
         assert not fake_of(engine).scheduler.seqs
@@ -258,12 +263,12 @@ class TestAbort:
         free_before = len(blocks.free_block_ids)
 
         outputs = await engine.add_request(prompt(8), FOREVER)
-        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
+        runner_of(engine).release(2)  # the launch that emits nothing, then the one that drains it
         await outputs.__anext__()
         assert len(blocks.free_block_ids) < free_before
 
         await outputs.aclose()
-        runner_of(engine).release()    # the abort lands once the step in flight returns
+        runner_of(engine).release()  # the abort lands once the step in flight returns
         await settle(engine)
         assert len(blocks.free_block_ids) == free_before
         assert not fake_of(engine).scheduler.seqs
@@ -275,15 +280,15 @@ class TestAbort:
         blocks = fake_of(engine).scheduler.block_manager
         free_before = len(blocks.free_block_ids)
         await engine.add_request(prompt(8), FOREVER, "running")
-        await wait_until(engine.engine_core._lock.locked)    # its step is blocked in the runner
+        await wait_until(engine.engine_core._lock.locked)  # its step is blocked in the runner
 
         adding = asyncio.create_task(engine.add_request(prompt(8, 100), FOREVER, "cancelled"))
-        await asyncio.sleep(0)    # now waiting on that step
+        await asyncio.sleep(0)  # now waiting on that step
         adding.cancel()
         with pytest.raises(asyncio.CancelledError):
             await adding
 
-        engine.abort("running")    # never iterated, so no generator finally will
+        engine.abort("running")  # never iterated, so no generator finally will
         runner_of(engine).release()
         await settle(engine)
         assert not fake_of(engine).scheduler.seqs
@@ -302,11 +307,11 @@ class TestAbort:
         """The server ends it through abort, but the client did not cancel it."""
         engine = make_async_engine(gated=True)
         outputs = await engine.add_request(prompt(8), FOREVER, "stopped")
-        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
+        runner_of(engine).release(2)  # the launch that emits nothing, then the one that drains it
         await outputs.__anext__()
 
         engine.abort("stopped", "stop")
-        await outputs.aclose()    # its own abort lands after, on a finished request
+        await outputs.aclose()  # its own abort lands after, on a finished request
         runner_of(engine).release()
         await settle(engine)
         assert fake_of(engine).metrics.requests_aborted.total == 0
@@ -315,7 +320,6 @@ class TestAbort:
 
 
 class TestAdmission:
-
     @asyncio_test
     async def test_closing_a_finished_stream_preserves_a_reused_request_id(self, make_async_engine):
         engine = make_async_engine(gated=True)
@@ -337,9 +341,9 @@ class TestAdmission:
     async def test_a_full_queue_is_refused_before_any_output(self, make_async_engine):
         """The 429 must surface from add_request, while a status code can still be chosen."""
         engine = make_async_engine(gated=True, max_waiting_requests=1, num_kvcache_blocks=1)
-        await engine.add_request(prompt(1), FOREVER)    # occupies the cache
+        await engine.add_request(prompt(1), FOREVER)  # occupies the cache
         waiting = asyncio.create_task(engine.add_request(prompt(8, 100), FOREVER))
-        await asyncio.sleep(0)    # enqueue before releasing the current step
+        await asyncio.sleep(0)  # enqueue before releasing the current step
         runner_of(engine).release()
         await waiting
 
@@ -360,8 +364,8 @@ class TestAdmission:
             await asyncio.wait_for(engine.add_request(prompt(8, 100), FOREVER, "twice"), timeout=1)
         assert set(engine.output_processor.request_states) == {"twice"}
 
-        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
-        output = await asyncio.wait_for(outputs.__anext__(), timeout=1)    # a stranded stream hangs here
+        runner_of(engine).release(2)  # the launch that emits nothing, then the one that drains it
+        output = await asyncio.wait_for(outputs.__anext__(), timeout=1)  # a stranded stream hangs here
         assert output.token_ids
 
         await outputs.aclose()
@@ -391,12 +395,11 @@ class TestAdmission:
 
 
 class TestEngineDeath:
-
     @asyncio_test
     async def test_a_live_stream_gets_the_error(self, make_async_engine):
         engine = make_async_engine(gated=True)
         outputs = await engine.add_request(prompt(8), FOREVER)
-        runner_of(engine).release(2)    # the launch that emits nothing, then the one that drains it
+        runner_of(engine).release(2)  # the launch that emits nothing, then the one that drains it
         await outputs.__anext__()
 
         kill(engine)
@@ -418,7 +421,6 @@ class TestEngineDeath:
 
 
 class TestShutdown:
-
     @asyncio_test
     async def test_stop_ends_an_idle_loop(self):
         """Waiting for work rather than polling, so only the stop can end it."""
@@ -444,7 +446,7 @@ class TestShutdown:
     async def test_stop_ends_a_loop_polling_on_outstanding_work(self):
         fake = FakeLLMEngine(FakeConfig(), FakeModelRunner())
         fake.is_finished = lambda: False
-        fake.step = lambda: ([], 0, 0)    # work outstanding, but nothing can be stepped
+        fake.step = lambda: ([], 0, 0)  # work outstanding, but nothing can be stepped
         engine = AsyncLLM(AsyncInprocClient(fake))
         engine.start()
         await asyncio.sleep(0.05)
@@ -457,7 +459,7 @@ class TestShutdown:
         engine = make_async_engine(gated=True)
         outputs = await engine.add_request(prompt(8), FOREVER)
         stopping = asyncio.create_task(asyncio.to_thread(engine.stop, 5))
-        await asyncio.sleep(0.05)    # the stop waits on the step blocked in the runner
+        await asyncio.sleep(0.05)  # the stop waits on the step blocked in the runner
         runner_of(engine).release()
         await stopping
         with pytest.raises(EngineDeadError, match="shutting down"):
@@ -468,6 +470,7 @@ class TestShutdown:
 
 def kill(engine: AsyncLLM):
     """Blow up the next step, the way an exception in the runner would."""
+
     def explode():
         raise RuntimeError("boom")
 

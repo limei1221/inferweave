@@ -59,6 +59,8 @@ dev = [
     # example_serving.py. Pinned below 3: openai 3.x streams over httpx2, which
     # prints a cosmetic teardown traceback that makes a working example look broken.
     "openai>=2.0.0,<3",
+    "ruff",
+    "mypy",
 ]
 
 [project.urls]
@@ -73,6 +75,26 @@ filterwarnings = [
     # torch.jit.script_method internally. torch warning about its own API; drop on upgrade.
     'ignore:`torch\.jit\.script_method` is deprecated:DeprecationWarning',
 ]
+
+[tool.ruff]
+line-length = 120    # what the code is written to
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+    "E501",    # the formatter owns line length; what it cannot wrap is long strings and comments
+    "B905",    # zip(strict=) on every call is noise where lengths match by construction
+    "B027",    # optional hooks on an ABC are empty on purpose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"lean_vllm/attention/triton_mla_decode.py" = ["E741"]    # m, l, acc: the online-softmax names
+
+[tool.mypy]
+files = ["lean_vllm"]
+python_version = "3.10"
+ignore_missing_imports = true    # triton, flash_attn, flashinfer and xxhash ship no stubs
 
 [tool.uv]
 required-version = ">=0.12"    # what wrote the committed lock

@@ -32,7 +32,6 @@ def deltas(tokenizer, text: str, prompt: str = "", skip_special_tokens: bool = T
 
 
 class TestFastIncrementalDetokenizer:
-
     def test_ascii_arrives_one_character_at_a_time(self, byte_tokenizer):
         assert deltas(byte_tokenizer, "hey") == ["h", "e", "y"]
 
@@ -73,7 +72,6 @@ class TestFastIncrementalDetokenizer:
 
 
 class TestLoadTokenizer:
-
     def test_a_fast_tokenizer_is_accepted(self, byte_tokenizer, tmp_path):
         byte_tokenizer.save_pretrained(tmp_path)
         assert isinstance(llm_engine.load_tokenizer(str(tmp_path)), PreTrainedTokenizerFast)
@@ -88,6 +86,7 @@ class TestLoadTokenizer:
 @pytest.fixture(scope="module")
 def tokenizer():
     from transformers import AutoTokenizer
+
     return AutoTokenizer.from_pretrained(MODEL, use_fast=True)
 
 

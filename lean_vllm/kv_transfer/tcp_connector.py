@@ -30,8 +30,8 @@ from lean_vllm.kv_transfer.base import (
 
 logger = logging.getLogger(__name__)
 
-_HEADER = struct.Struct("!IQ")    # JSON length, then payload length
-REGISTRATION_WAIT = 30.0    # how long a read waits for the engine to hand its request's blocks over
+_HEADER = struct.Struct("!IQ")  # JSON length, then payload length
+REGISTRATION_WAIT = 30.0  # how long a read waits for the engine to hand its request's blocks over
 SOCKET_TIMEOUT = 60.0
 
 
@@ -63,7 +63,6 @@ def recv_exact(sock: socket.socket, n: int) -> bytearray:
 
 
 class TcpConnectorScheduler(KVConnectorScheduler):
-
     def __init__(self, config):
         self.kv_transfer = config.kv_transfer
         self.block_size = config.kvcache_block_size
@@ -89,8 +88,8 @@ class TcpConnectorScheduler(KVConnectorScheduler):
 
     def update_state_after_alloc(self, seq, num_external_tokens: int):
         params = seq.kv_transfer_params
-        params["do_remote_prefill"] = False    # one load per request, so a preempted one recomputes
-        num_local_blocks = seq.num_cached_tokens // self.block_size    # prefix-cache hits here are not read
+        params["do_remote_prefill"] = False  # one load per request, so a preempted one recomputes
+        num_local_blocks = seq.num_cached_tokens // self.block_size  # prefix-cache hits here are not read
         self._reqs_to_recv[seq.request_id] = ReqToRecv(
             local_block_ids=seq.block_table[num_local_blocks:],
             remote_block_ids=params["remote_block_ids"][num_local_blocks:],
@@ -110,7 +109,7 @@ class TcpConnectorScheduler(KVConnectorScheduler):
         # As vLLM: only a prefill that ran to its max_tokens hands over; a stop or abort ends there.
         if not params or not params.get("do_remote_decode") or seq.finish_reason != "length":
             return False, None
-        block_ids = seq.block_table[:_cdiv(seq.num_prompt_tokens, self.block_size)]
+        block_ids = seq.block_table[: _cdiv(seq.num_prompt_tokens, self.block_size)]
         self._reqs_to_send[seq.request_id] = block_ids
         kv = self.kv_transfer
         return True, dict(
@@ -131,28 +130,28 @@ class _Server(socketserver.ThreadingTCPServer):
 
 
 class TcpConnectorWorker(KVConnectorWorker):
-
     def __init__(self, config, rank: int):
         self.kv_transfer = config.kv_transfer
         self.rank = rank
         self.block_size = config.kvcache_block_size
         self.kv_caches: list[torch.Tensor] = []
         self.layout: dict = {}
-        self._lock = threading.Condition()    # guards the three below, shared with the server and loader threads
-        self._reqs_to_send: dict[str, tuple[set[int], float]] = {}    # request -> (its blocks, when to give up)
-        self._reading: Counter[str] = Counter()    # reads in progress, which expiry must wait out
+        self._lock = threading.Condition()  # guards the three below, shared with the server and loader threads
+        self._reqs_to_send: dict[str, tuple[set[int], float]] = {}  # request -> (its blocks, when to give up)
+        self._reading: Counter[str] = Counter()  # reads in progress, which expiry must wait out
         self._finished = KVConnectorOutput()
         self._recv_queue: queue.Queue = queue.Queue()
-        self._peers: dict[tuple[str, int], tuple[socket.socket, str]] = {}    # loader thread only
+        self._peers: dict[tuple[str, int], tuple[socket.socket, str]] = {}  # loader thread only
         self._server: _Server | None = None
         self._threads: list[threading.Thread] = []
 
     def register_kv_caches(self, kv_caches: list[torch.Tensor]):
         self.kv_caches = kv_caches
         # What a peer must match: the same blocks, in the same layout, layer for layer.
-        self.layout = dict(block_size=self.block_size, layers=[
-            [str(cache.dtype), [cache.size(0), *cache.shape[2:]]] for cache in kv_caches
-        ])
+        self.layout = dict(
+            block_size=self.block_size,
+            layers=[[str(cache.dtype), [cache.size(0), *cache.shape[2:]]] for cache in kv_caches],
+        )
         kv = self.kv_transfer
         if kv.is_producer:
             port = kv.kv_port + self.rank
@@ -187,8 +186,11 @@ class TcpConnectorWorker(KVConnectorWorker):
         with self._lock:
             for request_id, (_, deadline) in list(self._reqs_to_send.items()):
                 if deadline < now and not self._reading[request_id]:
-                    logger.warning("freeing the KV blocks of %s, which no decode instance read in %.0f s",
-                                   request_id, envs.LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT)
+                    logger.warning(
+                        "freeing the KV blocks of %s, which no decode instance read in %.0f s",
+                        request_id,
+                        envs.LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT,
+                    )
                     self._release(request_id)
             finished, self._finished = self._finished, KVConnectorOutput()
         return finished
@@ -271,7 +273,7 @@ class TcpConnectorWorker(KVConnectorWorker):
             with torch.cuda.stream(stream) if stream is not None else nullcontext():
                 index = torch.tensor(block_ids, device=self.kv_caches[0].device)
                 for cache in self.kv_caches:
-                    chunk = cache.index_select(1, index).cpu()    # blocking, so the bytes are there to send
+                    chunk = cache.index_select(1, index).cpu()  # blocking, so the bytes are there to send
                     sock.sendall(chunk.flatten().view(torch.uint8).numpy())
         finally:
             with self._lock:
@@ -289,8 +291,13 @@ class TcpConnectorWorker(KVConnectorWorker):
                 self._load(req, ready, stream)
                 failed = False
             except Exception as error:
-                logger.warning("loading the KV of %s from %s:%d failed, so it prefills here: %s",
-                               request_id, req.remote_host, req.remote_port + self.rank, error)
+                logger.warning(
+                    "loading the KV of %s from %s:%d failed, so it prefills here: %s",
+                    request_id,
+                    req.remote_host,
+                    req.remote_port + self.rank,
+                    error,
+                )
                 failed = True
             with self._lock:
                 (self._finished.failed_recving if failed else self._finished.finished_recving).add(request_id)
@@ -308,7 +315,7 @@ class TcpConnectorWorker(KVConnectorWorker):
             recv_message(sock)
         except BaseException:
             self._peers.pop(key, None)
-            sock.close()    # its stream position is unknown
+            sock.close()  # its stream position is unknown
             raise
         if not reply["ok"]:
             raise RuntimeError(reply["error"])
@@ -338,7 +345,7 @@ class TcpConnectorWorker(KVConnectorWorker):
             sock, peer_engine_id = self._peers[key]
             if peer_engine_id == engine_id:
                 return sock
-            del self._peers[key]    # restarted since, so ask afresh
+            del self._peers[key]  # restarted since, so ask afresh
             sock.close()
         sock = socket.create_connection(key, timeout=SOCKET_TIMEOUT)
         try:
@@ -348,8 +355,10 @@ class TcpConnectorWorker(KVConnectorWorker):
             if reply["engine_id"] != engine_id:
                 raise RuntimeError(f"{key[0]}:{key[1]} is engine {reply['engine_id']}, not {engine_id}; it restarted")
             if reply["layout"] != self.layout:
-                raise RuntimeError(f"{key[0]}:{key[1]} lays its KV cache out as {reply['layout']}, "
-                                   f"this engine as {self.layout}; serve the same model, dtype and block size")
+                raise RuntimeError(
+                    f"{key[0]}:{key[1]} lays its KV cache out as {reply['layout']}, "
+                    f"this engine as {self.layout}; serve the same model, dtype and block size"
+                )
         except BaseException:
             sock.close()
             raise

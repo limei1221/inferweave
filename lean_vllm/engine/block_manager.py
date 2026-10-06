@@ -5,7 +5,6 @@ from lean_vllm.engine.sequence import Sequence
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
@@ -45,7 +44,6 @@ class FreeBlockQueue:
 
 
 class BlockManager:
-
     def __init__(self, num_blocks: int, block_size: int, enable_prefix_caching: bool = True):
         self.block_size = block_size
         self.enable_prefix_caching = enable_prefix_caching
@@ -83,7 +81,7 @@ class BlockManager:
                 break
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
-                num_new_blocks -= 1    # already held, so it costs no free block
+                num_new_blocks -= 1  # already held, so it costs no free block
         if len(self.free_block_ids) < num_new_blocks:
             return -1
         return num_cached_blocks
@@ -100,7 +98,7 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
+        for _ in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
         seq.num_published_blocks = num_cached_blocks
@@ -112,7 +110,7 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
-        seq.num_published_blocks = 0    # the new block table has published nothing
+        seq.num_published_blocks = 0  # the new block table has published nothing
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:

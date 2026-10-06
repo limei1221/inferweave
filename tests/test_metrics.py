@@ -3,6 +3,7 @@
 import pytest
 
 from lean_vllm.engine.metrics import Counter, Gauge, Histogram, Metrics
+from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -13,7 +14,6 @@ def prompt(n: int, start: int = 0) -> list[int]:
 
 
 class TestExposition:
-
     def test_a_counter_renders_its_total(self):
         counter = Counter("lean_vllm:things_total", "Things.")
         counter.inc()
@@ -62,7 +62,6 @@ class TestExposition:
 
 
 class TestEngineRecording:
-
     def test_a_finished_request_lands_in_the_latency_histograms(self, make_engine):
         engine = make_engine()
         engine.add(prompt(8), SamplingParams(max_tokens=3, ignore_eos=True))
@@ -70,7 +69,7 @@ class TestEngineRecording:
         metrics = engine.metrics
         assert metrics.ttft.count == 1 and metrics.e2e.count == 1
         assert metrics.queue_time.count == 1
-        assert metrics.tpot.count == 1    # three tokens, so there is a per-token rate
+        assert metrics.tpot.count == 1  # three tokens, so there is a per-token rate
         assert metrics.requests_finished.values == {"length": 1}
 
     def test_a_one_token_request_records_no_tpot(self, make_engine):
@@ -86,8 +85,8 @@ class TestEngineRecording:
         engine.add(prompt(8), SamplingParams(max_tokens=3, ignore_eos=True))
         engine.run_to_completion()
         metrics = engine.metrics
-        assert metrics.prefill_tokens.total == 8      # one chunk of the whole prompt
-        assert metrics.decode_tokens.total == 2       # the prefill step sampled the first token
+        assert metrics.prefill_tokens.total == 8  # one chunk of the whole prompt
+        assert metrics.decode_tokens.total == 2  # the prefill step sampled the first token
         assert metrics.prompt_tokens.total == 8 and metrics.generation_tokens.total == 3
 
     def test_queue_depths_and_kv_usage_are_gauged(self, make_engine):
@@ -97,7 +96,7 @@ class TestEngineRecording:
         engine.step()
         assert engine.metrics.running.value == 2
         assert engine.metrics.waiting.value == 0
-        assert engine.metrics.kv_usage.value == 1.0    # both blocks taken
+        assert engine.metrics.kv_usage.value == 1.0  # both blocks taken
 
     def test_the_kv_usage_peak_outlives_the_drain(self, make_engine):
         """The benchmark reads the summary once, after everything finished."""
@@ -107,7 +106,7 @@ class TestEngineRecording:
         engine.run_to_completion()
         summary = engine.metrics.summary()
         assert summary["kv_cache_usage"] == 0.0
-        assert summary["kv_cache_usage_peak"] == 1.0    # both blocks were taken while they ran
+        assert summary["kv_cache_usage_peak"] == 1.0  # both blocks were taken while they ran
 
     def test_preemptions_are_counted(self, make_engine):
         engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8, max_num_seqs=2)
@@ -121,17 +120,17 @@ class TestEngineRecording:
         engine = make_engine()
         engine.add(prompt(16), FOREVER)
         engine.step()
-        engine.add(prompt(16), FOREVER)    # same prompt, so one full block hits
+        engine.add(prompt(16), FOREVER)  # same prompt, so one full block hits
         engine.step()
         metrics = engine.metrics
-        assert metrics.prefix_cache_queries.total == 4    # two blocks each
-        assert metrics.prefix_cache_hits.total == 1       # the trailing block is never a candidate
+        assert metrics.prefix_cache_queries.total == 4  # two blocks each
+        assert metrics.prefix_cache_hits.total == 1  # the trailing block is never a candidate
         assert engine.metrics.summary()["prefix_cache_hit_rate"] == 0.25
 
     def test_admission_outcomes_are_counted(self, make_engine):
         engine = make_engine(max_waiting_requests=1, num_kvcache_blocks=1)
-        engine.add(prompt(16), FOREVER)    # too big for the cache, so it stays waiting
-        with pytest.raises(Exception):
+        engine.add(prompt(16), FOREVER)  # too big for the cache, so it stays waiting
+        with pytest.raises(QueueFull):
             engine.add(prompt(16, 100), FOREVER)
         assert engine.metrics.requests_received.total == 1
         assert engine.metrics.requests_rejected.total == 1
@@ -147,18 +146,18 @@ class TestEngineRecording:
 
 
 class TestSummary:
-
     def test_the_summary_reports_rates_not_raw_pairs(self, make_engine):
         engine = make_engine()
         engine.add(prompt(8), SamplingParams(max_tokens=2, ignore_eos=True))
         engine.run_to_completion()
         summary = engine.metrics.summary()
         assert summary["requests"]["finished"] == {"length": 1}
-        assert summary["graph_step_fraction"] == 0.0    # the fake runner captures no graphs
+        assert summary["graph_step_fraction"] == 0.0  # the fake runner captures no graphs
         assert summary["eager_steps"] == {"enforced": summary["steps"]}
         # the same clock as model_busy, split by kind
         assert summary["step_seconds"]["enforced"] == pytest.approx(
-            summary["model_busy_fraction"] * summary["uptime_seconds"])
+            summary["model_busy_fraction"] * summary["uptime_seconds"]
+        )
         assert 0 < summary["model_busy_fraction"] <= 1
         assert summary["latency"]["e2e"]["count"] == 1
 

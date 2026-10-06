@@ -1,7 +1,6 @@
 """The KV connector's worker halves over real sockets, a producer and a consumer in one process, on CPU caches."""
 
 import socket
-import threading
 from dataclasses import dataclass
 from time import monotonic, sleep
 
@@ -17,8 +16,8 @@ from lean_vllm.kv_transfer import (
     TcpConnectorWorker,
     check_kv_transfer_params,
     parse_kv_transfer_config,
+    tcp_connector,
 )
-from lean_vllm.kv_transfer import tcp_connector
 
 NUM_BLOCKS, BLOCK = 12, 4
 
@@ -60,8 +59,13 @@ def make_worker():
         worker.shutdown()
 
 
-def recv(producer: TcpConnectorWorker, local: list[int], remote: list[int], request_id: str = "p-1",
-         engine_id: str = "engine") -> ReqToRecv:
+def recv(
+    producer: TcpConnectorWorker,
+    local: list[int],
+    remote: list[int],
+    request_id: str = "p-1",
+    engine_id: str = "engine",
+) -> ReqToRecv:
     kv = producer.kv_transfer
     return ReqToRecv(local, remote, request_id, engine_id, kv.kv_ip, kv.kv_port - producer.rank)
 
@@ -76,7 +80,6 @@ def wait_for(worker: TcpConnectorWorker, timeout: float = 10.0) -> KVConnectorOu
 
 
 class TestTransfer:
-
     def test_the_blocks_land_exactly_in_the_consumer_s_own_blocks(self, make_worker):
         producer = make_worker("kv_producer", make_caches(0))
         consumer = make_worker("kv_consumer", make_caches(1))
@@ -121,9 +124,14 @@ class TestTransfer:
         producer = make_worker("kv_producer", make_caches(0))
         consumer = make_worker("kv_consumer", make_caches(1))
         producer.start_load_kv(KVConnectorMetadata(reqs_to_send={"p-1": [1], "p-2": [2]}))
-        consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={
-            "d-1": recv(producer, [5], [1], "p-1"), "d-2": recv(producer, [6], [2], "p-2"),
-        }))
+        consumer.start_load_kv(
+            KVConnectorMetadata(
+                reqs_to_recv={
+                    "d-1": recv(producer, [5], [1], "p-1"),
+                    "d-2": recv(producer, [6], [2], "p-2"),
+                }
+            )
+        )
         finished = set()
         while len(finished) < 2:
             finished |= wait_for(consumer).finished_recving
@@ -142,7 +150,6 @@ class TestTransfer:
 
 
 class TestFailures:
-
     def test_a_request_never_handed_over_fails_the_load(self, make_worker, monkeypatch, caplog):
         monkeypatch.setattr(tcp_connector, "REGISTRATION_WAIT", 0.1)
         producer = make_worker("kv_producer", make_caches(0))
@@ -172,9 +179,13 @@ class TestFailures:
         producer = make_worker("kv_producer", make_caches(0), engine_id="after-restart")
         consumer = make_worker("kv_consumer", make_caches(1))
         producer.start_load_kv(KVConnectorMetadata(reqs_to_send={"p-1": [4]}))
-        consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={
-            "d-1": recv(producer, [0], [4], engine_id="before-restart"),
-        }))
+        consumer.start_load_kv(
+            KVConnectorMetadata(
+                reqs_to_recv={
+                    "d-1": recv(producer, [0], [4], engine_id="before-restart"),
+                }
+            )
+        )
         assert wait_for(consumer).failed_recving == {"d-1"}
         assert "it restarted" in caplog.text
 
@@ -207,7 +218,6 @@ class TestFailures:
 
 
 class TestAggregator:
-
     def test_a_transfer_finishes_once_every_rank_reports_it(self):
         aggregator = KVOutputAggregator(world_size=2)
         assert not aggregator.aggregate([KVConnectorOutput(finished_recving={"a"}), KVConnectorOutput()])
@@ -216,27 +226,37 @@ class TestAggregator:
 
     def test_one_rank_failing_fails_the_load(self):
         aggregator = KVOutputAggregator(world_size=2)
-        result = aggregator.aggregate([KVConnectorOutput(failed_recving={"a"}), KVConnectorOutput(finished_recving={"a"})])
+        result = aggregator.aggregate(
+            [KVConnectorOutput(failed_recving={"a"}), KVConnectorOutput(finished_recving={"a"})]
+        )
         assert result == KVConnectorOutput(failed_recving={"a"})
 
     def test_sends_count_the_same_way(self):
         aggregator = KVOutputAggregator(world_size=2)
         assert not aggregator.aggregate([KVConnectorOutput(finished_sending={"a"}), KVConnectorOutput()])
-        assert aggregator.aggregate([KVConnectorOutput(), KVConnectorOutput(finished_sending={"a"})]).finished_sending == {"a"}
+        assert aggregator.aggregate(
+            [KVConnectorOutput(), KVConnectorOutput(finished_sending={"a"})]
+        ).finished_sending == {"a"}
 
 
 class TestConfig:
-
     def test_the_json_flag_parses(self):
         kv_transfer = parse_kv_transfer_config('{"kv_role": "kv_consumer", "kv_port": 15000}')
-        assert (kv_transfer.kv_connector, kv_transfer.kv_role, kv_transfer.kv_port) == ("TcpConnector", "kv_consumer", 15000)
+        assert (kv_transfer.kv_connector, kv_transfer.kv_role, kv_transfer.kv_port) == (
+            "TcpConnector",
+            "kv_consumer",
+            15000,
+        )
         assert kv_transfer.is_consumer and not kv_transfer.is_producer
 
-    @pytest.mark.parametrize("value, message", [
-        ('{"kv_role": "decoder"}', "unknown kv_role"),
-        ('{"kv_connector": "NixlConnector"}', "unknown kv_connector"),
-        ('{"kv_buffer_size": 1}', "unknown kv_transfer_config keys"),
-    ])
+    @pytest.mark.parametrize(
+        "value, message",
+        [
+            ('{"kv_role": "decoder"}', "unknown kv_role"),
+            ('{"kv_connector": "NixlConnector"}', "unknown kv_connector"),
+            ('{"kv_buffer_size": 1}', "unknown kv_transfer_config keys"),
+        ],
+    )
     def test_a_bad_flag_is_named(self, value, message):
         with pytest.raises(ValueError, match=message):
             parse_kv_transfer_config(value)
@@ -246,23 +266,31 @@ class TestConfig:
 
 
 class TestRequestParams:
-
     BOTH = KVTransferConfig(kv_role="kv_both")
-    PULL = dict(do_remote_prefill=True, remote_block_ids=[1], remote_request_id="p", remote_engine_id="e",
-                remote_host="h", remote_port=1)
+    PULL = dict(
+        do_remote_prefill=True,
+        remote_block_ids=[1],
+        remote_request_id="p",
+        remote_engine_id="e",
+        remote_host="h",
+        remote_port=1,
+    )
 
     def test_well_formed_params_pass(self):
         assert check_kv_transfer_params({"do_remote_decode": True}, self.BOTH) is None
         assert check_kv_transfer_params(self.PULL, self.BOTH) is None
 
-    @pytest.mark.parametrize("params, kv_role, message", [
-        ({"do_remote_decode": True}, None, "needs an engine started with kv_transfer_config"),
-        ({"do_remote_decode": True}, "kv_consumer", "do_remote_decode needs kv_role"),
-        (PULL, "kv_producer", "do_remote_prefill needs kv_role"),
-        (PULL | {"remote_port": "1"}, "kv_both", "remote_port, a int"),
-        (PULL | {"remote_block_ids": ["x"]}, "kv_both", "remote_block_ids must be integers"),
-        ({k: v for k, v in PULL.items() if k != "remote_host"}, "kv_both", "remote_host"),
-    ])
+    @pytest.mark.parametrize(
+        "params, kv_role, message",
+        [
+            ({"do_remote_decode": True}, None, "needs an engine started with kv_transfer_config"),
+            ({"do_remote_decode": True}, "kv_consumer", "do_remote_decode needs kv_role"),
+            (PULL, "kv_producer", "do_remote_prefill needs kv_role"),
+            (PULL | {"remote_port": "1"}, "kv_both", "remote_port, a int"),
+            (PULL | {"remote_block_ids": ["x"]}, "kv_both", "remote_block_ids must be integers"),
+            ({k: v for k, v in PULL.items() if k != "remote_host"}, "kv_both", "remote_host"),
+        ],
+    )
     def test_what_the_engine_cannot_honour_is_named(self, params, kv_role, message):
         kv_transfer = KVTransferConfig(kv_role=kv_role) if kv_role else None
         assert message in check_kv_transfer_params(params, kv_transfer)

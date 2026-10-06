@@ -9,11 +9,12 @@ from lean_vllm.utils.context import Context, split_decodes_and_prefills
 @dataclass(frozen=True, slots=True)
 class LayerSpec:
     """What one attention layer asks of a backend; the selector picks a backend per layer by it."""
-    head_size: int    # of queries and keys; an MLA layer's expanded prefill head
+
+    head_size: int  # of queries and keys; an MLA layer's expanded prefill head
     num_heads: int
     num_kv_heads: int
     dtype: torch.dtype
-    latent_dim: int = 0    # an MLA layer's cached latent width; 0 for a layer that caches keys and values
+    latent_dim: int = 0  # an MLA layer's cached latent width; 0 for a layer that caches keys and values
 
     @property
     def kind(self) -> str:
@@ -190,6 +191,7 @@ class AttentionBackend(ABC):
             return self.prefill(q, k, v, k_cache, v_cache, context)
         n, decodes, prefills = split_decodes_and_prefills(context)
         if decodes is None:
+            assert prefills is not None
             return self.prefill(q, k, v, k_cache, v_cache, prefills)
         if prefills is None:
             return self.decode(q, k_cache, v_cache, decodes)

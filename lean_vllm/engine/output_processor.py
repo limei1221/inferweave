@@ -34,12 +34,11 @@ class AsyncStream:
 
 @dataclass(slots=True)
 class RequestState:
-    detokenizer: FastIncrementalDetokenizer | None    # None without a tokenizer: outputs keep the core's text
-    stream: AsyncStream | None    # None offline, where outputs are returned instead
+    detokenizer: FastIncrementalDetokenizer | None  # None without a tokenizer: outputs keep the core's text
+    stream: AsyncStream | None  # None offline, where outputs are returned instead
 
 
 class OutputProcessor:
-
     def __init__(self, tokenizer: PreTrainedTokenizerFast | None):
         self.tokenizer = tokenizer
         self.request_states: dict[str, RequestState] = {}
@@ -65,7 +64,7 @@ class OutputProcessor:
         for output in outputs:
             state = self.request_states.get(output.request_id)
             if state is None:
-                continue    # aborted since the step
+                continue  # aborted since the step
             if state.detokenizer is not None:
                 output.text = "".join(state.detokenizer.decode(token_id) for token_id in output.token_ids)
             if output.finished:

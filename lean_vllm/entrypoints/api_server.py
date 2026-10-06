@@ -4,7 +4,7 @@ import asyncio
 import json
 from contextlib import aclosing, asynccontextmanager
 from time import time
-from typing import AsyncIterator, Awaitable
+from typing import AsyncGenerator, Awaitable, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -152,8 +152,8 @@ async def _serve(
         return _RequestStreamingResponse(stream, engine, request_id)
     reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
     if reply is None:
-        engine.abort(request_id)    # the generators may never have started, so no finally ran
-        return Response(status_code=499)    # nobody is left to read it
+        engine.abort(request_id)  # the generators may never have started, so no finally ran
+        return Response(status_code=499)  # nobody is left to read it
     return reply
 
 
@@ -167,7 +167,7 @@ async def _unless_disconnected(request: Request | None, work: Awaitable):
         await asyncio.wait((task, listener), return_when=asyncio.FIRST_COMPLETED)
     finally:
         listener.cancel()
-        task.cancel()    # a no-op once done
+        task.cancel()  # a no-op once done
         await asyncio.wait((task,))
     return None if task.cancelled() else task.result()
 
@@ -178,7 +178,10 @@ async def _disconnected(request: Request):
 
 
 async def _deltas(
-    outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLM, request_id: str,
+    outputs: AsyncGenerator[RequestOutput, None],
+    checker: StopChecker,
+    engine: AsyncLLM,
+    request_id: str,
 ):
     """Yields (text, finish_reason, num_completion_tokens, kv_transfer_params); the last has a reason."""
     num_tokens = 0
@@ -187,12 +190,12 @@ async def _deltas(
             num_tokens += len(output.token_ids)
             text = checker.push(output.text)
             if checker.matched:
-                engine.abort(request_id, "stop")    # frees the blocks, counted as a finish rather than a cancel
+                engine.abort(request_id, "stop")  # frees the blocks, counted as a finish rather than a cancel
                 yield text, "stop", num_tokens, None
                 return
             if output.finished:
                 if output.finish_reason not in FINISH_REASONS:
-                    status = DROP_STATUS.get(output.finish_reason, 503)
+                    status = DROP_STATUS.get(output.finish_reason or "", 503)
                     raise HTTPException(status, f"the engine dropped the request: {output.finish_reason}")
                 reason = FINISH_REASONS[output.finish_reason]
                 yield text + checker.flush(), reason, num_tokens, output.kv_transfer_params
@@ -205,7 +208,7 @@ async def _deltas(
 
 async def _collect(deltas, request_id: str, model: str, num_prompt_tokens: int, chat: bool):
     text, finish_reason, num_tokens, kv_transfer_params = "", "stop", 0, None
-    async for delta, reason, num_tokens, kv_transfer_params in deltas:
+    async for delta, reason, num_tokens, kv_transfer_params in deltas:  # noqa: B007 - the last values are kept
         text += delta
         finish_reason = reason or finish_reason
     usage = protocol.usage(num_prompt_tokens, num_tokens)
@@ -213,25 +216,35 @@ async def _collect(deltas, request_id: str, model: str, num_prompt_tokens: int, 
         message = protocol.ChatMessage(role="assistant", content=text)
         choice = protocol.ChatCompletionResponseChoice(index=0, message=message, finish_reason=finish_reason)
         return protocol.ChatCompletionResponse(
-            id=request_id, model=model, choices=[choice], usage=usage, kv_transfer_params=kv_transfer_params,
+            id=request_id,
+            model=model,
+            choices=[choice],
+            usage=usage,
+            kv_transfer_params=kv_transfer_params,
         )
-    choice = protocol.CompletionResponseChoice(index=0, text=text, finish_reason=finish_reason, logprobs=None)
+    text_choice = protocol.CompletionResponseChoice(index=0, text=text, finish_reason=finish_reason, logprobs=None)
     return protocol.CompletionResponse(
-        id=request_id, model=model, choices=[choice], usage=usage, kv_transfer_params=kv_transfer_params,
+        id=request_id,
+        model=model,
+        choices=[text_choice],
+        usage=usage,
+        kv_transfer_params=kv_transfer_params,
     )
 
 
 async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_prompt_tokens: int, chat: bool):
     created = int(time())
+    response: type[BaseModel]
     if chat:
         response, kind = protocol.ChatCompletionStreamResponse, "chat.completion.chunk"
     else:
         response, kind = protocol.CompletionStreamResponse, "text_completion"
 
     def chunk(choices: list, **extra) -> str:
-        return _event(response(id=request_id, object=kind, created=created, model=model, choices=choices, **extra))
+        # kind is the literal its response class asks for, a pairing mypy cannot follow
+        return _event(response(id=request_id, object=kind, created=created, model=model, choices=choices, **extra))  # type: ignore[arg-type]
 
-    def choice(text: str, reason: str | None, role: str | None = None):
+    def choice(text: str, reason: str | None, role: Literal["assistant"] | None = None):
         if not chat:
             return protocol.CompletionResponseChoice(index=0, text=text, finish_reason=reason, logprobs=None)
         delta = protocol.DeltaMessage(role=role, content=text) if role else protocol.DeltaMessage(content=text)
@@ -242,7 +255,7 @@ async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_pr
         if chat:
             yield chunk([choice("", None, role="assistant")])
         try:
-            async for delta, reason, num_tokens, _ in deltas:
+            async for delta, reason, num_tokens, _ in deltas:  # noqa: B007 - the last count is kept
                 yield chunk([choice(delta, reason)])
         except (EngineDeadError, HTTPException) as error:
             # The 200 is already sent, so the error rides in the stream.

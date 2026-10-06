@@ -20,7 +20,11 @@ from tqdm import tqdm
 from transformers import AutoConfig
 
 from lean_vllm.layers.fused_moe import (
-    CONFIG_DIR, fused_experts, get_config_file_name, silu_and_mul, try_get_optimal_moe_config,
+    CONFIG_DIR,
+    fused_experts,
+    get_config_file_name,
+    silu_and_mul,
+    try_get_optimal_moe_config,
 )
 
 BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096]
@@ -33,7 +37,7 @@ SEARCH_SPACE = dict(
     num_warps=[4, 8],
     num_stages=[2, 3, 4, 5],
 )
-CACHE_CLEAR_INTERVAL = 50    # configs between clearing compiled kernels, which otherwise pile up
+CACHE_CLEAR_INTERVAL = 50  # configs between clearing compiled kernels, which otherwise pile up
 
 
 def search_space() -> list[dict]:
@@ -54,8 +58,16 @@ def model_shape(path: str, tp_size: int, enable_expert_parallel: bool) -> tuple[
     return E, N, config.hidden_size, config.num_experts_per_tok
 
 
-def benchmark_config(config: dict | None, num_tokens: int, E: int, N: int, hidden_size: int, top_k: int,
-                     dtype: torch.dtype, num_iters: int) -> float:
+def benchmark_config(
+    config: dict | None,
+    num_tokens: int,
+    E: int,
+    N: int,
+    hidden_size: int,
+    top_k: int,
+    dtype: torch.dtype,
+    num_iters: int,
+) -> float:
     """Mean microseconds per call: 10 calls in one CUDA graph, replayed num_iters times on fresh routing."""
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     gate_up_proj = torch.randn(E, 2 * N, hidden_size, dtype=dtype)
@@ -74,7 +86,7 @@ def benchmark_config(config: dict | None, num_tokens: int, E: int, N: int, hidde
         fused_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, silu_and_mul, config=config)
 
     prepare(0)
-    run()    # compiles, and raises OutOfResources for a config that does not fit
+    run()  # compiles, and raises OutOfResources for a config that does not fit
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -110,8 +122,8 @@ def tune(num_tokens: int, shape: tuple, dtype: torch.dtype, configs: list[dict])
         try:
             # 20 iterations, as vLLM's tuner: enough to rank, not to report.
             kernel_time = benchmark_config(config, num_tokens, *shape, dtype, num_iters=20)
-        except triton.runtime.autotuner.OutOfResources:    # the path vLLM catches
-            continue    # too much shared memory or too many registers for this GPU
+        except triton.runtime.autotuner.OutOfResources:  # the path vLLM catches
+            continue  # too much shared memory or too many registers for this GPU
         if kernel_time < best_time:
             best_config, best_time = config, kernel_time
         if i and i % CACHE_CLEAR_INTERVAL == 0:

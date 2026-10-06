@@ -8,15 +8,24 @@ from lean_vllm.kv_transfer import KVConnectorOutput, KVTransferConfig
 from lean_vllm.sampling_params import SamplingParams
 
 BLOCK = 8
-PROMPT = list(range(100, 120))    # 20 tokens: three blocks, the last partial
+PROMPT = list(range(100, 120))  # 20 tokens: three blocks, the last partial
 
 
 def remote_prefill(num_blocks: int = 3, **overrides) -> dict:
     """What a producer's request_finished hands back, for blocks 50, 51, ..."""
-    return dict(
-        do_remote_prefill=True, do_remote_decode=False, remote_request_id="p-1", remote_engine_id="prefill-engine",
-        remote_block_ids=list(range(50, 50 + num_blocks)), remote_host="10.0.0.1", remote_port=14579, tp_size=1,
-    ) | overrides
+    return (
+        dict(
+            do_remote_prefill=True,
+            do_remote_decode=False,
+            remote_request_id="p-1",
+            remote_engine_id="prefill-engine",
+            remote_block_ids=list(range(50, 50 + num_blocks)),
+            remote_host="10.0.0.1",
+            remote_port=14579,
+            tp_size=1,
+        )
+        | overrides
+    )
 
 
 @pytest.fixture
@@ -24,22 +33,28 @@ def make_disagg_engine(make_engine):
     def _make(role: str = "kv_both", **overrides):
         kv_transfer = KVTransferConfig(kv_role=role, kv_ip="10.0.0.2", kv_port=15000, engine_id="this-engine")
         return make_engine(kvcache_block_size=BLOCK, kv_transfer=kv_transfer, **overrides)
+
     return _make
 
 
 def recvs(engine) -> dict:
     """Every load the runner has been asked to start, by request."""
-    return {request_id: req for metadata in engine.model_runner.kv_metadata
-            for request_id, req in metadata.reqs_to_recv.items()}
+    return {
+        request_id: req
+        for metadata in engine.model_runner.kv_metadata
+        for request_id, req in metadata.reqs_to_recv.items()
+    }
 
 
 def sends(engine) -> dict:
-    return {request_id: block_ids for metadata in engine.model_runner.kv_metadata
-            for request_id, block_ids in metadata.reqs_to_send.items()}
+    return {
+        request_id: block_ids
+        for metadata in engine.model_runner.kv_metadata
+        for request_id, block_ids in metadata.reqs_to_send.items()
+    }
 
 
 class TestDecodeSide:
-
     def test_a_remote_prefill_waits_for_its_blocks_without_running(self, make_disagg_engine):
         engine = make_disagg_engine()
         seq = engine.add(PROMPT, SamplingParams(max_tokens=4, kv_transfer_params=remote_prefill()), "d-1")
@@ -71,7 +86,7 @@ class TestDecodeSide:
         seq = engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), "d-1")
         engine.step()
         req = recvs(engine)["d-1"]
-        assert seq.num_cached_tokens == 2 * BLOCK    # the trailing block always recomputes
+        assert seq.num_cached_tokens == 2 * BLOCK  # the trailing block always recomputes
         assert req.local_block_ids == seq.block_table[2:]
         assert req.remote_block_ids == [52]
 
@@ -128,7 +143,7 @@ class TestDecodeSide:
         engine.run_to_completion()
         assert list(recvs(engine)) == ["d-1"]
         is_prefill, [(_, num_tokens)] = engine.model_runner.batches[num_batches]
-        assert is_prefill and num_tokens > 1    # recomputed here, past its local prefix hits
+        assert is_prefill and num_tokens > 1  # recomputed here, past its local prefix hits
 
     def test_whole_prompt_scheduling_admits_a_load_bigger_than_the_budget(self, make_disagg_engine):
         """Chunked prefill off refuses prompts over the budget, but a load computes one token."""
@@ -149,7 +164,6 @@ class TestDecodeSide:
 
 
 class TestPrefillSide:
-
     def test_a_finished_prefill_holds_its_blocks_and_says_where_they_are(self, make_disagg_engine):
         engine = make_disagg_engine()
         params = {"do_remote_decode": True}
@@ -158,10 +172,16 @@ class TestPrefillSide:
         final = [output for output in engine.step() + engine.step() if output.finished]
         assert len(final) == 1 and final[0].finish_reason == "length"
         assert final[0].kv_transfer_params == dict(
-            do_remote_prefill=True, do_remote_decode=False, remote_request_id="p-1", remote_engine_id="this-engine",
-            remote_block_ids=seq.block_table, remote_host="10.0.0.2", remote_port=15000, tp_size=1,
+            do_remote_prefill=True,
+            do_remote_decode=False,
+            remote_request_id="p-1",
+            remote_engine_id="this-engine",
+            remote_block_ids=seq.block_table,
+            remote_host="10.0.0.2",
+            remote_port=15000,
+            tp_size=1,
         )
-        assert block_table == [] and len(seq.block_table) == 3    # allocated at admission, after the add
+        assert block_table == [] and len(seq.block_table) == 3  # allocated at admission, after the add
         assert len(engine.scheduler.block_manager.used_block_ids) == 3
         assert not engine.is_finished()
         engine.step()
@@ -244,8 +264,11 @@ def test_decode_waits_for_blocks_held_by_a_transfer(make_disagg_engine, async_sc
     assert not local.is_finished
     assert local.num_completion_tokens == 1
 
-    done = (KVConnectorOutput(finished_sending={"remote"}) if transfer == "sending"
-            else KVConnectorOutput(finished_recving={"remote"}))
+    done = (
+        KVConnectorOutput(finished_sending={"remote"})
+        if transfer == "sending"
+        else KVConnectorOutput(finished_recving={"remote"})
+    )
     engine.model_runner.kv_outputs.append(done)
     rest = engine.run_to_completion()
     tokens = [token for output in outputs if output.request_id == "local" for token in output.token_ids]

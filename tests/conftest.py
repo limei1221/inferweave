@@ -1,11 +1,12 @@
 """A scheduler harness with no torch, no model and no GPU, so scheduling is testable on a laptop."""
 
 import asyncio
-import pytest
 from dataclasses import dataclass
-from time import perf_counter
 from functools import wraps
 from itertools import count
+from time import perf_counter
+
+import pytest
 
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
@@ -20,6 +21,7 @@ EOS = 7
 @dataclass
 class FakeConfig:
     """The fields Scheduler reads. Config itself needs a model directory on disk."""
+
     num_kvcache_blocks: int = 64
     kvcache_block_size: int = 8
     max_num_seqs: int = 8
@@ -33,9 +35,9 @@ class FakeConfig:
     max_waiting_requests: int = 0
     request_timeout: float = 0.0
     long_prefill_token_threshold: int = 0
-    async_scheduling: bool = False    # off, unlike Config: most tests count steps in sync order
+    async_scheduling: bool = False  # off, unlike Config: most tests count steps in sync order
     tensor_parallel_size: int = 1
-    kv_transfer: object = None    # a KVTransferConfig turns the connector on
+    kv_transfer: object = None  # a KVTransferConfig turns the connector on
 
 
 class FakeSampledTokens:
@@ -54,8 +56,8 @@ class FakeModelRunner:
     def __init__(self, eos_after: dict[str, int] | None = None):
         self.eos_after = eos_after or {}
         self.batches: list[tuple[bool, list[tuple[str, int]]]] = []
-        self.kv_metadata: list = []    # what each kv_connector_step was handed
-        self.kv_outputs: list = []    # what the next ones report, oldest first
+        self.kv_metadata: list = []  # what each kv_connector_step was handed
+        self.kv_outputs: list = []  # what the next ones report, oldest first
 
     def kv_connector_step(self, metadata):
         self.kv_metadata.append(metadata)
@@ -92,7 +94,6 @@ class FakeModelRunner:
 class FakeEngine:
     """LLMEngine.step without the model. Mirrors it deliberately: change both together."""
 
-
     def __init__(self, config: FakeConfig, runner: FakeModelRunner):
         self.config = config
         self.scheduler = Scheduler(config)
@@ -100,9 +101,11 @@ class FakeEngine:
         self.metrics = Metrics()
         self.last_output = None
         self.in_flight = None
-        self.profiler = None    # real LLMEngine exposes one; the async loop reads it
+        self.profiler = None  # real LLMEngine exposes one; the async loop reads it
 
-    def add(self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None) -> Sequence:
+    def add(
+        self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None
+    ) -> Sequence:
         seq = Sequence(prompt, sampling_params or SamplingParams(), request_id)
         try:
             self.scheduler.add(seq)
@@ -140,7 +143,8 @@ class FakeEngine:
                 finish_reason=seq.finish_reason,
                 metrics=seq.metrics(),
             )
-            for seq in output.dropped if seq not in stepped
+            for seq in output.dropped
+            if seq not in stepped
         ]
         # attributed to the step this call launched
         self.metrics.record_step(self.scheduler, output, outputs, perf_counter() - started, "enforced")
@@ -180,7 +184,7 @@ class FakeEngine:
 class FakeLLMEngine(FakeEngine):
     """LLMEngine's surface, so the core clients can drive it without a model."""
 
-    tokenizer = None    # the async engine only needs one for str prompts
+    tokenizer = None  # the async engine only needs one for str prompts
 
     def add_request(self, prompt: list[int], sampling_params=None, request_id: str | None = None) -> str:
         return self.add(prompt, sampling_params, request_id).request_id
@@ -189,13 +193,15 @@ class FakeLLMEngine(FakeEngine):
         seq = self.scheduler.seqs.get(request_id)
         aborted = self.scheduler.abort(request_id, reason)
         if aborted:
-            self.metrics.record_aborted(RequestOutput(
-                request_id=request_id,
-                token_ids=[],
-                finished=True,
-                finish_reason=seq.finish_reason,
-                metrics=seq.metrics(),
-            ))
+            self.metrics.record_aborted(
+                RequestOutput(
+                    request_id=request_id,
+                    token_ids=[],
+                    finished=True,
+                    finish_reason=seq.finish_reason,
+                    metrics=seq.metrics(),
+                )
+            )
         return aborted
 
     def step(self) -> tuple[list[RequestOutput], int, int]:
@@ -205,9 +211,11 @@ class FakeLLMEngine(FakeEngine):
 
 def asyncio_test(test):
     """No async plugin in the dev group, so each test drives its own loop."""
+
     @wraps(test)
     def wrapper(*args, **kwargs):
         return asyncio.run(test(*args, **kwargs))
+
     return wrapper
 
 
@@ -215,19 +223,19 @@ def asyncio_test(test):
 def _reset_sequence_globals():
     """What Sequence takes from Config, plus the id counter, is class state."""
     saved = (Sequence.block_size, Sequence.enable_prefix_caching, Sequence.hash_algo, Sequence.counter)
-    Sequence.counter = count()    # so seq ids are deterministic per test
+    Sequence.counter = count()  # so seq ids are deterministic per test
     yield
-    (Sequence.block_size, Sequence.enable_prefix_caching,
-     Sequence.hash_algo, Sequence.counter) = saved
+    (Sequence.block_size, Sequence.enable_prefix_caching, Sequence.hash_algo, Sequence.counter) = saved
 
 
 @pytest.fixture
 def make_engine():
     def _make(eos_after: dict[int, int] | None = None, **overrides) -> FakeEngine:
         config = FakeConfig(**overrides)
-        Sequence.counter = count()    # each engine gets its own seq ids, so two engines compare like-for-like
+        Sequence.counter = count()  # each engine gets its own seq ids, so two engines compare like-for-like
         Sequence.block_size = config.kvcache_block_size
         Sequence.enable_prefix_caching = config.enable_prefix_caching
         Sequence.hash_algo = config.prefix_caching_hash_algo
         return FakeEngine(config, FakeModelRunner(eos_after))
+
     return _make

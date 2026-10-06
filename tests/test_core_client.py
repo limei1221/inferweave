@@ -12,10 +12,10 @@ import pytest
 
 pytest.importorskip("zmq", reason="the serve extra is not installed")
 
+from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
-from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.core_client import AsyncMPClient
 from lean_vllm.engine.exceptions import EngineDeadError
@@ -40,12 +40,12 @@ class ScriptedModelRunner(FakeModelRunner):
 
 
 class ExplodingModelRunner(FakeModelRunner):
-
     def run(self, seqs):
         raise RuntimeError("boom")
 
 
 # Factories run in the core process, so they must be importable from there: module level only.
+
 
 def fake_engine(script: list[int] | None = None, explode: bool = False, **overrides) -> FakeLLMEngine:
     config = FakeConfig(**overrides)
@@ -78,7 +78,6 @@ async def collect(client: AsyncLLM, prompt: list[int], params: SamplingParams):
 
 
 class TestAcrossTheProcess:
-
     @asyncio_test
     async def test_every_token_reaches_the_caller(self, make_client):
         client = make_client()
@@ -118,7 +117,6 @@ class TestAcrossTheProcess:
 
 
 class TestAdmissionAndAbort:
-
     @asyncio_test
     async def test_closing_a_finished_stream_preserves_a_reused_request_id(self, make_client):
         client = make_client(kv_transfer=KVTransferConfig(kv_role="kv_consumer"))
@@ -126,13 +124,20 @@ class TestAdmissionAndAbort:
         assert (await asyncio.wait_for(anext(first), 10)).finished
         # The fake worker leaves this transfer pending, so the replacement
         # cannot finish before the old generator's cleanup reaches the core.
-        params = SamplingParams(max_tokens=2, kv_transfer_params=dict(
-            do_remote_prefill=True, remote_request_id="producer", remote_engine_id="producer-engine",
-            remote_block_ids=[0], remote_host="127.0.0.1", remote_port=14579,
-        ))
+        params = SamplingParams(
+            max_tokens=2,
+            kv_transfer_params=dict(
+                do_remote_prefill=True,
+                remote_request_id="producer",
+                remote_engine_id="producer-engine",
+                remote_block_ids=[0],
+                remote_host="127.0.0.1",
+                remote_port=14579,
+            ),
+        )
         second = await client.add_request([20], params, "reused")
         await first.aclose()
-        summary = await client.metrics_summary()    # processed after any abort sent by cleanup
+        summary = await client.metrics_summary()  # processed after any abort sent by cleanup
         assert summary["requests"]["aborted"] == 0
         assert "reused" in client.output_processor.request_states
         client.abort("reused")
@@ -142,7 +147,7 @@ class TestAdmissionAndAbort:
     async def test_a_full_queue_is_refused_before_any_output(self, make_client):
         client = make_client(max_num_seqs=1, max_waiting_requests=1)
         running = await client.add_request(list(range(8)), FOREVER)
-        await anext(running)    # scheduled, so the waiting queue is empty again
+        await anext(running)  # scheduled, so the waiting queue is empty again
         waiting = await client.add_request(list(range(8)), FOREVER)
         with pytest.raises(QueueFull):
             await client.add_request(list(range(8)), FOREVER)
@@ -164,7 +169,6 @@ class TestAdmissionAndAbort:
 
 
 class TestDeath:
-
     def test_a_core_that_cannot_build_its_engine_fails_the_constructor(self):
         with pytest.raises(RuntimeError, match="failed to start") as raised:
             AsyncMPClient(failing_engine)
@@ -208,6 +212,7 @@ ENGINE_ARGS = dict(enforce_eager=True, kvcache_memory_gb=0.25, max_model_len=256
 def generate(prompt: str, params: SamplingParams) -> dict:
     """LLMEngine.generate, in a process of its own so its process group never meets this one's."""
     from lean_vllm.engine.llm_engine import LLMEngine
+
     return LLMEngine(MODEL, **ENGINE_ARGS).generate([prompt], params, use_tqdm=False)[0]
 
 

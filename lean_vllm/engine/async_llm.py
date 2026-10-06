@@ -5,7 +5,7 @@ moves requests in and outputs out.
 """
 
 import asyncio
-from typing import AsyncIterator, Callable
+from typing import AsyncGenerator, Callable
 from uuid import uuid4
 
 from lean_vllm.engine.core_client import AsyncMPClient
@@ -17,7 +17,6 @@ from lean_vllm.sampling_params import SamplingParams
 
 
 class AsyncLLM:
-
     def __init__(self, engine_core: AsyncMPClient, tokenizer=None):
         """Without a tokenizer, prompts must be token ids and outputs keep the core's text."""
         self.engine_core = engine_core
@@ -25,7 +24,7 @@ class AsyncLLM:
         self.output_processor = OutputProcessor(tokenizer)
         self.error: BaseException | None = None
         self.on_death: Callable[[], None] | None = None
-        self._death = ""    # the message every later EngineDeadError carries
+        self._death = ""  # the message every later EngineDeadError carries
         self._stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._output_handler: asyncio.Task | None = None
@@ -34,6 +33,7 @@ class AsyncLLM:
     def from_engine_args(cls, model: str, **kwargs) -> "AsyncLLM":
         from lean_vllm.engine.core import make_engine
         from lean_vllm.engine.llm_engine import load_tokenizer
+
         return cls(AsyncMPClient(make_engine, (model,), kwargs), load_tokenizer(model))
 
     @property
@@ -59,10 +59,9 @@ class AsyncLLM:
         prompt: str | list[int],
         sampling_params: SamplingParams,
         request_id: str | None = None,
-    ) -> AsyncIterator[RequestOutput]:
+    ) -> AsyncGenerator[RequestOutput, None]:
         """Per-step outputs; closing the generator aborts. Admission settles first, so a status code is still choosable."""
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+        token_ids: list[int] = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
         request_id = request_id or f"req-{uuid4().hex}"
         if request_id in self.output_processor.request_states:
             # The scheduler would refuse it too, but only after this stream replaced the live one.
@@ -73,18 +72,18 @@ class AsyncLLM:
             raise self._dead_error()
         # Ready before the add is sent: the first token may arrive before this coroutine resumes.
         stream = AsyncStream()
-        self.output_processor.add_request(request_id, prompt, sampling_params.skip_special_tokens, stream)
+        self.output_processor.add_request(request_id, token_ids, sampling_params.skip_special_tokens, stream)
         try:
-            await self.engine_core.add_request_async(request_id, prompt, sampling_params)
+            await self.engine_core.add_request_async(request_id, token_ids, sampling_params)
         except asyncio.CancelledError:
-            self.abort(request_id)    # the core may have taken it before the cancel
+            self.abort(request_id)  # the core may have taken it before the cancel
             raise
-        except BaseException:    # refused, or the engine is gone
+        except BaseException:  # refused, or the engine is gone
             self.output_processor.abort_request(request_id)
             raise
         return self._generate(request_id, stream)
 
-    async def _generate(self, request_id: str, stream: AsyncStream) -> AsyncIterator[RequestOutput]:
+    async def _generate(self, request_id: str, stream: AsyncStream) -> AsyncGenerator[RequestOutput, None]:
         try:
             async for output in stream:
                 yield output
@@ -92,7 +91,7 @@ class AsyncLLM:
             # A finished request's id may already belong to a newer stream.
             state = self.output_processor.request_states.get(request_id)
             if state is not None and state.stream is stream:
-                self.abort(request_id)    # this is what makes a disconnect free KV blocks
+                self.abort(request_id)  # this is what makes a disconnect free KV blocks
 
     def abort(self, request_id: str, reason: str = "abort"):
         """Non-blocking and never raising, so it is safe in a generator's finally.
@@ -101,7 +100,7 @@ class AsyncLLM:
         """
         self.output_processor.abort_request(request_id)
         if self.is_dead or self._stopped:
-            return    # the blocks went with the engine
+            return  # the blocks went with the engine
         self.engine_core.abort_request(request_id, reason)
 
     async def render_metrics(self) -> str:
@@ -141,7 +140,7 @@ class AsyncLLM:
     def _on_loop(self, callback: Callable, *args):
         """Run callback on the event loop: now if this is its thread, else soon."""
         if self._loop is None or self._loop.is_closed():
-            return    # never started, or the loop is closed and its streams with it
+            return  # never started, or the loop is closed and its streams with it
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:

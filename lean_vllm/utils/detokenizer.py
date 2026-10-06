@@ -11,7 +11,9 @@ INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 class FastIncrementalDetokenizer:
     """Decodes one token at a time with DecodeStream, which holds back a split character rather than emit U+FFFD."""
 
-    def __init__(self, tokenizer: PreTrainedTokenizerFast, prompt_token_ids: list[int], skip_special_tokens: bool = True):
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerFast, prompt_token_ids: list[int], skip_special_tokens: bool = True
+    ):
         self.tokenizer = tokenizer._tokenizer
         self.skip_special_tokens = skip_special_tokens
         self.stream = DecodeStream(ids=prompt_token_ids, skip_special_tokens=skip_special_tokens)

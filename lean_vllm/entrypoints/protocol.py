@@ -41,7 +41,7 @@ class BaseRequest(BaseModel):
 
     model: str
     max_tokens: int = 64
-    temperature: float = 1.0    # 0 is greedy
+    temperature: float = 1.0  # 0 is greedy
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
@@ -49,7 +49,7 @@ class BaseRequest(BaseModel):
     # Extras: the OpenAI schema has no field for these, so they ride in the body.
     ignore_eos: bool = False
     priority: int = 0
-    kv_transfer_params: dict[str, Any] | None = None    # disaggregated prefill, as vLLM's; the proxy sets it
+    kv_transfer_params: dict[str, Any] | None = None  # disaggregated prefill, as vLLM's; the proxy sets it
 
     @model_validator(mode="before")
     @classmethod
@@ -62,7 +62,7 @@ class BaseRequest(BaseModel):
                 continue
             if _asks_for_it(data[name], neutral):
                 raise ValueError(f"{name} is not supported: {reason}")
-            del data[name]    # a no-op the client filled in; extra="forbid" must not see it
+            del data[name]  # a no-op the client filled in; extra="forbid" must not see it
         return data
 
     @model_validator(mode="after")
@@ -129,6 +129,7 @@ def usage(num_prompt_tokens: int, num_completion_tokens: int) -> UsageInfo:
 
 # Chunks serialize with exclude_unset, so wire fields they carry have no defaults: one left out fails loudly.
 
+
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
@@ -143,7 +144,7 @@ class CompletionResponse(BaseModel):
     model: str
     choices: list[CompletionResponseChoice]
     usage: UsageInfo
-    kv_transfer_params: dict[str, Any] | None = None    # from a prefill instance: where to pull its KV from
+    kv_transfer_params: dict[str, Any] | None = None  # from a prefill instance: where to pull its KV from
 
 
 class CompletionStreamResponse(BaseModel):

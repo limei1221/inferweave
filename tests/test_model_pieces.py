@@ -28,16 +28,21 @@ def process_group():
 def layer(process_group):
     torch.manual_seed(0)
     config = Qwen3Config(
-        hidden_size=HIDDEN, num_attention_heads=HEADS, num_key_value_heads=KV_HEADS,
-        head_dim=HEAD_DIM, intermediate_size=64, num_hidden_layers=1,
-        vocab_size=128, max_position_embeddings=64,
+        hidden_size=HIDDEN,
+        num_attention_heads=HEADS,
+        num_key_value_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        vocab_size=128,
+        max_position_embeddings=64,
     )
     default = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     with torch.inference_mode():
         layer = Qwen3DecoderLayer(config)
         for param in layer.parameters():
-            param.normal_(0, 0.05)    # the weights are torch.empty until a checkpoint lands
+            param.normal_(0, 0.05)  # the weights are torch.empty until a checkpoint lands
         yield layer
     torch.set_default_dtype(default)
     reset_context()
@@ -95,7 +100,7 @@ def test_the_split_layer_matches_the_unsplit_one(layer, inputs, first_layer):
 
 def test_the_pieces_need_no_attention_context(layer, inputs):
     """What a graph replays cannot depend on this step's sequence layout."""
-    reset_context()    # any read of it would see an empty Context and misbehave
+    reset_context()  # any read of it would see an empty Context and misbehave
     positions, hidden_states = inputs
 
     q, k, v, residual = layer.pre_attention(positions, hidden_states, None)
@@ -122,9 +127,15 @@ def test_a_yarn_config_reaches_the_rope(process_group):
     """rope_scaling was once read for rope_theta alone, so a YaRN Qwen3 ran unscaled rope."""
     yarn = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16}
     config = Qwen3Config(
-        hidden_size=HIDDEN, num_attention_heads=HEADS, num_key_value_heads=KV_HEADS,
-        head_dim=HEAD_DIM, intermediate_size=64, num_hidden_layers=1,
-        vocab_size=128, max_position_embeddings=64, rope_scaling=yarn,
+        hidden_size=HIDDEN,
+        num_attention_heads=HEADS,
+        num_key_value_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        vocab_size=128,
+        max_position_embeddings=64,
+        rope_scaling=yarn,
     )
     rope = Qwen3DecoderLayer(config).self_attn.rotary_emb
     want = RotaryEmbedding(HEAD_DIM, HEAD_DIM, 64, 10000.0, rope_scaling=dict(yarn, rope_theta=10000.0))

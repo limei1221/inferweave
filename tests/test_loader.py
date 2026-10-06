@@ -2,20 +2,19 @@
 
 import pytest
 import torch
-from torch import nn
 from safetensors.torch import save_file
+from torch import nn
 
 from lean_vllm.utils.loader import load_model
 
 
 class Tiny(nn.Module):
-
     def __init__(self, tie: bool = False):
         super().__init__()
         self.embed = nn.Parameter(torch.empty(4, 2))
         self.head = nn.Parameter(torch.empty(4, 2))
         if tie:
-            self.head.data = self.embed.data    # as the models tie lm_head
+            self.head.data = self.embed.data  # as the models tie lm_head
 
 
 def test_a_missing_weight_is_an_error(tmp_path):

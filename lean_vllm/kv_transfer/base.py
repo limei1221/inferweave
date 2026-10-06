@@ -16,10 +16,11 @@ KV_ROLES = ("kv_producer", "kv_consumer", "kv_both")
 @dataclass(slots=True)
 class KVTransferConfig:
     """vLLM's --kv-transfer-config, as JSON. A producer serves prefilled KV, a consumer loads it, both does either."""
+
     kv_connector: str = "TcpConnector"
     kv_role: str = "kv_both"
-    kv_ip: str = "127.0.0.1"    # where a producer listens, and what it tells consumers to dial
-    kv_port: int = 14579    # rank r listens on kv_port + r
+    kv_ip: str = "127.0.0.1"  # where a producer listens, and what it tells consumers to dial
+    kv_port: int = 14579  # rank r listens on kv_port + r
     engine_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self):
@@ -47,7 +48,11 @@ class KVTransferConfig:
 
 # What a decode instance needs to pull a remote prefill's blocks, as the producer's request_finished returns it.
 REMOTE_PREFILL_FIELDS = {
-    "remote_block_ids": list, "remote_request_id": str, "remote_engine_id": str, "remote_host": str, "remote_port": int,
+    "remote_block_ids": list,
+    "remote_request_id": str,
+    "remote_engine_id": str,
+    "remote_host": str,
+    "remote_port": int,
 }
 
 
@@ -73,6 +78,7 @@ def check_kv_transfer_params(params, kv_transfer: KVTransferConfig | None) -> st
 @dataclass(slots=True)
 class ReqToRecv:
     """A remote prefill's blocks to read into local ones, the two lists aligned."""
+
     local_block_ids: list[int]
     remote_block_ids: list[int]
     remote_request_id: str
@@ -84,8 +90,9 @@ class ReqToRecv:
 @dataclass(slots=True)
 class KVConnectorMetadata:
     """One step's instructions to every worker half."""
+
     reqs_to_recv: dict[str, ReqToRecv] = field(default_factory=dict)
-    reqs_to_send: dict[str, list[int]] = field(default_factory=dict)    # held blocks a remote decode may now read
+    reqs_to_send: dict[str, list[int]] = field(default_factory=dict)  # held blocks a remote decode may now read
 
     def __bool__(self):
         return bool(self.reqs_to_recv or self.reqs_to_send)
@@ -94,6 +101,7 @@ class KVConnectorMetadata:
 @dataclass(slots=True)
 class KVConnectorOutput:
     """Transfers a worker half finished since its last report. A failed load leaves its blocks to recompute."""
+
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
     failed_recving: set[str] = field(default_factory=set)
@@ -167,4 +175,3 @@ class KVConnectorWorker(ABC):
 
     def shutdown(self):
         pass
-

@@ -1,5 +1,6 @@
 import math
 from functools import lru_cache
+
 import torch
 from torch import nn
 
@@ -41,12 +42,15 @@ def yarn_inv_freq(rotary_dim: int, base: float, scaling: dict) -> torch.Tensor:
 
     low = max(math.floor(correction_dim(scaling.get("beta_fast") or 32)), 0)
     high = min(math.ceil(correction_dim(scaling.get("beta_slow") or 1)), rotary_dim - 1)
-    pos_freqs = base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
-    ramp = ((torch.arange(rotary_dim // 2, dtype=torch.float) - low) / (high - low if high != low else 0.001)).clamp(0, 1)
+    pos_freqs = base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+    ramp = ((torch.arange(rotary_dim // 2, dtype=torch.float) - low) / (high - low if high != low else 0.001)).clamp(
+        0, 1
+    )
     return 1.0 / (factor * pos_freqs) * ramp + 1.0 / pos_freqs * (1 - ramp)
 
 
 class RotaryEmbedding(nn.Module):
+    cos_sin_cache: torch.Tensor
 
     def __init__(
         self,
@@ -63,14 +67,16 @@ class RotaryEmbedding(nn.Module):
         assert rotary_dim == head_size
         scaling_type = rope_scaling and (rope_scaling.get("rope_type") or rope_scaling.get("type")) or "default"
         if scaling_type == "yarn":
+            assert rope_scaling is not None
             inv_freq = yarn_inv_freq(rotary_dim, base, rope_scaling)
             factor = rope_scaling["factor"]
             mscale = rope_scaling.get("attention_factor") or (
-                yarn_get_mscale(factor, rope_scaling.get("mscale", 1)) / yarn_get_mscale(factor, rope_scaling.get("mscale_all_dim", 0))
+                yarn_get_mscale(factor, rope_scaling.get("mscale", 1))
+                / yarn_get_mscale(factor, rope_scaling.get("mscale_all_dim", 0))
             )
         else:
             assert scaling_type == "default", f"unsupported rope scaling {scaling_type!r}"
-            inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+            inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
             mscale = 1.0
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)

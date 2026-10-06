@@ -28,11 +28,11 @@ class TorchAttention(AttentionBackend):
 
     @staticmethod
     def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        return True    # SDPA and the written-out varlen_with_lse take any value width
+        return True  # SDPA and the written-out varlen_with_lse take any value width
 
     @staticmethod
     def split_decodes() -> bool:
-        return True    # so decode rows skip prefill's padding to the step's longest query
+        return True  # so decode rows skip prefill's padding to the step's longest query
 
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         num_tokens = key.size(0)
@@ -41,7 +41,7 @@ class TorchAttention(AttentionBackend):
 
         slots = slot_mapping.long()
         keep = slots >= 0
-        if not keep.all():    # costs a host sync; kernels mask in-kernel instead
+        if not keep.all():  # costs a host sync; kernels mask in-kernel instead
             slots = slots[keep]
             key = key[keep]
             value = value[keep]
@@ -56,7 +56,7 @@ class TorchAttention(AttentionBackend):
 
         slots = slot_mapping.long()
         keep = slots >= 0
-        if not keep.all():    # costs a host sync; kernels mask in-kernel instead
+        if not keep.all():  # costs a host sync; kernels mask in-kernel instead
             slots = slots[keep]
             latent = latent[keep]
 
@@ -64,9 +64,10 @@ class TorchAttention(AttentionBackend):
 
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         cu_seqlens_q, cu_seqlens_k = context.cu_seqlens_q, context.cu_seqlens_k
+        assert cu_seqlens_q is not None and cu_seqlens_k is not None
         max_seqlen_q, max_seqlen_k = context.max_seqlen_q, context.max_seqlen_k
-        q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q)    # [B, Lq, H, D]
-        if context.block_tables is not None:    # read every key back from the pages
+        q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q)  # [B, Lq, H, D]
+        if context.block_tables is not None:  # read every key back from the pages
             seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             k_pad = self._gather_pages(k_cache, context.block_tables, max_seqlen_k, seqlens_k)
             v_pad = self._gather_pages(v_cache, context.block_tables, max_seqlen_k, seqlens_k)
@@ -76,37 +77,40 @@ class TorchAttention(AttentionBackend):
         mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True)
         return self._unpad_rows(self._sdpa(q_pad, k_pad, v_pad, mask), cu_seqlens_q, q.size(0))
 
-    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                        host_cu_seqlens=None):
+    def varlen_with_lse(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
+    ):
         # Written out, since SDPA does not return the log-sum-exp.
         repeats = self.num_heads // self.num_kv_heads
-        q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q).transpose(1, 2).float()    # [B, H, Lq, D]
+        q_pad = self._pad_rows(q, cu_seqlens_q, max_seqlen_q).transpose(1, 2).float()  # [B, H, Lq, D]
         k_pad = self._pad_rows(k, cu_seqlens_k, max_seqlen_k).repeat_interleave(repeats, dim=2).transpose(1, 2).float()
         v_pad = self._pad_rows(v, cu_seqlens_k, max_seqlen_k).repeat_interleave(repeats, dim=2).transpose(1, 2).float()
-        scores = q_pad @ k_pad.transpose(-1, -2) * self.scale    # [B, H, Lq, Lk]
+        scores = q_pad @ k_pad.transpose(-1, -2) * self.scale  # [B, H, Lq, Lk]
         mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal)
         scores = scores.masked_fill(~mask, float("-inf"))
-        o = (scores.softmax(dim=-1) @ v_pad).transpose(1, 2).to(q.dtype)    # [B, Lq, H, D]
-        lse = scores.logsumexp(dim=-1).transpose(1, 2)    # [B, Lq, H]
+        o = (scores.softmax(dim=-1) @ v_pad).transpose(1, 2).to(q.dtype)  # [B, Lq, H, D]
+        lse = scores.logsumexp(dim=-1).transpose(1, 2)  # [B, Lq, H]
         return self._unpad_rows(o, cu_seqlens_q, q.size(0)), self._unpad_rows(lse, cu_seqlens_q, q.size(0))
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
-        block_tables = context.block_tables
-        seqlen = block_tables.size(1) * k_cache.size(1)    # the table's width, so no length is read back
-        k = self._gather_pages(k_cache, block_tables, seqlen, context.context_lens)
-        v = self._gather_pages(v_cache, block_tables, seqlen, context.context_lens)
-        mask = self._key_mask(context.context_lens, seqlen)
+        block_tables, context_lens = context.block_tables, context.context_lens
+        assert block_tables is not None and context_lens is not None
+        seqlen = block_tables.size(1) * k_cache.size(1)  # the table's width, so no length is read back
+        k = self._gather_pages(k_cache, block_tables, seqlen, context_lens)
+        v = self._gather_pages(v_cache, block_tables, seqlen, context_lens)
+        mask = self._key_mask(context_lens, seqlen)
         return self._sdpa(q.unsqueeze(1), k, v, mask).squeeze(1)
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
         # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
-        block_tables = context.block_tables
+        block_tables, context_lens = context.block_tables, context.context_lens
+        assert block_tables is not None and context_lens is not None
         seqlen = block_tables.size(1) * latent_cache.size(1)
-        latent = self._gather_pages(latent_cache, block_tables, seqlen, context.context_lens)    # [B, Lk, D]
-        kv = latent.unsqueeze(1).expand(-1, q.size(1), -1, -1)    # [B, H, Lk, D]
-        mask = self._key_mask(context.context_lens, seqlen)
+        latent = self._gather_pages(latent_cache, block_tables, seqlen, context_lens)  # [B, Lk, D]
+        kv = latent.unsqueeze(1).expand(-1, q.size(1), -1, -1)  # [B, H, Lk, D]
+        mask = self._key_mask(context_lens, seqlen)
         o = F.scaled_dot_product_attention(q.unsqueeze(2), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale)
-        return o.squeeze(2)[..., :v_dim]    # [B, H, v_dim]; MPS returns the keys' width for one query
+        return o.squeeze(2)[..., :v_dim]  # [B, H, v_dim]; MPS returns the keys' width for one query
 
     @staticmethod
     def _pad_rows(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
@@ -123,10 +127,13 @@ class TorchAttention(AttentionBackend):
 
     @staticmethod
     def _gather_pages(
-        cache: torch.Tensor, block_tables: torch.Tensor, seqlen: int, seqlens: torch.Tensor,
+        cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seqlen: int,
+        seqlens: torch.Tensor,
     ) -> torch.Tensor:
         """Each row's cached tokens, [B, seqlen, ...], with unused slots zeroed."""
-        block_size = cache.size(1) # [num_blocks, block_size, ...]
+        block_size = cache.size(1)  # [num_blocks, block_size, ...]
         num_blocks = (seqlen + block_size - 1) // block_size
         blocks = block_tables[:, :num_blocks].long().clamp(min=0)
         gathered = cache[blocks].flatten(1, 2)[:, :seqlen]
@@ -147,21 +154,25 @@ class TorchAttention(AttentionBackend):
         """[B, 1, Lq, Lk]. Causal is bottom-right aligned, unlike SDPA's is_causal=True: query j sits at lk - lq + j."""
         seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        mask = cls._key_mask(seqlens_k, max_seqlen_k)    # [B, 1, 1, Lk]
+        mask = cls._key_mask(seqlens_k, max_seqlen_k)  # [B, 1, 1, Lk]
         if not causal:
             return mask
         device = mask.device
         # [B, 1, 1, 1] + [Lq, 1] -> [B, 1, Lq, 1]
         q_pos = (seqlens_k - seqlens_q).view(-1, 1, 1, 1) + torch.arange(max_seqlen_q, device=device).view(-1, 1)
-        return mask & (torch.arange(max_seqlen_k, device=device) <= q_pos)    # [B, 1, Lq, Lk]
+        return mask & (torch.arange(max_seqlen_k, device=device) <= q_pos)  # [B, 1, Lq, Lk]
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # Each key head's query heads fold into its query axis, so keys are never repeated and no enable_gqa
         # is needed, which takes a slow path on MPS once batched. Query head h reads key head h // group.
         B, Lq, _, D = q.shape
         group = self.num_heads // self.num_kv_heads
-        q = q.view(B, Lq, self.num_kv_heads, group, D).permute(0, 2, 3, 1, 4).reshape(B, self.num_kv_heads, group * Lq, D)
+        q = (
+            q.view(B, Lq, self.num_kv_heads, group, D)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(B, self.num_kv_heads, group * Lq, D)
+        )
         mask = mask.unsqueeze(2).expand(-1, -1, group, -1, -1).reshape(B, 1, group * Lq, -1)
         o = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=self.scale)
-        o = o[..., :v.size(-1)]    # MPS returns the keys' width for one query
+        o = o[..., : v.size(-1)]  # MPS returns the keys' width for one query
         return o.reshape(B, self.num_kv_heads, group, Lq, -1).permute(0, 3, 1, 2, 4).reshape(B, Lq, self.num_heads, -1)

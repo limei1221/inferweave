@@ -30,7 +30,7 @@ def test_on_cuda_it_does_not_wait_for_later_work():
     pending = SampledTokens(torch.tensor([3, 4], device="cuda"), torch.device("cuda"))
     later = torch.empty(4096, 4096, device="cuda")
     for _ in range(20):
-        later = later @ later    # queued on the default stream after the copy
+        later = later @ later  # queued on the default stream after the copy
     assert pending.tolist() == [3, 4]
     torch.cuda.synchronize()
 

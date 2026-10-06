@@ -51,7 +51,6 @@ def test_two_requests_finish_with_the_tokens_the_runner_sampled(make_engine):
 
 
 class TestAsyncScheduling:
-
     def test_the_flag_launches_before_the_last_step_is_reconciled(self, make_engine):
         """Stopping on EOS costs one extra launched step, scheduled before the stop is known."""
         runs = {}
@@ -63,8 +62,8 @@ class TestAsyncScheduling:
 
         sync_batches, sync_tokens = runs[False]
         async_batches, async_tokens = runs[True]
-        assert async_tokens == sync_tokens          # the extra token is never emitted
-        assert async_batches == sync_batches + 1    # but it was computed
+        assert async_tokens == sync_tokens  # the extra token is never emitted
+        assert async_batches == sync_batches + 1  # but it was computed
 
     def test_the_flag_does_not_change_what_a_request_receives(self, make_engine):
         """The extra token is never emitted, so text and finish reasons match."""
@@ -138,6 +137,6 @@ def test_the_first_token_is_timed_when_it_is_read_back(make_engine, async_schedu
     engine = make_engine(async_scheduling=async_scheduling)
     seq = engine.add([10, 11, 12], FOREVER)
     engine.step()
-    assert seq.first_token_time is None    # sampled, not yet read back
+    assert seq.first_token_time is None  # sampled, not yet read back
     engine.step()
     assert seq.first_token_time is not None

@@ -28,7 +28,7 @@ def split_at_attention(gm: fx.GraphModule) -> tuple[fx.GraphModule, set[str]]:
             index += 2
         else:
             part[node] = index
-    return split_module(gm, None, lambda node: part[node], keep_original_order=True), attention
+    return split_module(gm, None, lambda node: part[node], keep_original_order=True), attention  # type: ignore[arg-type]
 
 
 def weak_ref(value: Any) -> Any:
@@ -58,11 +58,11 @@ class Piece:
             graph, output = self.graphs[size]
             graph.replay()
             return output
-        self.compiled(*args)    # warm up outside the graph, where first launches may compile or allocate
+        self.compiled(*args)  # warm up outside the graph, where first launches may compile or allocate
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, self.pool):
             output = self.compiled(*args)
-        self.graphs[size] = graph, weak_ref(output)    # weak, so the pool can reuse it once later pieces read it
+        self.graphs[size] = graph, weak_ref(output)  # weak, so the pool can reuse it once later pieces read it
         return output
 
 
@@ -79,7 +79,7 @@ class _CompilePieces(fx.Interpreter):
         if target not in self.attention:
             piece = Piece(compile_fx(self.fetch_attr(target), list(args)), self.pool)
             self.pieces.append(piece)
-            self.module.__dict__[target] = piece    # past nn.Module's setattr, which wants a module
+            self.module.__dict__[target] = piece  # past nn.Module's setattr, which wants a module
         return output
 
 
@@ -93,12 +93,13 @@ class PiecewiseBackend:
     def __call__(self, gm: fx.GraphModule, example_inputs: list) -> Callable:
         split, attention = split_at_attention(gm)
         fake_mode = detect_fake_mode(example_inputs)
+        assert fake_mode is not None
         # Dynamo traced with fakes of these inputs; from_tensor returns those, symbolic sizes included.
         fake_inputs = [fake_mode.from_tensor(x) if isinstance(x, torch.Tensor) else x for x in example_inputs]
         compiler = _CompilePieces(split, attention, self.pool)
         with fake_mode, enable_python_dispatcher():
             compiler.run(*fake_inputs)
-        self.pieces += compiler.pieces    # only now: a trace Dynamo restarts leaves nothing behind
+        self.pieces += compiler.pieces  # only now: a trace Dynamo restarts leaves nothing behind
         return split
 
 

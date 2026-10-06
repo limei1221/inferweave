@@ -46,7 +46,7 @@ class AsyncMPClient:
         self.error: BaseException | None = None
         self.shutdown_timeout = shutdown_timeout
         self._outputs: asyncio.Queue = asyncio.Queue()
-        self._adding: dict[str, asyncio.Future] = {}    # sent, not yet acknowledged
+        self._adding: dict[str, asyncio.Future] = {}  # sent, not yet acknowledged
         self._calls: dict[int, asyncio.Future] = {}
         self._call_ids = count()
         self._stopped = False
@@ -58,7 +58,7 @@ class AsyncMPClient:
         input_address, output_address = f"ipc://{self._ipc_dir}/in", f"ipc://{self._ipc_dir}/out"
         self._context = zmq.Context()
         self._input = self._context.socket(zmq.PUSH)
-        self._input.setsockopt(zmq.SNDHWM, 0)    # a send never blocks the event loop
+        self._input.setsockopt(zmq.SNDHWM, 0)  # a send never blocks the event loop
         self._input.bind(input_address)
         self._async_context = zmq.asyncio.Context()
         self._output = self._async_context.socket(zmq.PULL)
@@ -68,16 +68,17 @@ class AsyncMPClient:
         ready, child_ready = ctx.Pipe(duplex=False)
         # Not a daemon: the core spawns the TP workers, and a daemon may have no children.
         self._process = ctx.Process(
-            target=run_engine_core, name="EngineCore",
+            target=run_engine_core,
+            name="EngineCore",
             args=(engine_factory, args, kwargs or {}, input_address, output_address, child_ready),
         )
         self._process.start()
         child_ready.close()
-        atexit.register(self._shutdown_process)    # also when the server never got as far as its lifespan
+        atexit.register(self._shutdown_process)  # also when the server never got as far as its lifespan
         wait([ready, self._process.sentinel])
         try:
             status, error = ready.recv()
-        except EOFError:    # it died before it could say why
+        except EOFError:  # it died before it could say why
             status, error = "exited", None
         ready.close()
         if status != "ready":
@@ -108,11 +109,12 @@ class AsyncMPClient:
             raise EngineDeadError("the server is shutting down")
         if self.error is not None:
             raise _dead_error("the engine core died", self.error)
+        assert self._loop is not None
         added = self._adding[request_id] = self._loop.create_future()
         self._send(("add", request_id, prompt, sampling_params))
         try:
             error = await added
-        except BaseException:    # cancelled while waiting, or the core died
+        except BaseException:  # cancelled while waiting, or the core died
             self._adding.pop(request_id, None)
             raise
         if error is not None:
@@ -121,7 +123,7 @@ class AsyncMPClient:
     def abort_request(self, request_id: str, reason: str = "abort"):
         """Non-blocking and never raising."""
         if self.error is not None or self._stopped:
-            return    # the blocks went with the engine
+            return  # the blocks went with the engine
         self._send(("abort", request_id, reason))
 
     async def get_output_async(self) -> list[RequestOutput]:
@@ -134,6 +136,7 @@ class AsyncMPClient:
         if self.error is not None:
             raise _dead_error("the engine core died", self.error)
         call_id = next(self._call_ids)
+        assert self._loop is not None
         result = self._calls[call_id] = self._loop.create_future()
         self._send(("metrics", call_id, method))
         try:
@@ -157,7 +160,7 @@ class AsyncMPClient:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            if not self._stopped:    # else the socket closed under a shutdown
+            if not self._stopped:  # else the socket closed under a shutdown
                 self._die(error)
 
     def _handle(self, message: tuple) -> bool:
@@ -168,7 +171,7 @@ class AsyncMPClient:
         elif kind == "added":
             _, request_id, error = message
             added = self._adding.pop(request_id, None)
-            if added is not None and not added.done():    # else its caller gave up, and sent an abort
+            if added is not None and not added.done():  # else its caller gave up, and sent an abort
                 added.set_result(error)
         elif kind == "metrics":
             _, call_id, value = message
@@ -216,7 +219,7 @@ class AsyncMPClient:
             try:
                 self._input.send_pyobj(("shutdown",), zmq.NOBLOCK)
             except zmq.ZMQError:
-                pass    # never connected, or gone
+                pass  # never connected, or gone
             process.join(self.shutdown_timeout if timeout is None else timeout)
         if process.is_alive():
             logger.warning("the engine core did not stop in time, so it is terminated")

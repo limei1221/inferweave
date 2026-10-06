@@ -1,23 +1,25 @@
 import atexit
+import collections.abc
 import os
 from dataclasses import dataclass, fields
 from time import perf_counter
-from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
 import torch.multiprocessing as mp
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from lean_vllm import envs
 from lean_vllm.config import Config
-from lean_vllm.sampling_params import SamplingParams
+from lean_vllm.engine.metrics import Metrics
+from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.output_processor import OutputProcessor
-from lean_vllm.engine.sequence import Sequence
-from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, Scheduler, SchedulerOutput
-from lean_vllm.engine.model_runner import ModelRunner
+from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVTransferConfig, check_kv_transfer_params
+from lean_vllm.sampling_params import SamplingParams
 
 
 def validate_request(
@@ -83,7 +85,7 @@ class _StepProfiler:
 
     def step(self):
         if self.started is False:
-            self.profile.start()    # lazy, so kineto skips model load and warmup
+            self.profile.start()  # lazy, so kineto skips model load and warmup
             self.started = True
         self.profile.step()
 
@@ -99,9 +101,9 @@ class _StepProfiler:
             return
         self.closed = True
         try:
-            self.profile.stop()    # flushes the window, partial or complete
+            self.profile.stop()  # flushes the window, partial or complete
         except RuntimeError:
-            pass    # the window already completed and saved mid-run
+            pass  # the window already completed and saved mid-run
         if not self.exported:
             print(
                 f"warning: step-loop profile captured nothing in {self.out_dir}; "
@@ -113,13 +115,13 @@ class _StepProfiler:
 @dataclass(slots=True)
 class _InFlight:
     """A launched step, waiting for its tokens."""
+
     output: SchedulerOutput
     rows: list[LaunchedRow]
     pending: SampledTokens
 
 
 class LLMEngine:
-
     def __init__(self, model, detokenize: bool = True, **kwargs):
         """detokenize=False leaves text empty, for a client that detokenizes itself, as an engine core's does."""
         config_fields = {field.name for field in fields(Config)}
@@ -128,7 +130,7 @@ class LLMEngine:
         Sequence.block_size = config.kvcache_block_size
         Sequence.enable_prefix_caching = config.enable_prefix_caching
         Sequence.hash_algo = config.prefix_caching_hash_algo
-        self.tokenizer = load_tokenizer(config.model)    # before workers spawn, so a bad one fails fast
+        self.tokenizer = load_tokenizer(config.model)  # before workers spawn, so a bad one fails fast
         config.eos = self.tokenizer.eos_token_id
         self.ps = []
         ctx = mp.get_context("spawn")
@@ -152,20 +154,23 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams, request_id: str | None = None) -> str:
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+    def add_request(
+        self, prompt: str | list[int], sampling_params: SamplingParams, request_id: str | None = None
+    ) -> str:
+        token_ids: list[int] = self.tokenizer.encode(prompt) if isinstance(prompt, str) else prompt
         config = self.config
-        validate_request(prompt, sampling_params, config.hf_config.vocab_size, config.max_model_len, config.kv_transfer)
-        seq = Sequence(prompt, sampling_params, request_id)
+        validate_request(
+            token_ids, sampling_params, config.hf_config.vocab_size, config.max_model_len, config.kv_transfer
+        )
+        seq = Sequence(token_ids, sampling_params, request_id)
         try:
-            self.scheduler.add(seq)    # before the detokenizer, so a refused request leaves nothing behind
+            self.scheduler.add(seq)  # before the detokenizer, so a refused request leaves nothing behind
         except QueueFull:
             self.metrics.record_rejected()
             raise
         self.metrics.record_received()
         if self.output_processor is not None:
-            self.output_processor.add_request(seq.request_id, prompt, seq.skip_special_tokens)
+            self.output_processor.add_request(seq.request_id, token_ids, seq.skip_special_tokens)
         return seq.request_id
 
     def abort_request(self, request_id: str, reason: str = "abort") -> bool:
@@ -175,6 +180,7 @@ class LLMEngine:
         if self.output_processor is not None:
             self.output_processor.abort_request(request_id)
         if aborted:
+            assert seq is not None
             self.metrics.record_aborted(self._dropped(seq))
         return aborted
 
@@ -193,7 +199,11 @@ class LLMEngine:
         outputs += [self._dropped(seq) for seq in output.dropped if seq not in stepped]
         # attributed to the step this call launched
         self.metrics.record_step(
-            self.scheduler, output, outputs, perf_counter() - started, self.model_runner.step_kind,
+            self.scheduler,
+            output,
+            outputs,
+            perf_counter() - started,
+            self.model_runner.step_kind,
         )
         if self.output_processor is not None:
             with record_function("detokenize"):
@@ -250,7 +260,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: collections.abc.Sequence[str | list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[dict]:
@@ -259,8 +269,8 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         request_ids = [self.add_request(prompt, sp) for prompt, sp in zip(prompts, sampling_params)]
-        collected = {request_id: {"text": "", "token_ids": []} for request_id in request_ids}
-        prefill_throughput = decode_throughput = 0.
+        collected: dict[str, dict] = {request_id: {"text": "", "token_ids": []} for request_id in request_ids}
+        prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
             t = perf_counter()
             step_outputs, num_prefill_tokens, num_decode_tokens = self.step()
@@ -269,10 +279,12 @@ class LLMEngine:
                 prefill_throughput = num_prefill_tokens / elapsed
             if num_decode_tokens:
                 decode_throughput = num_decode_tokens / elapsed
-            pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughput)}tok/s",
-                "Decode": f"{int(decode_throughput)}tok/s",
-            })
+            pbar.set_postfix(
+                {
+                    "Prefill": f"{int(prefill_throughput)}tok/s",
+                    "Decode": f"{int(decode_throughput)}tok/s",
+                }
+            )
             for output in step_outputs:
                 collected[output.request_id]["text"] += output.text
                 collected[output.request_id]["token_ids"] += output.token_ids

@@ -11,16 +11,26 @@ import torch.distributed as dist
 
 from lean_vllm.layers import fused_moe
 from lean_vllm.layers.fused_moe import (
-    align_blocks, fused_experts, get_config_file_name, get_default_config, get_moe_configs,
-    try_get_optimal_moe_config, use_triton,
+    align_blocks,
+    fused_experts,
+    get_config_file_name,
+    get_default_config,
+    get_moe_configs,
+    try_get_optimal_moe_config,
+    use_triton,
 )
 from lean_vllm.layers.moe import (
-    FusedMoE, determine_expert_map, shared_mlp, silu_and_mul, torch_experts, torch_select_experts,
+    FusedMoE,
+    determine_expert_map,
+    shared_mlp,
+    silu_and_mul,
+    torch_experts,
+    torch_select_experts,
 )
 
 HIDDEN, INTERMEDIATE = 32, 16
 NUM_EXPERTS, TOP_K, TOKENS = 8, 3, 20
-BLOCK_M = 16    # the kernel's smallest row block, so the padding is exercised at this size
+BLOCK_M = 16  # the kernel's smallest row block, so the padding is exercised at this size
 
 
 @pytest.fixture(scope="module")
@@ -36,7 +46,7 @@ def moe(process_group):
     layer = FusedMoE(NUM_EXPERTS, TOP_K, HIDDEN, INTERMEDIATE)
     with torch.inference_mode():
         for param in layer.parameters():
-            param.normal_(0, 0.1)    # the weights are torch.empty until a checkpoint lands
+            param.normal_(0, 0.1)  # the weights are torch.empty until a checkpoint lands
     return layer
 
 
@@ -62,10 +72,11 @@ def blocked_moe(gate_up_proj, down_proj, x, topk_weights, topk_ids, block_m: int
         # h is one row per pair already, so the second gemm reads it without dividing.
         a, b, c, per = (x, gate_up_proj, h, top_k) if gate_up else (silu_and_mul(h), down_proj, out, 1)
         for block, expert in enumerate(block_experts.tolist()):
-            if block * block_m >= num_rows: break
-            pairs = sorted_pairs[block * block_m:(block + 1) * block_m]
-            pairs = pairs[pairs < num_pairs].long()    # the mask the kernel applies to an overhanging block
-            if expert == -1:    # another rank's expert
+            if block * block_m >= num_rows:
+                break
+            pairs = sorted_pairs[block * block_m : (block + 1) * block_m]
+            pairs = pairs[pairs < num_pairs].long()  # the mask the kernel applies to an overhanging block
+            if expert == -1:  # another rank's expert
                 c[pairs] = 0
                 continue
             acc = a[pairs // per] @ b[expert].T
@@ -86,7 +97,7 @@ def test_a_block_reads_one_expert(batch):
     sorted_pairs, block_experts, _ = align_blocks(topk_ids, NUM_EXPERTS, BLOCK_M)
     pairs_expert = topk_ids.flatten()
     for block, expert in enumerate(block_experts.tolist()):
-        held = sorted_pairs[block * BLOCK_M:(block + 1) * BLOCK_M]
+        held = sorted_pairs[block * BLOCK_M : (block + 1) * BLOCK_M]
         held = held[held < topk_ids.numel()].long()
         assert (pairs_expert[held] == expert).all()
 
@@ -100,7 +111,7 @@ def test_the_row_count_covers_each_padded_run(batch):
 
 def test_an_expert_with_no_tokens_owns_no_block():
     """An empty run is padded to nothing, so the next expert must start on the same block."""
-    topk_ids = torch.zeros(4, 1, dtype=torch.long)    # every pair on expert 0
+    topk_ids = torch.zeros(4, 1, dtype=torch.long)  # every pair on expert 0
     topk_ids[:2] = NUM_EXPERTS - 1
     sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, NUM_EXPERTS, BLOCK_M)
     assert num_rows == 2 * BLOCK_M
@@ -113,7 +124,7 @@ def test_a_run_holds_its_pairs_in_pair_order(batch):
     _, _, topk_ids = batch
     sorted_pairs, block_experts, num_rows = align_blocks(topk_ids, NUM_EXPERTS, BLOCK_M)
     for block in range(int(num_rows) // BLOCK_M):
-        held = sorted_pairs[block * BLOCK_M:(block + 1) * BLOCK_M]
+        held = sorted_pairs[block * BLOCK_M : (block + 1) * BLOCK_M]
         held = held[held < topk_ids.numel()].tolist()
         assert held == sorted(held)
 
@@ -134,7 +145,7 @@ requires_triton_gpu = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("ep_size", [2, 3])    # 3 does not divide 8 experts
+@pytest.mark.parametrize("ep_size", [2, 3])  # 3 does not divide 8 experts
 def test_placement_matches_vllm_linear(ep_size):
     """Contiguous runs, the remainder on the first ranks, and every expert on exactly one rank."""
     maps = [determine_expert_map(ep_size, rank, NUM_EXPERTS) for rank in range(ep_size)]
@@ -143,7 +154,7 @@ def test_placement_matches_vllm_linear(ep_size):
     owners = torch.stack([expert_map >= 0 for _, expert_map in maps]).int()
     assert owners.sum(0).tolist() == [1] * NUM_EXPERTS
     owned = [torch.nonzero(expert_map >= 0).flatten().tolist() for _, expert_map in maps]
-    assert sum(owned, []) == list(range(NUM_EXPERTS))    # rank order is expert order
+    assert sum(owned, []) == list(range(NUM_EXPERTS))  # rank order is expert order
     for (count, expert_map), experts in zip(maps, owned):
         assert expert_map[experts].tolist() == list(range(count))
 
@@ -168,7 +179,8 @@ def test_expert_shards_sum_to_the_full_layer(moe, batch, ep_size, path):
     with torch.inference_mode():
         want = torch_experts(x, moe.gate_up_proj, moe.down_proj, topk_weights, topk_ids)
         parts = [
-            torch_experts(x, gate_up, down, topk_weights, topk_ids, expert_map) if path == "grouped_mm"
+            torch_experts(x, gate_up, down, topk_weights, topk_ids, expert_map)
+            if path == "grouped_mm"
             else blocked_moe(gate_up, down, x, topk_weights, topk_ids, BLOCK_M, expert_map)
             for expert_map, gate_up, down in shards(moe, ep_size)
         ]
@@ -177,7 +189,7 @@ def test_expert_shards_sum_to_the_full_layer(moe, batch, ep_size, path):
 
 def test_a_rank_with_no_routed_pairs_returns_zeros(moe, batch):
     x, topk_weights, _ = batch
-    topk_ids = torch.zeros(TOKENS, TOP_K, dtype=torch.long)    # every pair on rank 0's expert
+    topk_ids = torch.zeros(TOKENS, TOP_K, dtype=torch.long)  # every pair on rank 0's expert
     expert_map, gate_up, down = list(shards(moe, 2))[1]
     with torch.inference_mode():
         assert torch.equal(torch_experts(x, gate_up, down, topk_weights, topk_ids, expert_map), torch.zeros_like(x))
@@ -262,11 +274,13 @@ def test_grouped_order_covers_every_tile_once(group_size_m):
 def test_grouped_order_walks_a_column_tile_down_the_group():
     """Consecutive programs share a weight tile, which is the point of grouping."""
     assert grouped_order(num_blocks=4, num_pid_n=2, group_size_m=2)[:4] == [(0, 0), (1, 0), (0, 1), (1, 1)]
-    assert grouped_order(num_blocks=4, num_pid_n=2, group_size_m=1)[:2] == [(0, 0), (0, 1)]    # the old order
+    assert grouped_order(num_blocks=4, num_pid_n=2, group_size_m=1)[:2] == [(0, 0), (0, 1)]  # the old order
 
 
 def test_config_file_names_match_vllm():
-    assert get_config_file_name(64, 1408, "NVIDIA_H100_80GB_HBM3") == "E=64,N=1408,device_name=NVIDIA_H100_80GB_HBM3.json"
+    assert (
+        get_config_file_name(64, 1408, "NVIDIA_H100_80GB_HBM3") == "E=64,N=1408,device_name=NVIDIA_H100_80GB_HBM3.json"
+    )
     assert get_config_file_name(64, 1408, "NVIDIA_H200_141GB") == "E=64,N=1408,device_name=NVIDIA_H200.json"
 
 
@@ -290,7 +304,7 @@ def test_a_tuned_file_maps_each_batch_to_its_nearest_entry(tuned_folder):
     assert sorted(get_moe_configs(8, 16)) == [1, 64, 512]
     assert try_get_optimal_moe_config(8, 16, 3) == tile(16)
     assert try_get_optimal_moe_config(8, 16, 100) == tile(32)
-    assert try_get_optimal_moe_config(8, 16, 4096) == tile(64)    # SPLIT_K dropped: the kernel has none
+    assert try_get_optimal_moe_config(8, 16, 4096) == tile(64)  # SPLIT_K dropped: the kernel has none
 
 
 def test_no_file_falls_back_to_vllm_defaults(tuned_folder):
@@ -298,12 +312,15 @@ def test_no_file_falls_back_to_vllm_defaults(tuned_folder):
     assert try_get_optimal_moe_config(8, 16, 7) == get_default_config(7, 8)
 
 
-@pytest.mark.parametrize("M, E, want", [
-    (1, 64, (16, 64, 128, 1, 4, 4)),
-    (48, 64, (32, 64, 128, 1, 4, 3)),
-    (256, 64, (64, 128, 64, 1, 8, 3)),
-    (4096, 8, (128, 128, 64, 16, 8, 3)),    # 512 tokens per expert, so grouping pays
-])
+@pytest.mark.parametrize(
+    "M, E, want",
+    [
+        (1, 64, (16, 64, 128, 1, 4, 4)),
+        (48, 64, (32, 64, 128, 1, 4, 3)),
+        (256, 64, (64, 128, 64, 1, 8, 3)),
+        (4096, 8, (128, 128, 64, 16, 8, 3)),  # 512 tokens per expert, so grouping pays
+    ],
+)
 def test_defaults_are_vllms_bf16_table(M, E, want):
     config = get_default_config(M, E)
     keys = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M", "num_warps", "num_stages")
@@ -311,11 +328,15 @@ def test_defaults_are_vllms_bf16_table(M, E, want):
 
 
 @requires_triton_gpu
-@pytest.mark.parametrize("config", [
-    dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=1, num_warps=4, num_stages=2),
-    dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=16, num_warps=8, num_stages=3),
-    dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, GROUP_SIZE_M=64, num_warps=8, num_stages=2),
-], ids=["small", "grouped", "large"])
+@pytest.mark.parametrize(
+    "config",
+    [
+        dict(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=64, GROUP_SIZE_M=1, num_warps=4, num_stages=2),
+        dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=16, num_warps=8, num_stages=3),
+        dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, BLOCK_SIZE_K=128, GROUP_SIZE_M=64, num_warps=8, num_stages=2),
+    ],
+    ids=["small", "grouped", "large"],
+)
 def test_any_tuned_config_computes_the_same_layer(moe, batch, config):
     """Tiles and grouping change the schedule, never the result: what lets the tuner pick freely."""
     layer = moe.to("cuda", torch.bfloat16)
@@ -355,8 +376,8 @@ def dense_routing(weights: torch.Tensor, ids: torch.Tensor, num_experts: int) ->
 
 
 @requires_triton_gpu
-@pytest.mark.parametrize("num_tokens", [1, 20, 3000])    # 3000 * 6 pairs span many programs
-@pytest.mark.parametrize("num_experts", [8, 64, 160])    # 160 is not a power of two
+@pytest.mark.parametrize("num_tokens", [1, 20, 3000])  # 3000 * 6 pairs span many programs
+@pytest.mark.parametrize("num_experts", [8, 64, 160])  # 160 is not a power of two
 @pytest.mark.parametrize("block_m", [16, 64])
 @pytest.mark.parametrize("ep", [False, True], ids=["one_rank", "ep"])
 def test_triton_alignment_matches_the_reference(num_tokens, num_experts, block_m, ep):
@@ -372,14 +393,18 @@ def test_triton_alignment_matches_the_reference(num_tokens, num_experts, block_m
     num_rows = int(want_rows)
     assert int(got_rows) == num_rows
     assert torch.equal(got_pairs[:num_rows], want_pairs[:num_rows])
-    assert torch.equal(got_experts[:num_rows // block_m], want_experts[:num_rows // block_m])
+    assert torch.equal(got_experts[: num_rows // block_m], want_experts[: num_rows // block_m])
 
 
 @requires_triton_gpu
-@pytest.mark.parametrize("routing", [
-    dict(num_groups=1, topk_group=1),
-    dict(num_groups=8, topk_group=3),    # DeepSeek-V2's group-limited greedy
-], ids=["greedy", "grouped"])
+@pytest.mark.parametrize(
+    "routing",
+    [
+        dict(num_groups=1, topk_group=1),
+        dict(num_groups=8, topk_group=3),  # DeepSeek-V2's group-limited greedy
+    ],
+    ids=["greedy", "grouped"],
+)
 @pytest.mark.parametrize("renormalize, scaling", [(False, 1.0), (True, 2.5)])
 @pytest.mark.parametrize("num_experts", [64, 160])
 def test_triton_routing_matches_torch(routing, renormalize, scaling, num_experts):
@@ -390,11 +415,12 @@ def test_triton_routing_matches_torch(routing, renormalize, scaling, num_experts
     want_weights, want_ids = torch_select_experts(*args)
     assert got_ids.dtype == want_ids.dtype == torch.int32
     torch.testing.assert_close(
-        dense_routing(got_weights, got_ids, num_experts), dense_routing(want_weights, want_ids, num_experts))
+        dense_routing(got_weights, got_ids, num_experts), dense_routing(want_weights, want_ids, num_experts)
+    )
 
 
 @requires_triton_gpu
-@pytest.mark.parametrize("width", [16, 1408, 3000])    # under one block, the V2-Lite expert, and three blocks
+@pytest.mark.parametrize("width", [16, 1408, 3000])  # under one block, the V2-Lite expert, and three blocks
 def test_triton_silu_and_mul_matches_torch(width):
     torch.manual_seed(0)
     x = torch.randn(37, 2 * width, device="cuda", dtype=torch.bfloat16)
@@ -444,12 +470,12 @@ def test_the_side_stream_replays_in_a_cuda_graph(moe, batch, monkeypatch):
     x, topk_weights, topk_ids = x.to("cuda", torch.bfloat16), topk_weights.float().cuda(), topk_ids.int().cuda()
     gate_up, down = shared_weights("cuda", torch.bfloat16)
     with torch.inference_mode():
-        layer(x, topk_weights, topk_ids, gate_up, down)    # warmup, which also makes the side stream
+        layer(x, topk_weights, topk_ids, gate_up, down)  # warmup, which also makes the side stream
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             out = layer(x, topk_weights, topk_ids, gate_up, down)
-        x.copy_(torch.randn_like(x))    # new inputs in the captured buffers
+        x.copy_(torch.randn_like(x))  # new inputs in the captured buffers
         graph.replay()
         torch.cuda.synchronize()
         want = layer(x, topk_weights, topk_ids, gate_up, down)

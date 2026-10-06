@@ -10,6 +10,20 @@ from lean_vllm.kv_transfer.base import (
 )
 from lean_vllm.kv_transfer.tcp_connector import TcpConnectorScheduler, TcpConnectorWorker
 
+__all__ = [
+    "KVConnectorMetadata",
+    "KVConnectorOutput",
+    "KVConnectorScheduler",
+    "KVConnectorWorker",
+    "KVOutputAggregator",
+    "KVTransferConfig",
+    "ReqToRecv",
+    "check_kv_transfer_params",
+    "create_scheduler_connector",
+    "create_worker_connector",
+    "parse_kv_transfer_config",
+]
+
 # As vLLM's KVConnectorFactory: a name in kv_transfer_config, and the class for each half.
 CONNECTORS = {"TcpConnector": (TcpConnectorScheduler, TcpConnectorWorker)}
 

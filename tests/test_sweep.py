@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("httpx")
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))    # scripts, not a package
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))  # scripts, not a package
 
 import sweep
 
@@ -19,7 +19,6 @@ def args(*extra: str):
 
 
 class TestCacheFlags:
-
     def test_the_same_tokens_reach_either_engine(self):
         tokens = 320000
         lean = sweep.cache_flags(args("--kvcache-tokens", str(tokens)))
@@ -38,7 +37,6 @@ class TestCacheFlags:
 
 
 class TestServerCommand:
-
     def test_booleans_become_the_paired_flag(self):
         arm = sweep.Arm("a", {"enable-chunked-prefill": False, "enforce-eager": True})
         command = sweep.server_command(args(), arm)
@@ -56,7 +54,6 @@ class TestServerCommand:
 
 
 class TestAsyncSuite:
-
     def test_both_arms_reach_either_engine_as_the_paired_flag(self):
         arms = sweep.async_suite(args())
         for engine in ("lean-vllm", "vllm"):

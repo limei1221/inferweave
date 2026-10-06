@@ -12,7 +12,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
-def build_proxy_app(prefill_urls: list[str], decode_urls: list[str], client: httpx.AsyncClient | None = None) -> FastAPI:
+def build_proxy_app(
+    prefill_urls: list[str], decode_urls: list[str], client: httpx.AsyncClient | None = None
+) -> FastAPI:
     prefill_urls = [url.rstrip("/") for url in prefill_urls]
     decode_urls = [url.rstrip("/") for url in decode_urls]
     prefills, decodes = itertools.cycle(prefill_urls), itertools.cycle(decode_urls)
@@ -57,7 +59,7 @@ async def _disaggregate(client: httpx.AsyncClient, prefill_url: str, decode_url:
     prefill_body.pop("stream_options", None)
     prefill = await client.post(prefill_url + path, json=prefill_body)
     if prefill.status_code != 200:
-        return _relay(prefill)    # a 400 or 429 there is the client's answer
+        return _relay(prefill)  # a 400 or 429 there is the client's answer
     kv_transfer_params = prefill.json().get("kv_transfer_params")
     # None when the prefill stopped short of its one token; the decode server then prefills itself.
     decode_body = dict(body, kv_transfer_params=kv_transfer_params) if kv_transfer_params else body

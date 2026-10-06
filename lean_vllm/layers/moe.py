@@ -1,13 +1,12 @@
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
 
 from lean_vllm import envs
 from lean_vllm.layers import fused_moe
 from lean_vllm.layers.activation import SiluAndMul
 from lean_vllm.layers.linear import divide
-
 
 silu_and_mul = SiluAndMul()
 _aux_stream: torch.cuda.Stream | None = None
@@ -37,7 +36,7 @@ def determine_expert_map(ep_size: int, ep_rank: int, num_experts: int) -> tuple[
     local_num_experts = base + 1 if ep_rank < remainder else base
     start = ep_rank * base + min(ep_rank, remainder)
     expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cpu")
-    expert_map[start:start + local_num_experts] = torch.arange(local_num_experts, dtype=torch.int32, device="cpu")
+    expert_map[start : start + local_num_experts] = torch.arange(local_num_experts, dtype=torch.int32, device="cpu")
     return local_num_experts, expert_map
 
 
@@ -83,14 +82,14 @@ def torch_select_experts(
     if num_groups > 1:
         # Only experts in the topk_group best groups stay eligible.
         num_token = scores.size(0)
-        group_scores = scores.view(num_token, num_groups, -1).max(dim=-1).values    # [N, G]
-        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]    # [N, topk_group]
+        group_scores = scores.view(num_token, num_groups, -1).max(dim=-1).values  # [N, G]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]  # [N, topk_group]
         group_mask = torch.zeros_like(group_scores)
         group_mask.scatter_(1, group_idx, 1)
-        score_mask = (group_mask.unsqueeze(-1)
-                      .expand(num_token, num_groups, scores.size(-1) // num_groups)
-                      .reshape(num_token, -1))    # [N, E]
-        scores = scores.masked_fill(~score_mask.bool(), float("-inf"))    # [N, E]
+        score_mask = (
+            group_mask.unsqueeze(-1).expand(num_token, num_groups, scores.size(-1) // num_groups).reshape(num_token, -1)
+        )  # [N, E]
+        scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [N, E]
     topk_weights, topk_ids = torch.topk(scores, k=top_k, dim=-1, sorted=False)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -142,7 +141,7 @@ def moe_experts(
     """The routed experts, plus the shared ones when given."""
     if not fused_moe.use_triton(x):
         out = torch_experts(x, gate_up_proj, down_proj, topk_weights, topk_ids, expert_map)
-        if shared_gate_up is not None:
+        if shared_gate_up is not None and shared_down is not None:
             out = out + shared_mlp(x, shared_gate_up, shared_down, silu_and_mul)
         return out
     has_shared = shared_gate_up is not None
@@ -153,13 +152,14 @@ def moe_experts(
         stream.wait_stream(current)
         # No record_stream for x or the output: the current stream waits on the side one before either is freed.
         with torch.cuda.stream(stream):
-            shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)
+            shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)  # type: ignore[arg-type]
     out = fused_moe.fused_experts(
-        x, gate_up_proj, down_proj, topk_weights, topk_ids, fused_moe.silu_and_mul, expert_map)
+        x, gate_up_proj, down_proj, topk_weights, topk_ids, fused_moe.silu_and_mul, expert_map
+    )
     if overlap:
         current.wait_stream(stream)
     elif has_shared:
-        shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)
+        shared = shared_mlp(x, shared_gate_up, shared_down, fused_moe.silu_and_mul)  # type: ignore[arg-type]
     if has_shared:
         out += shared
     return out
@@ -200,15 +200,15 @@ class FusedMoE(nn.Module):
         use_ep = enable_expert_parallel and world_size > 1
         self.tp_rank, self.tp_size = (0, 1) if use_ep else (rank, world_size)
         self.ep_rank, self.ep_size = (rank, world_size) if use_ep else (0, 1)
-        self.num_experts = num_experts    # global; the stacked weights hold local_num_experts
+        self.num_experts = num_experts  # global; the stacked weights hold local_num_experts
         self.top_k = top_k
         self.intermediate_size = divide(intermediate_size, self.tp_size)
         self.local_num_experts, expert_map = determine_expert_map(self.ep_size, self.ep_rank, num_experts)
-        self.local_expert_ids = expert_map.tolist() if expert_map is not None else None    # for the loader
+        self.local_expert_ids = expert_map.tolist() if expert_map is not None else None  # for the loader
         self.gate_up_proj = nn.Parameter(torch.empty(self.local_num_experts, 2 * self.intermediate_size, hidden_size))
         self.down_proj = nn.Parameter(torch.empty(self.local_num_experts, hidden_size, self.intermediate_size))
-        self.gate_up_proj.weight_loader = self.weight_loader
-        self.down_proj.weight_loader = self.weight_loader
+        self.gate_up_proj.weight_loader = self.weight_loader  # type: ignore[attr-defined]
+        self.down_proj.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         if expert_map is not None:
             expert_map = expert_map.to(self.gate_up_proj.device)
         self.register_buffer("expert_map", expert_map, persistent=False)
@@ -217,7 +217,7 @@ class FusedMoE(nn.Module):
         expert_id, proj = shard_id
         if self.local_expert_ids is not None:
             expert_id = self.local_expert_ids[expert_id]
-            if expert_id == -1:    # another rank's expert
+            if expert_id == -1:  # another rank's expert
                 return
         if proj == "down_proj":
             param.data[expert_id].copy_(loaded_weight.chunk(self.tp_size, 1)[self.tp_rank])
@@ -236,7 +236,8 @@ class FusedMoE(nn.Module):
     ) -> torch.Tensor:
         """With the shared experts' weights, their output is added in, before the one all-reduce both need."""
         out = torch.ops.lean_vllm.moe_experts(
-            x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.expert_map, shared_gate_up, shared_down)
+            x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.expert_map, shared_gate_up, shared_down
+        )
         if self.tp_size > 1 or self.ep_size > 1:
             dist.all_reduce(out)
         return out

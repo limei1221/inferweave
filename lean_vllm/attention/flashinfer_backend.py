@@ -1,4 +1,5 @@
 import math
+from typing import Any
 
 import torch
 
@@ -13,7 +14,7 @@ try:
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
-except ImportError as e:    # the cuda extra installs it on Linux
+except ImportError as e:  # the cuda extra installs it on Linux
     _IMPORT_ERROR = e
 
 # Scratch for split-KV partial results, shared by every wrapper as vLLM shares one.
@@ -25,11 +26,11 @@ MAX_RAGGED_PLANS = 8
 class FlashInferBackend(AttentionBackend):
     """FlashInfer's paged prefill and decode, planned once per step, with the Triton KV-cache scatter. sm80 and up."""
 
-    supported_kinds = ("decoder",)    # MLA layers take flashinfer_mla, which runs this prefill
+    supported_kinds = ("decoder",)  # MLA layers take flashinfer_mla, which runs this prefill
     _workspace: torch.Tensor | None = None
-    _wrappers: dict[tuple, object] = {}    # by kernel, layer shape and graph size; each holds one plan at a time
-    _ragged: list[list] = []    # [wrapper, the problem it is planned for], reused across steps
-    _graph_pages: tuple[torch.Tensor, ...] | None = None    # the page table full graphs read, sized at the largest
+    _wrappers: dict[tuple, Any] = {}  # by kernel, layer shape and graph size; each holds one plan at a time
+    _ragged: list[list] = []  # [wrapper, the problem it is planned for], reused across steps
+    _graph_pages: tuple[torch.Tensor, ...] | None = None  # the page table full graphs read, sized at the largest
 
     @staticmethod
     def get_name() -> str:
@@ -37,12 +38,16 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def is_available() -> bool:
-        return (_IMPORT_ERROR is None and triton_cache._IMPORT_ERROR is None and torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] >= 8)
+        return (
+            _IMPORT_ERROR is None
+            and triton_cache._IMPORT_ERROR is None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 8
+        )
 
     @staticmethod
     def supports_cuda_graph() -> bool:
-        return True    # full graphs re-plan decode before each replay; piecewise runs attention eager
+        return True  # full graphs re-plan decode before each replay; piecewise runs attention eager
 
     @staticmethod
     def split_decodes() -> bool:
@@ -50,11 +55,11 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def supports_head_size(head_size: int) -> bool:
-        return head_size in (64, 128, 256)    # as vLLM's FlashInfer backend
+        return head_size in (64, 128, 256)  # as vLLM's FlashInfer backend
 
     @staticmethod
     def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        return head_size == v_head_size or (head_size, v_head_size) == (192, 128)    # its prefill builds DeepSeek's
+        return head_size == v_head_size or (head_size, v_head_size) == (192, 128)  # its prefill builds DeepSeek's
 
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
@@ -67,12 +72,13 @@ class FlashInferBackend(AttentionBackend):
             return self._planned_ragged(q, k, v, cu_q, cu_k, causal=True).run(q, k, v)
         return self._planned("paged", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache))
 
-    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                        host_cu_seqlens=None):
+    def varlen_with_lse(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
+    ):
         host_q, host_k = host_cu_seqlens or (None, None)
         cu_q, cu_k = _host_cumulative(host_q, cu_seqlens_q), _host_cumulative(host_k, cu_seqlens_k)
         o, lse = self._planned_ragged(q, k, v, cu_q, cu_k, causal).run(q, k, v, return_lse=True)
-        return o, lse * math.log(2)    # FlashInfer's log-sum-exp is base 2
+        return o, lse * math.log(2)  # FlashInfer's log-sum-exp is base 2
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         return self._planned("decode", q, k_cache.dtype, context, k_cache.size(1)).run(q, (k_cache, v_cache))
@@ -80,8 +86,18 @@ class FlashInferBackend(AttentionBackend):
     def _planned_ragged(self, q, k, v, cu_q: torch.Tensor, cu_k: torch.Tensor, causal: bool):
         """A ragged wrapper planned for this problem. Every layer of a step poses the same few, so each is planned
         by the first layer to pose it, on a wrapper of its own; past MAX_RAGGED_PLANS they share the last."""
-        key = (self.num_heads, self.num_kv_heads, self.head_dim, v.size(-1), self.scale, q.dtype, k.dtype, causal,
-               tuple(cu_q.tolist()), tuple(cu_k.tolist()))
+        key = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            v.size(-1),
+            self.scale,
+            q.dtype,
+            k.dtype,
+            causal,
+            tuple(cu_q.tolist()),
+            tuple(cu_k.tolist()),
+        )
         step = get_context()
         if step.attn_metadata is None:
             step.attn_metadata = {}
@@ -91,17 +107,36 @@ class FlashInferBackend(AttentionBackend):
         while len(pool) <= slot:
             pool.append([BatchPrefillWithRaggedKVCacheWrapper(self._workspace_for(q.device), "NHD"), None])
         entry = pool[slot]
-        if entry[1] != key:    # a plan is reused while nothing else has planned its wrapper
-            entry[0].plan(cu_q, cu_k, self.num_heads, self.num_kv_heads, self.head_dim, v.size(-1), causal=causal,
-                          sm_scale=self.scale, q_data_type=q.dtype, kv_data_type=k.dtype)
+        if entry[1] != key:  # a plan is reused while nothing else has planned its wrapper
+            entry[0].plan(
+                cu_q,
+                cu_k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                v.size(-1),
+                causal=causal,
+                sm_scale=self.scale,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+            )
             entry[1] = key
         return entry[0]
 
     def _planned(self, kind: str, q: torch.Tensor, kv_dtype: torch.dtype, context: Context, page_size: int = 0):
         """This step's wrapper for kind, planned by the first layer to ask and reused by every layer alike."""
         graph_size = context.full_graph_size if kind == "decode" else None
-        key = (kind, self.num_heads, self.num_kv_heads, self.head_dim, self.scale, q.dtype, kv_dtype, page_size,
-               graph_size)
+        key = (
+            kind,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.scale,
+            q.dtype,
+            kv_dtype,
+            page_size,
+            graph_size,
+        )
         if context.attn_metadata is None:
             context.attn_metadata = {}
         if key in context.attn_metadata:
@@ -113,7 +148,7 @@ class FlashInferBackend(AttentionBackend):
         options = dict(sm_scale=self.scale, q_data_type=q.dtype, kv_data_type=kv_dtype)
         if kind == "decode":
             _plan_decode(wrapper, key, self._pages(context, page_size, graph_size))
-        else:    # FlashInfer's causal mask is bottom-right aligned, as the contract asks
+        else:  # FlashInfer's causal mask is bottom-right aligned, as the contract asks
             qo_indptr = _host_cumulative(context.cu_seqlens_q_host, context.cu_seqlens_q)
             indptr, indices, last_page_len = self._pages(context, page_size)
             wrapper.plan(qo_indptr, indptr, indices, last_page_len, *shape, page_size, causal=True, **options)
@@ -149,15 +184,22 @@ class FlashInferBackend(AttentionBackend):
             return BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD", use_tensor_cores=use_tensor_cores)
         # One per captured batch size, over slices of one fixed page table, as vLLM's.
         if FlashInferBackend._graph_pages is None:
-            rows, width = context.block_tables.shape    # graphs capture largest first, so this bounds the rest
-            FlashInferBackend._graph_pages = (torch.zeros(rows + 1, dtype=torch.int32, device=device),
-                                              torch.zeros(rows * width, dtype=torch.int32, device=device),
-                                              torch.zeros(rows, dtype=torch.int32, device=device))
+            assert context.block_tables is not None
+            rows, width = context.block_tables.shape  # graphs capture largest first, so this bounds the rest
+            FlashInferBackend._graph_pages = (
+                torch.zeros(rows + 1, dtype=torch.int32, device=device),
+                torch.zeros(rows * width, dtype=torch.int32, device=device),
+                torch.zeros(rows, dtype=torch.int32, device=device),
+            )
         indptr, indices, last_page_len = FlashInferBackend._graph_pages
         assert graph_size <= last_page_len.numel(), "full graphs must capture their largest batch size first"
         return BatchDecodeWithPagedKVCacheWrapper(
-            workspace, "NHD", use_cuda_graph=True, use_tensor_cores=use_tensor_cores,
-            paged_kv_indptr_buffer=indptr[:graph_size + 1], paged_kv_indices_buffer=indices,
+            workspace,
+            "NHD",
+            use_cuda_graph=True,
+            use_tensor_cores=use_tensor_cores,
+            paged_kv_indptr_buffer=indptr[: graph_size + 1],
+            paged_kv_indices_buffer=indices,
             paged_kv_last_page_len_buffer=last_page_len[:graph_size],
         )
 
@@ -173,10 +215,11 @@ class FlashInferBackend(AttentionBackend):
         rows = torch.repeat_interleave(num_pages)
         pages = torch.arange(rows.numel()) - indptr[rows]
         block_tables = context.block_tables
+        assert block_tables is not None
         flat = (rows * block_tables.size(1) + pages).to(block_tables.device, non_blocking=True)
         indices = block_tables.flatten()[flat]
         last_page_len = kv_lens - (num_pages - 1) * page_size
-        if num_rows is not None:    # a last length of 1, as vLLM pads, though an empty row reads none
+        if num_rows is not None:  # a last length of 1, as vLLM pads, though an empty row reads none
             pad = num_rows - kv_lens.numel()
             indptr = torch.cat([indptr, indptr[-1:].expand(pad)])
             last_page_len = torch.cat([last_page_len, last_page_len.new_ones(pad)])
@@ -186,14 +229,16 @@ class FlashInferBackend(AttentionBackend):
 def _plan_decode(wrapper, key: tuple, pages: tuple[torch.Tensor, ...]) -> None:
     """Plan a decode wrapper from its key alone, so a replay hook re-plans with no layer at hand."""
     _, num_heads, num_kv_heads, head_dim, scale, q_dtype, kv_dtype, page_size, _ = key
-    wrapper.plan(*pages, num_heads, num_kv_heads, head_dim, page_size,
-                 sm_scale=scale, q_data_type=q_dtype, kv_data_type=kv_dtype)
+    wrapper.plan(
+        *pages, num_heads, num_kv_heads, head_dim, page_size, sm_scale=scale, q_data_type=q_dtype, kv_data_type=kv_dtype
+    )
 
 
 def _host_cumulative(host: list[int] | None, device: torch.Tensor | None, lens: torch.Tensor | None = None):
     """Cumulative lengths as a host int32 tensor. A hand-built context may lack the host copy, so read the device."""
     if host is None:
-        if device is None:    # a decode context carries its lengths alone
+        if device is None:  # a decode context carries its lengths alone
+            assert lens is not None
             device = torch.nn.functional.pad(lens.cumsum(0), (1, 0))
         host = device.tolist()
     return torch.tensor(host, dtype=torch.int32)

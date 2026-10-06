@@ -1,10 +1,10 @@
 import dataclasses
 from itertools import accumulate
-from typing import Callable
+from typing import Callable, cast
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend, triton_merge
 from lean_vllm.utils import device as dev
@@ -39,7 +39,7 @@ def _actual_rows(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
 @torch.library.custom_op("lean_vllm::attention", mutates_args=("out",))
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
     q, k, v = _actual_rows(q, k, v)
-    out[:q.size(0)] = _layer(layer_name).attend(q, k, v)
+    out[: q.size(0)] = _layer(layer_name).attend(q, k, v)
 
 
 @attention.register_fake
@@ -50,7 +50,7 @@ def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, laye
 @torch.library.custom_op("lean_vllm::mla_attention", mutates_args=("out",))
 def mla_attention(q: torch.Tensor, latent: torch.Tensor, out: torch.Tensor, layer_name: str) -> None:
     q, latent = _actual_rows(q, latent)
-    out[:q.size(0)] = _layer(layer_name).attend(q, latent)
+    out[: q.size(0)] = cast("MLAAttention", _layer(layer_name)).attend(q, latent)
 
 
 @mla_attention.register_fake
@@ -76,7 +76,8 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         # The default dtype is the model's while the runner builds it.
         backend_cls = backend or get_attention_backend(
-            LayerSpec(head_dim, num_heads, num_kv_heads, torch.get_default_dtype()))
+            LayerSpec(head_dim, num_heads, num_kv_heads, torch.get_default_dtype())
+        )
         self.backend = backend_cls(num_heads, head_dim, scale, num_kv_heads)
         self.k_cache = self.v_cache = torch.tensor([])
         self.layer_name = ""
@@ -114,13 +115,14 @@ class Attention(nn.Module):
 @dataclasses.dataclass(slots=True)
 class ContextChunk:
     """Cached keys of consecutive rows, and the queries of those rows."""
-    queries: slice    # the rows' tokens in the step's q
+
+    queries: slice  # the rows' tokens in the step's q
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
     max_seqlen_q: int
     max_seqlen_k: int
-    slots: torch.Tensor    # the cache slot of each key
-    host_cu_seqlens: tuple[list[int], list[int]]    # cu_seqlens_q and _k on the host, for backends that plan there
+    slots: torch.Tensor  # the cache slot of each key
+    host_cu_seqlens: tuple[list[int], list[int]]  # cu_seqlens_q and _k on the host, for backends that plan there
 
 
 def plan_context_chunks(context_lens: list[int], budget: int) -> list[tuple[int, list[int], list[int]]]:
@@ -149,6 +151,7 @@ def context_chunks(context: Context, block_size: int, budget: int) -> list[Conte
     """The step's cached keys in chunks, planned on the host once per step."""
     if context.context_chunks is None:
         cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
+        assert cu_q is not None and cu_k is not None and context.block_tables is not None
         context_lens = [(cu_k[i + 1] - cu_k[i]) - (cu_q[i + 1] - cu_q[i]) for i in range(len(cu_q) - 1)]
         device = context.block_tables.device
         context.context_chunks = []
@@ -160,22 +163,24 @@ def context_chunks(context: Context, block_size: int, budget: int) -> list[Conte
             offsets = dev.make_tensor([s - c for s, c in zip(starts, cu_seqlens_k)], torch.int64, device)
             positions = torch.arange(num_keys, device=device) + offsets[key_rows]
             blocks = context.block_tables[first + key_rows, positions // block_size].long()
-            cu_seqlens_q = [n - cu_q[first] for n in cu_q[first:last + 1]]
-            context.context_chunks.append(ContextChunk(
-                queries=slice(cu_q[first], cu_q[last]),
-                cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, device),
-                cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, device),
-                max_seqlen_q=max(cu_q[i + 1] - cu_q[i] for i in range(first, last)),
-                max_seqlen_k=max(lens),
-                slots=blocks * block_size + positions % block_size,
-                host_cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
-            ))
+            cu_seqlens_q = [n - cu_q[first] for n in cu_q[first : last + 1]]
+            context.context_chunks.append(
+                ContextChunk(
+                    queries=slice(cu_q[first], cu_q[last]),
+                    cu_seqlens_q=dev.make_tensor(cu_seqlens_q, torch.int32, device),
+                    cu_seqlens_k=dev.make_tensor(cu_seqlens_k, torch.int32, device),
+                    max_seqlen_q=max(cu_q[i + 1] - cu_q[i] for i in range(first, last)),
+                    max_seqlen_k=max(lens),
+                    slots=blocks * block_size + positions % block_size,
+                    host_cu_seqlens=(cu_seqlens_q, cu_seqlens_k),
+                )
+            )
     return context.context_chunks
 
 
 def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention over two disjoint key sets, from each one's output and log-sum-exp."""
-    weight_b = torch.sigmoid(lse_b - lse_a).unsqueeze(-1)    # exp(lse_b) / (exp(lse_a) + exp(lse_b))
+    weight_b = torch.sigmoid(lse_b - lse_a).unsqueeze(-1)  # exp(lse_b) / (exp(lse_a) + exp(lse_b))
     o = torch.lerp(o_a.float(), o_b.float(), weight_b)
     return o.to(o_a.dtype), torch.logaddexp(lse_a, lse_b)
 
@@ -197,7 +202,7 @@ class MLAAttention(Attention):
     This plays vLLM's MLACommonImpl, so it splits a step into decode and prefill itself.
     """
 
-    max_context_chunk = 8192    # the runner sets its step token budget
+    max_context_chunk = 8192  # the runner sets its step token budget
 
     def __init__(
         self,
@@ -211,13 +216,14 @@ class MLAAttention(Attention):
         backend: type[AttentionBackend] | None = None,
     ):
         backend = backend or get_attention_backend(
-            LayerSpec(qk_head_dim, num_heads, num_heads, torch.get_default_dtype(), latent_dim))
+            LayerSpec(qk_head_dim, num_heads, num_heads, torch.get_default_dtype(), latent_dim)
+        )
         super().__init__(num_heads, qk_head_dim, scale, num_heads, backend)
         self.v_head_dim = v_head_dim
         self.latent_dim = latent_dim
         # Values pad up to the keys' head size only for a backend that takes one size, as vLLM's MLA prefill.
         self.pad_values = not self.backend.supports_value_head_size(qk_head_dim, v_head_dim)
-        self.expand = expand    # methods of the owning layer, so not a registered submodule
+        self.expand = expand  # methods of the owning layer, so not a registered submodule
         self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
 
@@ -234,23 +240,24 @@ class MLAAttention(Attention):
         # Decode must attend latents, as expanding them needs the step's host plan, and be safe to replay.
         return self.backend.supports_mla_decode() and self.backend.supports_full_cudagraph_mla_decode()
 
-    def forward(self, q: torch.Tensor, latent: torch.Tensor):
+    def forward(self, q: torch.Tensor, latent: torch.Tensor):  # type: ignore[override]
         out = q.new_empty(self.output_shape(q.size(0)))
         torch.ops.lean_vllm.mla_attention(q, latent, out, self.layer_name)
         return out
 
-    def attend(self, q: torch.Tensor, latent: torch.Tensor):
+    def attend(self, q: torch.Tensor, latent: torch.Tensor):  # type: ignore[override]
         context = get_context()
         cache = self.latent_cache
         if not cache.numel():
-            return self._prefill(q, latent, context)    # warmup: no cache yet, so every key is new
+            return self._prefill(q, latent, context)  # warmup: no cache yet, so every key is new
         self.backend.store_latents(latent, cache, context.slot_mapping)
         if not self.backend.supports_mla_decode():
-            return self._prefill(q, latent, context)    # decode rows expand like prompt rows
+            return self._prefill(q, latent, context)  # decode rows expand like prompt rows
         if not context.is_prefill:
-            return self._decode_latents(q, context)    # pure decode
+            return self._decode_latents(q, context)  # pure decode
         n, decodes, prefills = split_decodes_and_prefills(context)
         if decodes is None:
+            assert prefills is not None
             return self._prefill(q, latent, prefills)
         if prefills is None:
             return self._decode_latents(q, decodes)
@@ -268,9 +275,17 @@ class MLAAttention(Attention):
             return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged))
         # New tokens attend each other causally, then each chunk of cached keys unmasked.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
+        assert cu_seqlens_q is not None
         host = context.cu_seqlens_q_host
         o, lse = self.backend.varlen_with_lse(
-            q, k, self._pad(v), cu_seqlens_q, cu_seqlens_q, max_seqlen_q, max_seqlen_q, causal=True,
+            q,
+            k,
+            self._pad(v),
+            cu_seqlens_q,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_q,
+            causal=True,
             host_cu_seqlens=None if host is None else (host, host),
         )
         del k, v
@@ -279,11 +294,18 @@ class MLAAttention(Attention):
             k, v = self.expand(latents[chunk.slots])
             rows = chunk.queries
             o_chunk, lse_chunk = self.backend.varlen_with_lse(
-                q[rows], k, self._pad(v), chunk.cu_seqlens_q, chunk.cu_seqlens_k,
-                chunk.max_seqlen_q, chunk.max_seqlen_k, causal=False, host_cu_seqlens=chunk.host_cu_seqlens,
+                q[rows],
+                k,
+                self._pad(v),
+                chunk.cu_seqlens_q,
+                chunk.cu_seqlens_k,
+                chunk.max_seqlen_q,
+                chunk.max_seqlen_k,
+                causal=False,
+                host_cu_seqlens=chunk.host_cu_seqlens,
             )
             del k, v
-            merge_attention_(o[rows], lse[rows], o_chunk, lse_chunk)    # rows is a slice, so these are views
+            merge_attention_(o[rows], lse[rows], o_chunk, lse_chunk)  # rows is a slice, so these are views
         return self._unpad(o)
 
     def _decode_latents(self, q: torch.Tensor, context: Context) -> torch.Tensor:
@@ -306,4 +328,4 @@ class MLAAttention(Attention):
         return F.pad(v, (0, self.head_dim - self.v_head_dim)) if self.pad_values else v
 
     def _unpad(self, o: torch.Tensor) -> torch.Tensor:
-        return o[..., :self.v_head_dim].contiguous() if self.pad_values else o
+        return o[..., : self.v_head_dim].contiguous() if self.pad_values else o

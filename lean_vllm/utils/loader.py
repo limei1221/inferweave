@@ -1,9 +1,10 @@
 import os
 import re
 from glob import glob
+
 import torch
-from torch import nn
 from safetensors import safe_open
+from torch import nn
 
 # Routed experts are stored one by one, and load into one stacked parameter per projection.
 EXPERT_WEIGHT = re.compile(r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight")
@@ -24,7 +25,7 @@ def load_model(model: nn.Module, path: str):
                     prefix, expert_id, proj = expert.groups()
                     param_name = f"{prefix}.{STACKED_EXPERT_PARAMS[proj]}"
                     param = model.get_parameter(param_name)
-                    param.weight_loader(param, f.get_tensor(weight_name), (int(expert_id), proj))
+                    param.weight_loader(param, f.get_tensor(weight_name), (int(expert_id), proj))  # type: ignore[attr-defined]
                     loaded.add(param_name)
                     continue
                 for k in packed_modules_mapping:
@@ -32,7 +33,7 @@ def load_model(model: nn.Module, path: str):
                         v, shard_id = packed_modules_mapping[k]
                         param_name = weight_name.replace(k, v)
                         param = model.get_parameter(param_name)
-                        weight_loader = getattr(param, "weight_loader")
+                        weight_loader = param.weight_loader  # type: ignore[attr-defined]
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         loaded.add(param_name)
                         break
@@ -42,16 +43,17 @@ def load_model(model: nn.Module, path: str):
                     weight_loader(param, f.get_tensor(weight_name))
                     loaded.add(weight_name)
     check_loaded(model, loaded, path)
-    for module in model.modules():    # vLLM's hook, for what is derived from the weights once
+    for module in model.modules():  # vLLM's hook, for what is derived from the weights once
         if hasattr(module, "process_weights_after_loading"):
-            module.process_weights_after_loading()
+            module.process_weights_after_loading()  # type: ignore[operator]
 
 
 def check_loaded(model: nn.Module, loaded: set[str], path: str):
     """A parameter no weight reached would run on uninitialized memory. A tied one shares a loaded one's storage."""
     loaded_storage = {model.get_parameter(name).data_ptr() for name in loaded}
     missing = [
-        name for name, param in model.named_parameters()
+        name
+        for name, param in model.named_parameters()
         if name not in loaded and param.data_ptr() not in loaded_storage
     ]
     if missing:

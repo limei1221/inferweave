@@ -31,7 +31,9 @@ def get_attention_backend(spec: LayerSpec, name: str | None = None) -> type[Atte
         backend = by_name[name]
         reasons = _unsupported(backend, spec)
         if reasons:
-            raise RuntimeError(f"attention backend {name!r} was requested but cannot serve {spec}: {'; '.join(reasons)}")
+            raise RuntimeError(
+                f"attention backend {name!r} was requested but cannot serve {spec}: {'; '.join(reasons)}"
+            )
         return backend
     return next(backend for backend in BACKENDS if not _unsupported(backend, spec))
 

@@ -14,7 +14,7 @@ def add_engine_args(parser: argparse.ArgumentParser):
     for field in fields(Config):
         default = field.default
         if field.name in INTERNAL or default is MISSING or default is None:
-            continue    # no default to take a type from
+            continue  # no default to take a type from
         flag = "--" + field.name.replace("_", "-")
         if isinstance(default, bool):
             group.add_argument(flag, action=argparse.BooleanOptionalAction, default=default)
@@ -42,11 +42,15 @@ def main(argv: list[str] | None = None):
 
     if args.command == "proxy":
         import uvicorn
+
         from lean_vllm.entrypoints.disagg_proxy import build_proxy_app
-        uvicorn.run(build_proxy_app(args.prefill, args.decode), host=args.host, port=args.port, log_level=args.log_level)
+
+        uvicorn.run(
+            build_proxy_app(args.prefill, args.decode), host=args.host, port=args.port, log_level=args.log_level
+        )
         return
 
-    from lean_vllm.entrypoints.server import run    # imports fastapi, which is the `serve` extra
+    from lean_vllm.entrypoints.server import run  # imports fastapi, which is the `serve` extra
 
     engine_kwargs = {
         field.name: getattr(args, field.name)

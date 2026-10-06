@@ -1,6 +1,7 @@
 import heapq
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Iterator
 
 from lean_vllm.engine.sequence import Sequence
 
@@ -31,6 +32,12 @@ class SchedulingPolicy(ABC):
 
     @abstractmethod
     def remove(self, seq: Sequence): ...
+
+    @abstractmethod
+    def __len__(self) -> int: ...
+
+    @abstractmethod
+    def __iter__(self) -> Iterator[Sequence]: ...
 
     @abstractmethod
     def victim(self, running: deque[Sequence]) -> Sequence:
@@ -65,7 +72,7 @@ class Fcfs(SchedulingPolicy):
         self.queue.remove(seq)
 
     def victim(self, running):
-        return running[-1]    # newest, so the oldest work is preserved
+        return running[-1]  # newest, so the oldest work is preserved
 
     def __len__(self):
         return len(self.queue)

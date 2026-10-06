@@ -27,7 +27,7 @@ class FakeTokenizer:
 
     def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, return_dict=True):
         ids = self.encode("\n".join(message["content"] for message in messages))
-        return {"input_ids": ids} if return_dict else ids    # as a real fast tokenizer does
+        return {"input_ids": ids} if return_dict else ids  # as a real fast tokenizer does
 
 
 class FakeAsyncEngine:
@@ -41,8 +41,8 @@ class FakeAsyncEngine:
         self.is_dead = False
         self.error = None
         self.admission_error: Exception | None = None
-        self.hang = False    # never finish, like a request the client gives up on
-        self.kv_transfer_params = None    # what the final output hands back, as a prefill instance's does
+        self.hang = False  # never finish, like a request the client gives up on
+        self.kv_transfer_params = None  # what the final output hands back, as a prefill instance's does
         self.requests: list[tuple] = []
         self.aborted: list[tuple[str, str]] = []
 
@@ -108,7 +108,6 @@ def events(response) -> list[str]:
 
 
 class TestEndpoints:
-
     def test_health_is_ok(self, client):
         assert client.get("/health").json() == {"status": "ok"}
 
@@ -130,20 +129,17 @@ class TestEndpoints:
         complete(client)
         summary = client.get("/metrics.json").json()
         assert summary["requests"]["received"] == 1
-        assert summary["prefix_cache_hit_rate"] is None    # nothing scheduled behind this fake
+        assert summary["prefix_cache_hit_rate"] is None  # nothing scheduled behind this fake
 
 
 class TestCompletions:
-
     def test_the_pieces_are_joined(self, client):
         body = complete(client).json()
         assert body["choices"][0]["text"] == "Hello, world"
         assert body["choices"][0]["finish_reason"] == "length"
 
     def test_usage_counts_both_ends(self, client):
-        assert complete(client).json()["usage"] == {
-            "prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4
-        }
+        assert complete(client).json()["usage"] == {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4}
 
     def test_token_ids_are_accepted_as_a_prompt(self, client, engine):
         complete(client, prompt=[1, 2, 3])
@@ -159,11 +155,15 @@ class TestCompletions:
 
 
 class TestChatCompletions:
-
     def test_empty_messages_are_a_400(self, client, engine):
-        response = client.post("/v1/chat/completions", json={
-            "model": MODEL, "messages": [], "max_tokens": 4,
-        })
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [],
+                "max_tokens": 4,
+            },
+        )
         assert response.status_code == 400
         assert response.json()["error"]["type"] == "invalid_request_error"
         assert "messages" in response.json()["error"]["message"]
@@ -177,7 +177,6 @@ class TestChatCompletions:
 
 
 class TestStreaming:
-
     def test_deltas_are_sse_and_end_with_done(self, client):
         response = complete(client, stream=True)
         assert response.headers["content-type"].startswith("text/event-stream")
@@ -204,7 +203,10 @@ class TestStreaming:
         """Chunks drop unset fields, so a null finish_reason and logprobs must still be sent."""
         first = json.loads(events(complete(client, stream=True))[0])
         assert first == {
-            "id": first["id"], "object": "text_completion", "created": first["created"], "model": MODEL,
+            "id": first["id"],
+            "object": "text_completion",
+            "created": first["created"],
+            "model": MODEL,
             "choices": [{"index": 0, "text": "Hello", "finish_reason": None, "logprobs": None}],
         }
 
@@ -216,16 +218,14 @@ class TestStreaming:
 
 
 class TestStopStrings:
-
     def test_a_stop_string_truncates_the_text_and_aborts(self, client, engine):
         body = complete(client, stop=",").json()
         assert body["choices"][0]["text"] == "Hello"
         assert body["choices"][0]["finish_reason"] == "stop"
-        assert engine.aborted[0] == (body["id"], "stop")    # dropped, not run to max_tokens, and not a cancel
+        assert engine.aborted[0] == (body["id"], "stop")  # dropped, not run to max_tokens, and not a cancel
 
 
 class TestDisconnect:
-
     def test_a_client_that_leaves_a_non_streaming_request_aborts_it(self, engine):
         """Starlette only watches for a disconnect while streaming."""
         engine.hang = True
@@ -245,11 +245,19 @@ class TestDisconnect:
 
 
 class TestRefusals:
-
-    @pytest.mark.parametrize("field, value", [
-        ("top_p", 0.9), ("top_k", 20), ("seed", 1), ("logprobs", 1),
-        ("presence_penalty", 0.1), ("logit_bias", {"1": 1.0}), ("echo", True), ("best_of", 2),
-    ])
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("top_p", 0.9),
+            ("top_k", 20),
+            ("seed", 1),
+            ("logprobs", 1),
+            ("presence_penalty", 0.1),
+            ("logit_bias", {"1": 1.0}),
+            ("echo", True),
+            ("best_of", 2),
+        ],
+    )
     def test_an_unsupported_parameter_is_named_in_a_400(self, client, field, value):
         response = complete(client, **{field: value})
         assert response.status_code == 400
@@ -275,14 +283,24 @@ class TestRefusals:
 
     def test_the_served_name_is_the_one_that_works(self, client):
         assert complete(client, model=MODEL).status_code == 200
-        assert client.post("/v1/chat/completions", json={
-            "model": "some-other-model", "messages": [{"role": "user", "content": "hi"}],
-        }).status_code == 404
+        assert (
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "some-other-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            ).status_code
+            == 404
+        )
 
-    @pytest.mark.parametrize("message", [
-        "token id 999999 is outside the 100-token vocabulary",
-        "prompt is 65 tokens, leaving no room in the 64-token context",
-    ])
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "token id 999999 is outside the 100-token vocabulary",
+            "prompt is 65 tokens, leaving no room in the 64-token context",
+        ],
+    )
     def test_a_prompt_the_engine_rejects_is_a_400_and_not_a_500(self, client, engine, message):
         """Validation lives in the engine, which knows the vocabulary and the context length."""
         engine.admission_error = InvalidRequest(message)
@@ -303,7 +321,7 @@ class TestRefusals:
         assert complete(client).status_code == 503
 
     def test_a_capacity_drop_is_a_503_rather_than_a_completion(self, client, engine):
-        """"capacity" means the server could not serve it, so it is not an OpenAI finish reason."""
+        """ "capacity" means the server could not serve it, so it is not an OpenAI finish reason."""
         engine.pieces, engine.finish_reason = [""], "capacity"
         response = complete(client)
         assert response.status_code == 503
@@ -324,7 +342,6 @@ class TestRefusals:
 
 
 class TestDisaggregatedPrefill:
-
     PARAMS = {"do_remote_prefill": True, "remote_block_ids": [3, 4], "remote_request_id": "cmpl-p"}
 
     def test_the_request_s_params_reach_the_engine(self, client, engine):
@@ -334,13 +351,20 @@ class TestDisaggregatedPrefill:
     def test_a_prefill_instance_s_reply_carries_them_back(self, client, engine):
         """What the proxy forwards to the decode instance."""
         engine.kv_transfer_params = self.PARAMS
-        assert complete(client, kv_transfer_params={"do_remote_decode": True}).json()["kv_transfer_params"] == self.PARAMS
+        assert (
+            complete(client, kv_transfer_params={"do_remote_decode": True}).json()["kv_transfer_params"] == self.PARAMS
+        )
 
     def test_a_chat_reply_carries_them_too(self, client, engine):
         engine.kv_transfer_params = self.PARAMS
-        response = client.post("/v1/chat/completions", json={
-            "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "kv_transfer_params": {"do_remote_decode": True},
-        })
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hi"}],
+                "kv_transfer_params": {"do_remote_decode": True},
+            },
+        )
         assert response.json()["kv_transfer_params"] == self.PARAMS
 
     def test_a_streamed_hand_off_is_refused(self, client, engine):

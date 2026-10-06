@@ -7,7 +7,7 @@ from lean_vllm.utils.context import Context
 _IMPORT_ERROR: ImportError | None = None
 try:
     from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
-except ImportError as e:    # Hopper only, and built by the cuda extra
+except ImportError as e:  # Hopper only, and built by the cuda extra
     _IMPORT_ERROR = e
 
 
@@ -21,8 +21,12 @@ class FlashAttention3Backend(AttentionBackend):
     @staticmethod
     def is_available() -> bool:
         # FA3 is built for Hopper (sm90) only.
-        return (_IMPORT_ERROR is None and triton_cache._IMPORT_ERROR is None and torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] == 9)
+        return (
+            _IMPORT_ERROR is None
+            and triton_cache._IMPORT_ERROR is None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 9
+        )
 
     @staticmethod
     def supports_cuda_graph() -> bool:
@@ -30,7 +34,7 @@ class FlashAttention3Backend(AttentionBackend):
 
     @staticmethod
     def supports_head_size(head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256    # as vLLM's FlashAttention backend
+        return head_size % 8 == 0 and head_size <= 256  # as vLLM's FlashAttention backend
 
     @staticmethod
     def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
@@ -47,34 +51,56 @@ class FlashAttention3Backend(AttentionBackend):
         if context.keys_are_new or context.block_tables is None:
             # k and v hold every key this batch attends (cold prompts), so skip the pages.
             return flash_attn_varlen_func(
-                q, k, v,
-                cu_seqlens_q=context.cu_seqlens_q, cu_seqlens_k=context.cu_seqlens_k,
-                max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
-                softmax_scale=self.scale, causal=True,
+                q,
+                k,
+                v,
+                cu_seqlens_q=context.cu_seqlens_q,
+                cu_seqlens_k=context.cu_seqlens_k,
+                max_seqlen_q=context.max_seqlen_q,
+                max_seqlen_k=context.max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
             )
         # Some row reads cached keys, and FA3's varlen entry takes no page table.
+        assert context.cu_seqlens_k is not None
         cache_seqlens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
         return flash_attn_with_kvcache(
-            q, k_cache, v_cache,
-            cache_seqlens=cache_seqlens, page_table=context.block_tables,
-            cu_seqlens_q=context.cu_seqlens_q, max_seqlen_q=context.max_seqlen_q,
-            softmax_scale=self.scale, causal=True,
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            page_table=context.block_tables,
+            cu_seqlens_q=context.cu_seqlens_q,
+            max_seqlen_q=context.max_seqlen_q,
+            softmax_scale=self.scale,
+            causal=True,
         )
 
-    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                        host_cu_seqlens=None):
+    def varlen_with_lse(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
+    ):
         o, lse = flash_attn_varlen_func(
-            q, k, v,
-            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.scale, causal=causal, return_attn_probs=True,
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=causal,
+            return_attn_probs=True,
         )
-        return o, lse.transpose(0, 1)    # FA3's varlen lse is [heads, tokens]
+        return o, lse.transpose(0, 1)  # FA3's varlen lse is [heads, tokens]
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         o = flash_attn_with_kvcache(
-            q.unsqueeze(1), k_cache, v_cache,
-            cache_seqlens=context.context_lens, page_table=context.block_tables,
-            softmax_scale=self.scale, causal=True,
+            q.unsqueeze(1),
+            k_cache,
+            v_cache,
+            cache_seqlens=context.context_lens,
+            page_table=context.block_tables,
+            softmax_scale=self.scale,
+            causal=True,
         )
-        return o.squeeze(1)    # match the [batch, heads, dim] contract
+        return o.squeeze(1)  # match the [batch, heads, dim] contract

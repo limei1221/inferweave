@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+from typing import Callable
 
 import torch
 
@@ -24,7 +25,7 @@ _IMPORT_ERROR: ImportError | None = None
 try:
     import triton
     import triton.language as tl
-except ImportError as e:    # installed by the cuda extra
+except ImportError as e:  # installed by the cuda extra
     _IMPORT_ERROR = e
 else:
 
@@ -64,19 +65,20 @@ else:
         group_size_m = min(num_blocks - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
         pid_n = (pid % num_pid_in_group) // group_size_m
-        if pid_m * BLOCK_SIZE_M >= tl.load(num_rows_ptr): return    # a block the padding left empty
+        if pid_m * BLOCK_SIZE_M >= tl.load(num_rows_ptr):
+            return  # a block the padding left empty
 
         offs_pair = tl.load(sorted_pairs_ptr + pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))
-        pair_mask = offs_pair < num_valid_pairs    # the tail of an expert's run overhangs its last block
+        pair_mask = offs_pair < num_valid_pairs  # the tail of an expert's run overhangs its last block
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + offs_pair[:, None] * stride_cm + offs_cn[None, :] * stride_cn
         c_mask = pair_mask[:, None] & (offs_cn < N)[None, :]
         expert = tl.load(block_experts_ptr + pid_m)
-        if expert == -1:    # another EP rank's expert: its pairs add zero here, as in vLLM
+        if expert == -1:  # another EP rank's expert: its pairs add zero here, as in vLLM
             tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty), mask=c_mask)
             return
 
-        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N    # wrapped, so only the store masks N
+        offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N  # wrapped, so only the store masks N
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         a_ptrs = a_ptr + (offs_pair // TOP_K)[:, None] * stride_am + offs_k[None, :] * stride_ak
         b_ptrs = b_ptr + expert * stride_be + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
@@ -117,12 +119,15 @@ else:
         cols = tl.arange(0, EXPERTS_POW2)
         row_mask = rows < num_tokens
         col_mask = cols < NUM_EXPERTS
-        logits = tl.load(logits_ptr + rows[:, None] * stride_logits + cols[None, :],
-                         mask=row_mask[:, None] & col_mask[None, :], other=0.0).to(tl.float32)
+        logits = tl.load(
+            logits_ptr + rows[:, None] * stride_logits + cols[None, :],
+            mask=row_mask[:, None] & col_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
         logits = tl.where(col_mask[None, :], logits, float("-inf"))
         scores = tl.exp(logits - tl.max(logits, axis=1)[:, None])
         scores = scores / tl.sum(scores, axis=1)[:, None]
-        scores = tl.where(col_mask[None, :], scores, float("-inf"))    # padding is never picked
+        scores = tl.where(col_mask[None, :], scores, float("-inf"))  # padding is never picked
         if NUM_GROUPS > 1:
             # A group scores its best expert; only the TOPK_GROUP best groups stay eligible.
             group = cols // (NUM_EXPERTS // NUM_GROUPS)
@@ -189,7 +194,7 @@ else:
             ptrs = counts_ptr + rows[:, None] * EXPERTS_POW2 + experts[None, :]
             mask = (rows < num_programs)[:, None]
             counts = tl.load(ptrs, mask=mask, other=0)
-            tl.store(ptrs, tl.cumsum(counts, axis=0) - counts + totals[None, :], mask=mask)    # exclusive
+            tl.store(ptrs, tl.cumsum(counts, axis=0) - counts + totals[None, :], mask=mask)  # exclusive
             totals += tl.sum(counts, axis=0)
         padded = (totals + BLOCK_M - 1) // BLOCK_M * BLOCK_M
         starts = tl.cumsum(padded, axis=0) - padded
@@ -225,10 +230,13 @@ else:
         mask = offs < num_pairs
         ids = tl.load(topk_ids_ptr + offs, mask=mask, other=-1)
         one_hot = (ids[:, None] == experts[None, :]).to(tl.int32)
-        rank = tl.sum(tl.cumsum(one_hot, axis=0) * one_hot, axis=1) - 1    # among this program's pairs of the expert
+        rank = tl.sum(tl.cumsum(one_hot, axis=0) * one_hot, axis=1) - 1  # among this program's pairs of the expert
         ids = tl.where(mask, ids, 0)
-        slots = (tl.load(expert_starts_ptr + ids, mask=mask, other=0)
-                 + tl.load(counts_ptr + pid * EXPERTS_POW2 + ids, mask=mask, other=0) + rank)
+        slots = (
+            tl.load(expert_starts_ptr + ids, mask=mask, other=0)
+            + tl.load(counts_ptr + pid * EXPERTS_POW2 + ids, mask=mask, other=0)
+            + rank
+        )
         tl.store(sorted_pairs_ptr + slots, offs, mask=mask)
 
         # A block belongs to the last expert starting at or before it, so an empty expert owns none.
@@ -268,7 +276,7 @@ def get_config_file_name(E: int, N: int, device_name: str | None = None) -> str:
     """vLLM's name for bf16, so its tuned files load here too. N is the intermediate size per expert, after TP."""
     if device_name is None:
         device_name = re.sub(r"[\s/]+", "_", torch.cuda.get_device_name())
-    if "H200" in device_name.split("_"):    # one file serves the H200 family, as in vLLM
+    if "H200" in device_name.split("_"):  # one file serves the H200 family, as in vLLM
         device_name = "NVIDIA_H200"
     return f"E={E},N={N},device_name={device_name}.json"
 
@@ -308,7 +316,7 @@ def try_get_optimal_moe_config(E: int, N: int, M: int) -> dict:
     configs = get_moe_configs(E, N)
     if configs:
         config = configs[min(configs, key=lambda m: abs(m - M))]
-        return {k: v for k, v in config.items() if k != "SPLIT_K"}    # vLLM writes it; the kernel has no split
+        return {k: v for k, v in config.items() if k != "SPLIT_K"}  # vLLM writes it; the kernel has no split
     return get_default_config(M, E)
 
 
@@ -321,7 +329,7 @@ def align_blocks(topk_ids: torch.Tensor, num_experts: int, block_m: int) -> tupl
     pairs = topk_ids.flatten()
     num_pairs = pairs.numel()
     experts = torch.arange(num_experts, device=pairs.device, dtype=pairs.dtype)
-    expert_of_pair, order = pairs.sort(stable=True)    # a run in pair order, as the kernels lay it out
+    expert_of_pair, order = pairs.sort(stable=True)  # a run in pair order, as the kernels lay it out
     starts = torch.searchsorted(expert_of_pair, experts)
     counts = torch.searchsorted(expert_of_pair, experts, right=True) - starts
     padded = (counts + block_m - 1) // block_m * block_m
@@ -352,9 +360,9 @@ def align_blocks_triton(
     pairs = topk_ids.flatten()
     num_pairs = pairs.numel()
     experts_pow2 = triton.next_power_of_2(num_experts)
-    tile = max(16, 8192 // experts_pow2)    # rows of a one-hot tile, so a tile stays near 8K elements
+    tile = max(16, 8192 // experts_pow2)  # rows of a one-hot tile, so a tile stays near 8K elements
     num_programs = triton.cdiv(num_pairs, tile)
-    num_blocks = triton.cdiv(num_pairs, block_m) + num_experts    # every expert wastes under one whole block
+    num_blocks = triton.cdiv(num_pairs, block_m) + num_experts  # every expert wastes under one whole block
     device = pairs.device
     counts = torch.empty(num_programs, experts_pow2, dtype=torch.int32, device=device)
     expert_starts = torch.empty(experts_pow2, dtype=torch.int32, device=device)
@@ -363,13 +371,30 @@ def align_blocks_triton(
     num_rows = torch.empty(1, dtype=torch.int32, device=device)
     count_experts_kernel[(num_programs,)](pairs, counts, num_pairs, EXPERTS_POW2=experts_pow2, BLOCK=tile)
     scan_experts_kernel[(1,)](
-        counts, expert_starts, sorted_pairs, num_rows, num_programs, num_pairs,
-        EXPERTS_POW2=experts_pow2, BLOCK_M=block_m, ROWS=tile, TAIL=min(block_m, tile),
+        counts,
+        expert_starts,
+        sorted_pairs,
+        num_rows,
+        num_programs,
+        num_pairs,
+        EXPERTS_POW2=experts_pow2,
+        BLOCK_M=block_m,
+        ROWS=tile,
+        TAIL=min(block_m, tile),
     )
     scatter_pairs_kernel[(max(num_programs, triton.cdiv(num_blocks, tile)),)](
-        pairs, counts, expert_starts, block_experts if expert_map is None else expert_map,
-        sorted_pairs, block_experts, num_pairs, num_blocks,
-        NUM_EXPERTS=num_experts, EXPERTS_POW2=experts_pow2, BLOCK_M=block_m, BLOCK=tile,
+        pairs,
+        counts,
+        expert_starts,
+        block_experts if expert_map is None else expert_map,
+        sorted_pairs,
+        block_experts,
+        num_pairs,
+        num_blocks,
+        NUM_EXPERTS=num_experts,
+        EXPERTS_POW2=experts_pow2,
+        BLOCK_M=block_m,
+        BLOCK=tile,
         HAS_EXPERT_MAP=expert_map is not None,
     )
     return sorted_pairs, block_experts, num_rows
@@ -391,11 +416,21 @@ def topk_softmax(
     experts_pow2 = triton.next_power_of_2(num_experts)
     block_t = max(1, 4096 // experts_pow2)
     topk_softmax_kernel[(triton.cdiv(num_tokens, block_t),)](
-        router_logits, weights, ids, num_tokens, scaling, router_logits.stride(0),
-        NUM_EXPERTS=num_experts, EXPERTS_POW2=experts_pow2,
-        TOP_K=top_k, TOP_K_POW2=triton.next_power_of_2(top_k),
-        NUM_GROUPS=num_groups, GROUPS_POW2=triton.next_power_of_2(num_groups), TOPK_GROUP=topk_group,
-        RENORMALIZE=renormalize, BLOCK_T=block_t,
+        router_logits,
+        weights,
+        ids,
+        num_tokens,
+        scaling,
+        router_logits.stride(0),
+        NUM_EXPERTS=num_experts,
+        EXPERTS_POW2=experts_pow2,
+        TOP_K=top_k,
+        TOP_K_POW2=triton.next_power_of_2(top_k),
+        NUM_GROUPS=num_groups,
+        GROUPS_POW2=triton.next_power_of_2(num_groups),
+        TOPK_GROUP=topk_group,
+        RENORMALIZE=renormalize,
+        BLOCK_T=block_t,
     )
     return weights, ids
 
@@ -415,7 +450,7 @@ def fused_experts(
     down_proj: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    act_fn: torch.nn.Module,
+    act_fn: Callable[[torch.Tensor], torch.Tensor],
     expert_map: torch.Tensor | None = None,
     config: dict | None = None,
 ) -> torch.Tensor:
@@ -424,33 +459,49 @@ def fused_experts(
     With expert_map, the weights hold this rank's experts, and blocks of other ranks' experts write zeros.
     config overrides the looked-up launch config, for the tuner.
     """
-    num_tokens, _ = x.shape    # [T, D]
-    num_experts, gate_up_size, hidden_size = gate_up_proj.shape    # [E, 2I, D]
+    num_tokens, _ = x.shape  # [T, D]
+    num_experts, gate_up_size, hidden_size = gate_up_proj.shape  # [E, 2I, D]
     launch = config or try_get_optimal_moe_config(num_experts, down_proj.size(2), num_tokens)
     if expert_map is not None:
-        num_experts = expert_map.numel()    # blocked by global id, as vLLM's moe_align_block_size
+        num_experts = expert_map.numel()  # blocked by global id, as vLLM's moe_align_block_size
     top_k = topk_ids.size(1)
     num_pairs = num_tokens * top_k
     sorted_pairs, block_experts, num_rows = align_blocks_triton(
-        topk_ids, num_experts, launch["BLOCK_SIZE_M"], expert_map)
-    topk_weights = topk_weights.flatten()    # the kernel scales its fp32 accumulator by them, in their own dtype
+        topk_ids, num_experts, launch["BLOCK_SIZE_M"], expert_map
+    )
+    topk_weights = topk_weights.flatten()  # the kernel scales its fp32 accumulator by them, in their own dtype
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pairs_per_row: int, mul_routed_weight: bool):
         n, k = b.shape[1], b.shape[2]
         grid = (block_experts.numel() * triton.cdiv(n, launch["BLOCK_SIZE_N"]),)
         fused_moe_kernel[grid](
-            a, b, c, sorted_pairs, block_experts, num_rows, topk_weights,
-            n, k, num_pairs, block_experts.numel(),
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1), b.stride(2),
-            c.stride(0), c.stride(1),
-            TOP_K=pairs_per_row, MUL_ROUTED_WEIGHT=mul_routed_weight, **launch,
+            a,
+            b,
+            c,
+            sorted_pairs,
+            block_experts,
+            num_rows,
+            topk_weights,
+            n,
+            k,
+            num_pairs,
+            block_experts.numel(),
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            b.stride(2),
+            c.stride(0),
+            c.stride(1),
+            TOP_K=pairs_per_row,
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            **launch,
         )
 
     # The first GEMM writes every pair's row before the second reads it, so empty is safe.
-    h = torch.empty(num_pairs, gate_up_size, device=x.device, dtype=x.dtype)    # [T*K, 2I]
-    gemm(x, gate_up_proj, h, top_k, mul_routed_weight=False)    # x has one row per token
-    h = act_fn(h)    # [T*K, 2I] -> [T*K, I]
-    out = torch.empty(num_pairs, hidden_size, device=x.device, dtype=x.dtype)    # [T*K, D]
-    gemm(h, down_proj, out, 1, mul_routed_weight=True)    # h is already one row per pair
-    return out.view(num_tokens, top_k, hidden_size).sum(dim=1)    # [T, D]
+    h = torch.empty(num_pairs, gate_up_size, device=x.device, dtype=x.dtype)  # [T*K, 2I]
+    gemm(x, gate_up_proj, h, top_k, mul_routed_weight=False)  # x has one row per token
+    h = act_fn(h)  # [T*K, 2I] -> [T*K, I]
+    out = torch.empty(num_pairs, hidden_size, device=x.device, dtype=x.dtype)  # [T*K, D]
+    gemm(h, down_proj, out, 1, mul_routed_weight=True)  # h is already one row per pair
+    return out.view(num_tokens, top_k, hidden_size).sum(dim=1)  # [T, D]

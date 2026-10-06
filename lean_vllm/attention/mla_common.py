@@ -24,7 +24,9 @@ class MLACommonBackend(AttentionBackend):
 
     def __init__(self, num_heads: int, head_dim: int, scale: float, num_kv_heads: int):
         super().__init__(num_heads, head_dim, scale, num_kv_heads)
-        self.expanded = prefill_backend()(num_heads, head_dim, scale, num_kv_heads)
+        prefill = prefill_backend()
+        assert prefill is not None
+        self.expanded = prefill(num_heads, head_dim, scale, num_kv_heads)
 
     @staticmethod
     def supports_cuda_graph() -> bool:
@@ -38,8 +40,9 @@ class MLACommonBackend(AttentionBackend):
     def supports_head_size(head_size: int) -> bool:
         prefill = prefill_backend()
         # FlashInfer's prefill also builds DeepSeek's 192, which its decode kernels do not.
-        return prefill is not None and (prefill.supports_head_size(head_size) or
-                                        (prefill is FlashInferBackend and head_size == 192))
+        return prefill is not None and (
+            prefill.supports_head_size(head_size) or (prefill is FlashInferBackend and head_size == 192)
+        )
 
     @staticmethod
     def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
@@ -64,10 +67,12 @@ class MLACommonBackend(AttentionBackend):
     def prefill(self, q, k, v, k_cache, v_cache, context: Context) -> torch.Tensor:
         return self.expanded.prefill(q, k, v, k_cache, v_cache, context)
 
-    def varlen_with_lse(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                        host_cu_seqlens=None):
-        return self.expanded.varlen_with_lse(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal,
-                                             host_cu_seqlens)
+    def varlen_with_lse(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
+    ):
+        return self.expanded.varlen_with_lse(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens
+        )
 
     def decode(self, q, k_cache, v_cache, context: Context) -> torch.Tensor:
         raise NotImplementedError(f"the {self.get_name()} backend decodes MLA latents only")

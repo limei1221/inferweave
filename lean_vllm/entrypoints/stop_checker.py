@@ -20,7 +20,7 @@ class StopChecker:
         if not self.hold:
             emit, self.buffer = self.buffer, ""
             return emit
-        emit, self.buffer = self.buffer[:-self.hold], self.buffer[-self.hold:]
+        emit, self.buffer = self.buffer[: -self.hold], self.buffer[-self.hold :]
         return emit
 
     def flush(self) -> str:

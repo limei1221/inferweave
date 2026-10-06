@@ -19,13 +19,14 @@ from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
 
 logger = logging.getLogger(__name__)
 
-IDLE_POLL_MS = 5    # backoff after a step that ran nothing although work is outstanding
-PARENT_POLL_MS = 1000    # how often an idle core checks that the client is still there
+IDLE_POLL_MS = 5  # backoff after a step that ran nothing although work is outstanding
+PARENT_POLL_MS = 1000  # how often an idle core checks that the client is still there
 
 
 def make_engine(model: str, **kwargs):
     """The engine a core serves. Detokenization stays with the client, as in vLLM, so the step loop skips it."""
     from lean_vllm.engine.llm_engine import LLMEngine
+
     return LLMEngine(model, detokenize=False, **kwargs)
 
 
@@ -80,12 +81,12 @@ class EngineCore:
         kind = message[0]
         if kind == "add":
             _, request_id, prompt, sampling_params = message
-            error = None
+            error: BaseException | None = None
             try:
                 self.engine.add_request(prompt, sampling_params, request_id)
-            except (InvalidRequest, QueueFull) as refused:    # the client turns these into a 400 or a 429
+            except (InvalidRequest, QueueFull) as refused:  # the client turns these into a 400 or a 429
                 error = refused
-            except Exception as unexpected:    # the request's alone, so the engine serves on
+            except Exception as unexpected:  # the request's alone, so the engine serves on
                 logger.exception("add_request failed for %s", request_id)
                 error = picklable(unexpected)
             self.output.send_pyobj(("added", request_id, error))
@@ -127,7 +128,7 @@ def run_engine_core(
     input_socket = context.socket(zmq.PULL)
     input_socket.connect(input_address)
     output_socket = context.socket(zmq.PUSH)
-    output_socket.setsockopt(zmq.SNDHWM, 0)    # never block a step on a slow reader; outputs queue instead
+    output_socket.setsockopt(zmq.SNDHWM, 0)  # never block a step on a slow reader; outputs queue instead
     output_socket.connect(output_address)
     ready.send(("ready", None))
     ready.close()
@@ -140,4 +141,4 @@ def run_engine_core(
         output_socket.send_pyobj(("dead", picklable(error)))
         raise
     finally:
-        context.destroy(linger=1000)    # long enough to deliver a last message, never a hang at exit
+        context.destroy(linger=1000)  # long enough to deliver a last message, never a hang at exit

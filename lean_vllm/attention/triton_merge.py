@@ -7,7 +7,7 @@ _IMPORT_ERROR: ImportError | None = None
 try:
     import triton
     import triton.language as tl
-except ImportError as e:    # installed by the cuda extra
+except ImportError as e:  # installed by the cuda extra
     _IMPORT_ERROR = e
 else:
 
@@ -52,8 +52,18 @@ def merge_attn_states_(o_a: torch.Tensor, lse_a: torch.Tensor, o_b: torch.Tensor
     num_tokens, num_heads, head_dim = o_a.shape
     assert o_a.stride(-1) == 1 and o_b.stride(-1) == 1, "the head dim must be contiguous"
     merge_attn_states_kernel[(num_tokens, num_heads)](
-        o_a, lse_a, o_b, lse_b, head_dim,
-        o_a.stride(0), o_a.stride(1), o_b.stride(0), o_b.stride(1),
-        lse_a.stride(0), lse_a.stride(1), lse_b.stride(0), lse_b.stride(1),
+        o_a,
+        lse_a,
+        o_b,
+        lse_b,
+        head_dim,
+        o_a.stride(0),
+        o_a.stride(1),
+        o_b.stride(0),
+        o_b.stride(1),
+        lse_a.stride(0),
+        lse_a.stride(1),
+        lse_b.stride(0),
+        lse_b.stride(1),
         BLOCK_D=triton.next_power_of_2(head_dim),
     )

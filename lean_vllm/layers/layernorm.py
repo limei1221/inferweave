@@ -3,7 +3,6 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -19,7 +18,7 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = x.dtype
-        x = x.to(torch.float32, copy=True)    # a bare .float() aliases fp32 input, which mul_ would rewrite
+        x = x.to(torch.float32, copy=True)  # a bare .float() aliases fp32 input, which mul_ would rewrite
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
@@ -32,8 +31,8 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
-        x = x.float() + residual.float()    # not add_, which would rewrite an fp32 x in place
-        residual = x.to(orig_dtype, copy=True)    # or, in fp32, the mul_ below rewrites it
+        x = x.float() + residual.float()  # not add_, which would rewrite an fp32 x in place
+        residual = x.to(orig_dtype, copy=True)  # or, in fp32, the mul_ below rewrites it
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)

@@ -2,29 +2,29 @@ import logging
 import math
 from collections import Counter
 from datetime import timedelta
+
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
 
-from lean_vllm.config import Config, FULL_MODES, PIECEWISE_MODES
+from lean_vllm.config import FULL_MODES, PIECEWISE_MODES, Config
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
 from lean_vllm.engine.input_buffers import InputBuffers
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, KVOutputAggregator, create_worker_connector
-from lean_vllm.models import get_model_class
 from lean_vllm.layers.attention import Attention, MLAAttention, register_layers
 from lean_vllm.layers.sampler import Sampler
-from lean_vllm.utils.context import set_context, get_context
-from lean_vllm.utils.loader import load_model
+from lean_vllm.models import get_model_class
 from lean_vllm.utils import device as dev
+from lean_vllm.utils.context import get_context, set_context
+from lean_vllm.utils.loader import load_model
 
 logger = logging.getLogger(__name__)
 
 # How long a TP worker may wait for its next call; gloo's 30-minute default would kill an idle server.
 CALL_TIMEOUT = timedelta(days=365)
-
 
 
 def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> list[int]:
@@ -43,27 +43,27 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
 
 
 class ModelRunner:
-
     def __init__(self, config: Config, rank: int):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        Sequence.block_size = self.block_size    # spawned workers never run LLMEngine.__init__
+        Sequence.block_size = self.block_size  # spawned workers never run LLMEngine.__init__
         self.device = dev.get_device()
-        self.step_kind = "enforced"    # how the last step ran: see _step_kind
-        self._prev_tokens: SampledTokens | None = None    # the step still in flight, if any
-        self._prev_rows: dict[int, int] | None = None       # seq_id -> its row in those tokens
+        self.step_kind = "enforced"  # how the last step ran: see _step_kind
+        self._prev_tokens: SampledTokens | None = None  # the step still in flight, if any
+        self._prev_rows: dict[int, int] | None = None  # seq_id -> its row in those tokens
         model_cls = get_model_class(hf_config)
-        self.graph_bs: list[int] = []          # captured batch sizes, full graphs
-        self.piecewise_bs: list[int] = []      # captured token counts, piecewise graphs
+        self.graph_bs: list[int] = []  # captured batch sizes, full graphs
+        self.piecewise_bs: list[int] = []  # captured token counts, piecewise graphs
         self.graphs: dict = {}
-        self.graph_pool = None                 # shared by both capture kinds
-        self.compile_backend: PiecewiseBackend | None = None    # holds the pieces and their graphs
+        self.graph_pool = None  # shared by both capture kinds
+        self.compile_backend: PiecewiseBackend | None = None  # holds the pieces and their graphs
         self.world_size = config.tensor_parallel_size
         self.rank = rank
 
         dist.init_process_group(
-            dev.dist_backend(self.device), f"tcp://localhost:{config.dist_port}", world_size=self.world_size, rank=rank)
+            dev.dist_backend(self.device), f"tcp://localhost:{config.dist_port}", world_size=self.world_size, rank=rank
+        )
         if self.world_size > 1:
             # Calls go to the workers on the host, whatever device the default group runs on.
             self.call_group = dist.new_group(backend="gloo", timeout=CALL_TIMEOUT)
@@ -73,20 +73,27 @@ class ModelRunner:
         torch.set_default_device(self.device)
         model_kwargs = {"enable_expert_parallel": True} if config.enable_expert_parallel else {}
         self.model = model_cls(hf_config, **model_kwargs)
-        register_layers(self.model)    # before warmup_model, which runs the op
+        register_layers(self.model)  # before warmup_model, which runs the op
         # Each layer chose its backend as it was built; graphs depend on all of them.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
         if rank == 0:
             counts = Counter(layer.backend.get_name() for layer in layers)
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
-        self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))    # replay hooks
-        self.enforce_eager = (config.enforce_eager or self.device.type != "cuda" or not model_cls.supports_cuda_graph
-                              or not all(layer.backend.supports_cuda_graph() for layer in layers))
+        self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))  # replay hooks
+        self.enforce_eager = (
+            config.enforce_eager
+            or self.device.type != "cuda"
+            or not model_cls.supports_cuda_graph
+            or not all(layer.backend.supports_cuda_graph() for layer in layers)
+        )
         mode = "none" if self.enforce_eager else config.cudagraph_mode
         self.cudagraph_mode = self._cudagraph_mode(mode, layers)
         if rank == 0 and self.cudagraph_mode != mode:
-            logger.info("some attention layer cannot run in a full graph; cudagraph_mode is %r not %r",
-                        self.cudagraph_mode, mode)
+            logger.info(
+                "some attention layer cannot run in a full graph; cudagraph_mode is %r not %r",
+                self.cudagraph_mode,
+                mode,
+            )
         for module in self.model.modules():
             if isinstance(module, MLAAttention):
                 # Warmup expands a step's worth of new latents, so a chunk this size fits what it measured.
@@ -116,13 +123,13 @@ class ModelRunner:
         if self.kv_connector is not None:
             self.kv_connector.shutdown()
         if self.world_size > 1:
-            dist.barrier()    # sync ranks
+            dist.barrier()  # sync ranks
         if self.cudagraph_mode != "none":
             for piece in self.compile_backend.pieces:
                 piece.graphs.clear()
             del self.graphs, self.graph_pool
-        dev.synchronize(self.device)    # drain the device
-        dist.destroy_process_group()    # drop the comms
+        dev.synchronize(self.device)  # drain the device
+        dist.destroy_process_group()  # drop the comms
 
     def loop(self):
         while True:
@@ -141,13 +148,14 @@ class ModelRunner:
 
     def kv_connector_step(self, metadata: KVConnectorMetadata) -> KVConnectorOutput | None:
         """Start this step's transfers on every rank, and return those finished on all of them (rank 0 only)."""
+        assert self.kv_connector is not None
         self.kv_connector.start_load_kv(metadata)
         output = self.kv_connector.get_finished()
         if self.world_size == 1:
             return output
-        outputs = [None] * self.world_size if self.rank == 0 else None
+        outputs: list | None = [None] * self.world_size if self.rank == 0 else None
         dist.gather_object(output, outputs, dst=0, group=self.call_group)
-        return self.kv_aggregator.aggregate(outputs) if self.rank == 0 else None
+        return self.kv_aggregator.aggregate(outputs) if outputs is not None else None
 
     def compile_model(self):
         """As vLLM: traced whole, split at attention, pieces compiled by Inductor. Warmup's step runs the compile."""
@@ -173,12 +181,12 @@ class ModelRunner:
         num_rows = min(self.config.max_num_seqs, self.config.max_num_batched_tokens)
         # Random, as vLLM's: dummy hidden states could hold values that break the sampler.
         hidden_states = torch.rand(num_rows, self.config.hf_config.hidden_size)
-        with set_context(False):    # no logits_indices, so every row samples
+        with set_context(False):  # no logits_indices, so every row samples
             logits = self.model.compute_logits(hidden_states)
         if self.rank != 0:
-            return    # only rank 0 gathers logits and samples
+            return  # only rank 0 gathers logits and samples
         try:
-            self.sampler(logits, torch.full((num_rows,), 0.5, dtype=torch.float32))    # non-greedy, the costlier path
+            self.sampler(logits, torch.full((num_rows,), 0.5, dtype=torch.float32))  # non-greedy, the costlier path
         except torch.OutOfMemoryError as error:
             raise RuntimeError(
                 f"out of memory warming up the sampler with {num_rows} rows; "
@@ -194,7 +202,9 @@ class ModelRunner:
         if config.num_kvcache_blocks <= 0:
             config.num_kvcache_blocks = dev.kvcache_bytes(self.device, config) // block_bytes
         assert config.num_kvcache_blocks > 0, "no memory left for the kv cache"
-        self.kv_cache = [torch.empty(layer.kv_cache_shape(config.num_kvcache_blocks, self.block_size)) for layer in layers]
+        self.kv_cache = [
+            torch.empty(layer.kv_cache_shape(config.num_kvcache_blocks, self.block_size)) for layer in layers
+        ]
         for layer, cache in zip(layers, self.kv_cache):
             layer.bind_kv_cache(cache)
 
@@ -219,10 +229,10 @@ class ModelRunner:
         lens = np.fromiter((seq.num_scheduled_tokens for seq in seqs), np.int64, num_rows)
         starts = np.fromiter((seq.num_cached_tokens for seq in seqs), np.int64, num_rows)
         planned = np.fromiter((seq.num_planned_tokens for seq in seqs), np.int64, num_rows)
-        order = np.argsort(lens > 1, kind="stable")    # decodes_first, as indices
+        order = np.argsort(lens > 1, kind="stable")  # decodes_first, as indices
         batch = [seqs[i] for i in order]
         row_of = np.empty(num_rows, np.int64)
-        row_of[order] = np.arange(num_rows)    # each scheduled sequence's row in the batch
+        row_of[order] = np.arange(num_rows)  # each scheduled sequence's row in the batch
 
         lens, starts = lens[order], starts[order]
         ends = starts + lens
@@ -233,31 +243,33 @@ class ModelRunner:
         token_rows = np.repeat(np.arange(num_rows), lens)
         positions = starts[token_rows] + np.arange(cu_q[-1]) - cu_q[token_rows]
 
-        input_ids, pending_dst, pending_src = [], [], []
+        token_ids: list[int] = []
+        pending_dst: list[int] = []
+        pending_src: list[int] = []
         for seq, start, end in zip(batch, starts.tolist(), ends.tolist()):
             if seq.is_prefill:
                 assert not seq.num_pending_tokens, "a prefill row carries a pending token"
-                input_ids.extend(seq[start:end])
+                token_ids.extend(seq[start:end])
             else:
                 if seq.num_pending_tokens:
                     # Sampled by a step still in flight; the device copy fixes it below.
-                    pending_dst.append(len(input_ids))
+                    pending_dst.append(len(token_ids))
                     pending_src.append(self._prev_row(seq))
-                input_ids.append(seq.last_token)
+                token_ids.append(seq.last_token)
 
         # A row with nothing left to prefill samples its last token.
-        sampling = np.flatnonzero(starts[row_of] + lens[row_of] == planned)    # in scheduler order
+        sampling = np.flatnonzero(starts[row_of] + lens[row_of] == planned)  # in scheduler order
         logits_indices = cu_q[row_of[sampling] + 1] - 1
         sampling_rows = [seqs[i] for i in sampling.tolist()]
         # Only the sampling rank owns sampling parameters.
-        temperatures = [seq.temperature for seq in sampling_rows] if self.rank == 0 else []
+        row_temperatures = [seq.temperature for seq in sampling_rows] if self.rank == 0 else []
 
         block_tables = slot_mapping = None
         tables = [seq.block_table for seq in batch]
         if any(tables):
             table = np.full((num_rows, max(map(len, tables))), -1, np.int32)
             for i, row in enumerate(tables):
-                table[i, :len(row)] = row
+                table[i, : len(row)] = row
             # Each token's slot is its block's, plus its offset in it. Rows with no blocks (warmup) store nothing.
             keep = np.fromiter(map(bool, tables), bool, num_rows)[token_rows]
             kept = positions[keep]
@@ -270,8 +282,8 @@ class ModelRunner:
             is_prefill=is_prefill,
             cu_seqlens_q=buffers.put("cu_seqlens_q", cu_q, torch.int32),
             cu_seqlens_k=buffers.put("cu_seqlens_k", cu_k, torch.int32),
-            max_seqlen_q=int(lens.max()),
-            max_seqlen_k=int(ends.max()),
+            max_seqlen_q=int(np.max(lens)),
+            max_seqlen_k=int(np.max(ends)),
             cu_seqlens_q_host=cu_seqlens_q,
             cu_seqlens_k_host=cu_seqlens_k,
             # No row reads cached keys, so the cache can be skipped.
@@ -282,11 +294,12 @@ class ModelRunner:
             # A pure-decode batch samples on every row, so the gather is skipped.
             logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
         )
-        input_ids = buffers.put("input_ids", np.array(input_ids, np.int64), torch.int64)
-        positions = buffers.put("positions", positions, torch.int64)
-        all_greedy = all(temperature == 0 for temperature in temperatures)
-        temperatures = None if all_greedy else buffers.put("temperatures", temperatures, torch.float32)
+        input_ids = buffers.put("input_ids", np.array(token_ids, np.int64), torch.int64)
+        positions_t = buffers.put("positions", positions, torch.int64)
+        all_greedy = all(temperature == 0 for temperature in row_temperatures)
+        temperatures = None if all_greedy else buffers.put("temperatures", row_temperatures, torch.float32)
         if pending_dst:
+            assert self._prev_tokens is not None
             prev = self._prev_tokens.device_tokens()
             num_pending = len(pending_dst)
             if pending_dst == list(range(num_pending)) == pending_src:
@@ -298,7 +311,7 @@ class ModelRunner:
                 input_ids.index_copy_(0, dst, prev.index_select(0, src))
         buffers.end()
         self._sampling_rows = sampling_rows
-        return input_ids, positions, temperatures, context
+        return input_ids, positions_t, temperatures, context
 
     @staticmethod
     def decodes_first(seqs: list[Sequence]) -> list[Sequence]:
@@ -335,7 +348,7 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         self.step_kind = self._step_kind(is_prefill, input_ids.size(0))
-        if self.compile_backend is not None and not self.compile_backend.pieces:    # this call traces
+        if self.compile_backend is not None and not self.compile_backend.pieces:  # this call traces
             mark_dynamic_tokens(input_ids, positions)
         if self.step_kind == "graph":
             return self.model.compute_logits(self._replay_full(input_ids, positions))
@@ -356,8 +369,8 @@ class ModelRunner:
         graph_vars["slot_mapping"][:bs] = context.slot_mapping
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-        for backend in self.attention_backends:    # e.g. FlashInfer re-plans the graph's decode
+        graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
+        for backend in self.attention_backends:  # e.g. FlashInfer re-plans the graph's decode
             backend.before_full_graph_replay(context, graph_bs)
         graph.replay()
         return graph_vars["outputs"][:bs]
@@ -417,7 +430,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
-        self.graph_bs = [size for size in sizes if size <= config.max_num_seqs]    # a decode step has a row per token
+        self.graph_bs = [size for size in sizes if size <= config.max_num_seqs]  # a decode step has a row per token
         max_bs = self.graph_bs[-1]
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -433,14 +446,19 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            with set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
-                             block_tables=block_tables[:bs], full_graph_size=bs):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup, which also plans FlashInfer
+            with set_context(
+                False,
+                slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs],
+                full_graph_size=bs,
+            ):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup, which also plans FlashInfer
                 # The warmup scheduled MLA decode into the default pool; clear it so the capture reschedules
                 # into the graph's own pool (else the graph bakes pointers freed with this context).
                 get_context().mla_decode_metadata = None
                 with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
             self.graphs[bs] = graph
             torch.cuda.synchronize()
 

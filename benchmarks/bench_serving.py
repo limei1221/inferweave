@@ -43,8 +43,8 @@ class Result:
     priority: int
     prompt_len: int
     requested_output_len: int
-    arrival: float           # seconds after the first send
-    status: str              # ok | rejected | failed
+    arrival: float  # seconds after the first send
+    status: str  # ok | rejected | failed
     output_len: int = 0
     ttft: float | None = None
     latency: float | None = None
@@ -73,10 +73,7 @@ def _lognormal(rng: random.Random, median: int, sigma: float, low: int, high: in
 
 def fixed_trace(rng: random.Random, args) -> list[Request]:
     """Every request the same shape: the cleanest read on a scheduling change."""
-    return [
-        Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len)
-        for _ in range(args.num_requests)
-    ]
+    return [Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len) for _ in range(args.num_requests)]
 
 
 def lognormal_trace(rng: random.Random, args) -> list[Request]:
@@ -96,7 +93,9 @@ def mixed_trace(rng: random.Random, args) -> list[Request]:
         if rng.random() < args.long_fraction:
             request = Request(
                 _prompt(rng, args.long_input_len, args.vocab_size),
-                args.long_output_len, args.long_priority, "long",
+                args.long_output_len,
+                args.long_priority,
+                "long",
             )
         else:
             request = Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len, 0, "short")
@@ -202,9 +201,13 @@ class Run:
 
 async def one_request(api: AsyncOpenAI, args, index: int, request: Request, t0: float, run: Run) -> Result:
     result = Result(
-        index=index, label=request.label, priority=request.priority,
-        prompt_len=request.prompt_len, requested_output_len=request.output_len,
-        arrival=perf_counter() - t0, status="failed",
+        index=index,
+        label=request.label,
+        priority=request.priority,
+        prompt_len=request.prompt_len,
+        requested_output_len=request.output_len,
+        arrival=perf_counter() - t0,
+        status="failed",
     )
     send = last = perf_counter()
     try:
@@ -248,7 +251,9 @@ async def one_request(api: AsyncOpenAI, args, index: int, request: Request, t0: 
     return run.finish(result)
 
 
-async def run_trace(api: AsyncOpenAI, args, trace: list[Request], offsets: list[float]) -> tuple[list[Result], Run, float]:
+async def run_trace(
+    api: AsyncOpenAI, args, trace: list[Request], offsets: list[float]
+) -> tuple[list[Result], Run, float]:
     run = Run(len(trace), args.max_failure_rate, args.quiet)
     tasks: list[asyncio.Task] = []
     t0 = perf_counter()
@@ -288,7 +293,7 @@ async def resolve_model_name(api: AsyncOpenAI, args) -> str:
     try:
         return (await api.models.list()).data[0].id
     except Exception as error:
-        raise SystemExit(f"could not read /v1/models ({error}); pass --model-name")
+        raise SystemExit(f"could not read /v1/models ({error}); pass --model-name") from None
 
 
 async def server_summary(http: httpx.AsyncClient, base_url: str) -> dict | None:
@@ -344,8 +349,7 @@ def summarize(results: list[Result], duration: float, split_labels: bool = True)
     labels = sorted({result.label for result in results})
     if split_labels and len(labels) > 1:
         summary["by_label"] = {
-            label: summarize([r for r in results if r.label == label], duration, split_labels=False)
-            for label in labels
+            label: summarize([r for r in results if r.label == label], duration, split_labels=False) for label in labels
         }
     return summary
 

@@ -12,16 +12,15 @@ import pytest
 pytest.importorskip("fastapi", reason="the serve extra is not installed")
 
 import httpx
+from conftest import asyncio_test
 from openai import AsyncOpenAI
+from test_api_server import MODEL, FakeAsyncEngine
 
 from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.entrypoints.api_server import build_app
 
-from conftest import asyncio_test
-from test_api_server import MODEL, FakeAsyncEngine
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))    # scripts, not a package
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))  # scripts, not a package
 
 import bench_serving as bench
 
@@ -40,7 +39,6 @@ async def clients(engine):
 
 
 class TestTrace:
-
     def test_an_infinite_rate_is_one_burst(self):
         assert bench.arrival_offsets(bench.random.Random(0), 5, float("inf")) == [0.0] * 5
 
@@ -67,8 +65,16 @@ class TestTrace:
 
     def test_mixed_labels_and_prioritises_the_long_prompts(self):
         args = make_args(
-            "--dataset", "mixed", "--num-requests", "200",
-            "--long-fraction", "0.25", "--long-input-len", "64", "--long-priority", "1",
+            "--dataset",
+            "mixed",
+            "--num-requests",
+            "200",
+            "--long-fraction",
+            "0.25",
+            "--long-input-len",
+            "64",
+            "--long-priority",
+            "1",
         )
         trace = bench.mixed_trace(bench.random.Random(0), args)
         long = [request for request in trace if request.label == "long"]
@@ -78,8 +84,16 @@ class TestTrace:
 
     def test_prefix_shares_a_head_and_keeps_the_tails_distinct(self):
         args = make_args(
-            "--dataset", "prefix", "--num-requests", "50",
-            "--num-prefixes", "4", "--prefix-len", "16", "--input-len", "24",
+            "--dataset",
+            "prefix",
+            "--num-requests",
+            "50",
+            "--num-prefixes",
+            "4",
+            "--prefix-len",
+            "16",
+            "--input-len",
+            "24",
         )
         trace = bench.prefix_trace(bench.random.Random(0), args)
         heads = {tuple(request.prompt_token_ids[:16]) for request in trace}
@@ -89,7 +103,6 @@ class TestTrace:
 
 
 class TestStatistics:
-
     def test_percentiles_interpolate(self):
         summary = bench.distribution([4.0, 0.0, 3.0, 1.0, 2.0])
         assert summary["p50"] == 2.0
@@ -117,7 +130,6 @@ class TestStatistics:
 
 
 class TestRun:
-
     def test_failures_past_the_budget_abort_the_run(self):
         run = bench.Run(total=100, max_failure_rate=0.05, quiet=True)
         for index in range(5):
@@ -134,7 +146,6 @@ class TestRun:
 
 
 class TestAgainstTheServer:
-
     @asyncio_test
     async def test_every_request_completes_and_is_timed(self):
         engine = FakeAsyncEngine()
@@ -156,7 +167,7 @@ class TestAgainstTheServer:
         args = make_args("--num-requests", "1", "--request-rate", "inf")
         async with clients(engine) as (api, http):
             result = await bench.benchmark(args, api, http)
-        assert result["config"]["model_name"] == MODEL    # vLLM 404s anything else
+        assert result["config"]["model_name"] == MODEL  # vLLM 404s anything else
 
     @asyncio_test
     async def test_an_explicit_model_name_wins(self):
@@ -200,8 +211,18 @@ class TestAgainstTheServer:
     async def test_a_mixed_trace_reports_each_class_on_its_own(self):
         engine = FakeAsyncEngine()
         args = make_args(
-            "--dataset", "mixed", "--num-requests", "20", "--request-rate", "inf",
-            "--long-fraction", "0.5", "--long-input-len", "16", "--long-priority", "1",
+            "--dataset",
+            "mixed",
+            "--num-requests",
+            "20",
+            "--request-rate",
+            "inf",
+            "--long-fraction",
+            "0.5",
+            "--long-input-len",
+            "16",
+            "--long-priority",
+            "1",
         )
         async with clients(engine) as (api, http):
             result = await bench.benchmark(args, api, http)
@@ -212,7 +233,7 @@ class TestAgainstTheServer:
 
     @asyncio_test
     async def test_an_error_event_mid_stream_is_a_failure(self):
-        engine = FakeAsyncEngine(finish_reason="capacity")    # the engine dropped it
+        engine = FakeAsyncEngine(finish_reason="capacity")  # the engine dropped it
         args = make_args("--num-requests", "1", "--request-rate", "inf")
         async with clients(engine) as (api, http):
             result = await bench.benchmark(args, api, http)
