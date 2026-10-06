@@ -10,7 +10,7 @@ def _bool(name: str, default: bool) -> bool:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Forces a device such as "cpu" or "mps"; unset picks cuda, then mps, then cpu.
+    # Forces "cpu" or "cuda"; unset picks cuda when available, else cpu.
     "LEAN_VLLM_DEVICE": lambda: os.getenv("LEAN_VLLM_DEVICE") or None,
     # Forces an attention backend by name; unset picks the first available.
     "LEAN_VLLM_ATTENTION_BACKEND": lambda: os.getenv("LEAN_VLLM_ATTENTION_BACKEND") or None,

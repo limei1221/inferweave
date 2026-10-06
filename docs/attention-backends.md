@@ -34,7 +34,7 @@ AttentionBackend                  # the interface
 
 | Backend (name) | Runs on | Serves | KV page size | CUDA graphs | Splits decode from prefill |
 |---|---|---|---|---|---|
-| `torch` | Anything: CPU, Apple Silicon, any CUDA GPU | Any layer; fp32, fp16 or bf16 | Any multiple of 16 | No, always eager | Yes |
+| `torch` | Anything: CPU or any CUDA GPU | Any layer; fp32, fp16 or bf16 | Any multiple of 16 | No, always eager | Yes |
 | `flashinfer` | sm80 and newer (A100, H100, ...), Linux | Plain layers; fp16/bf16; head size 64, 128 or 256 | Any multiple of 16 | Full + piecewise | Yes |
 | `flash_attn_3` | H100 / H200 (sm90), Linux x86_64 | Plain and MLA layers; fp16/bf16; head size a multiple of 8, up to 256 | Any multiple of 16 | Full + piecewise | No |
 | `flashmla` | H100 / H200, with FlashMLA built from source | MLA layers with 512 + 64 latents; as FA3 otherwise | 64 | Full + piecewise | MLA layers split themselves |
@@ -369,8 +369,7 @@ Decode gathers the block table's full width, so it reads no lengths back either.
 The padding and the gathered copy cost memory traffic that grows with batch
 size and context length, and a step that mixes long chunks with decode rows
 spends compute on padding. Each key head's query heads fold into its query axis
-rather than going through `enable_gqa`, which takes a slow path on MPS once
-batched. The backend still reports no CUDA graph support. That is the right
+rather than going through `enable_gqa`. The backend still reports no CUDA graph support. That is the right
 trade for a reference and for laptop development, and the wrong one for speed.
 
 ## Next steps

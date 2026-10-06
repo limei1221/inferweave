@@ -46,7 +46,6 @@ class TorchAttention(AttentionBackend):
             key = key[keep]
             value = value[keep]
 
-        # Indexed assignment, as index_copy_ on MPS costs the whole cache's size per call.
         k_cache.view(-1, dim)[slots] = key.flatten(1)
         v_cache.view(-1, dim)[slots] = value.flatten(1)
 
@@ -110,7 +109,7 @@ class TorchAttention(AttentionBackend):
         kv = latent.unsqueeze(1).expand(-1, q.size(1), -1, -1)  # [B, H, Lk, D]
         mask = self._key_mask(context_lens, seqlen)
         o = F.scaled_dot_product_attention(q.unsqueeze(2), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale)
-        return o.squeeze(2)[..., :v_dim]  # [B, H, v_dim]; MPS returns the keys' width for one query
+        return o.squeeze(2)  # [B, H, v_dim]
 
     @staticmethod
     def _pad_rows(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
@@ -164,7 +163,7 @@ class TorchAttention(AttentionBackend):
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         # Each key head's query heads fold into its query axis, so keys are never repeated and no enable_gqa
-        # is needed, which takes a slow path on MPS once batched. Query head h reads key head h // group.
+        # is needed. Query head h reads key head h // group.
         B, Lq, _, D = q.shape
         group = self.num_heads // self.num_kv_heads
         q = (
@@ -174,5 +173,4 @@ class TorchAttention(AttentionBackend):
         )
         mask = mask.unsqueeze(2).expand(-1, -1, group, -1, -1).reshape(B, 1, group * Lq, -1)
         o = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=self.scale)
-        o = o[..., : v.size(-1)]  # MPS returns the keys' width for one query
         return o.reshape(B, self.num_kv_heads, group, Lq, -1).permute(0, 3, 1, 2, 4).reshape(B, Lq, self.num_heads, -1)

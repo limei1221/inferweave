@@ -37,12 +37,12 @@ also installs FlashInfer, which runs on Ampere and newer and compiles its
 kernels on first use, so it needs `nvcc`. DeepSeek-V2 also decodes with FlashMLA when it is built from source; see
 [docs/deepseek-v2.md](docs/deepseek-v2.md).
 
-Without it, and without Triton, the engine runs on CPU and Apple Silicon via the
+Without it, and without Triton, the engine runs on CPU via the
 `torch` attention backend, at laptop speed — enough to develop and test the
 scheduler and cache against a small model.
 
-The device is picked automatically (cuda, then mps, then cpu) and can be forced
-with `LEAN_VLLM_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV
+Only `cuda` and `cpu` are supported. The device is picked automatically (cuda,
+then cpu) and can be forced with `LEAN_VLLM_DEVICE`. Off CUDA there is no `mem_get_info` to size the KV
 cache from, so it comes from `kvcache_memory_gb` (default 2.0) instead of
 `gpu_memory_utilization`.
 

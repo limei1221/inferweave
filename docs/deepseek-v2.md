@@ -40,7 +40,7 @@ force one.
 | `triton_mla` | sm80 and newer | vLLM's Triton MLA kernel over the latents | full + piecewise |
 | `flashinfer_mla` | sm80 and newer | FlashInfer's FA2/FA3 MLA kernel over the latents | full + piecewise |
 | `flash_attn_3` | H100/H200 | expands latents into keys and values | piecewise only |
-| `torch` | anything: CPU, Apple Silicon, any CUDA GPU | over the latents, in plain torch | none (eager) |
+| `torch` | anything: CPU or any CUDA GPU | over the latents, in plain torch | none (eager) |
 
 `flashmla` switches the KV cache to 64-token pages, the only size its kernel
 reads; `triton_mla` and `flashinfer_mla` read any. Those two prefill on FA3 on

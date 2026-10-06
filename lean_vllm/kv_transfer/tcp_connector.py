@@ -336,8 +336,6 @@ class TcpConnectorWorker(KVConnectorWorker):
         # The engine schedules the request as soon as this reports it.
         if stream is not None:
             stream.synchronize()
-        elif self.kv_caches[0].device.type == "mps":
-            torch.mps.synchronize()
 
     def _connect(self, key: tuple[str, int], engine_id: str) -> socket.socket:
         """A connection to the producer rank at key, checked to hold engine_id's blocks in this layout."""

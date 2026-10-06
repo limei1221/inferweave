@@ -23,7 +23,7 @@ through host memory over a TCP socket.
 | Prefix caching | On both sides. The decode instance reads only the blocks it does not already hold |
 | Front door | `lean-vllm proxy`, round-robin over any number of prefill and decode servers |
 | Failure | A load that fails, for any reason, falls back to prefilling on the decode instance |
-| Devices | CPU and MPS verified end to end. The CUDA path (side streams, events) has not run on a GPU yet |
+| Devices | CPU verified end to end. The CUDA path (side streams, events) has not run on a GPU yet |
 
 Not supported: RDMA or GPU-direct transfer, different tensor-parallel sizes on
 the two sides, layer-by-layer streaming during the prefill (vLLM's
@@ -87,7 +87,7 @@ a request carrying `kv_transfer_params` with a 400.
   is the recomputed last token below, not the transfer. After the decode
   instance reads its blocks, the prefill instance's KV usage returns to zero. A
   client that disconnects mid-stream aborts the decode.
-- The transport, over real sockets on CPU and MPS caches: blocks land exactly in
+- The transport, over real sockets on CPU caches: blocks land exactly in
   the consumer's own block ids, and nothing else is touched. Also covered: tail
   reads after local prefix hits, a read that arrives before the hand-over, the
   rank-to-rank pairing, and each failure below.

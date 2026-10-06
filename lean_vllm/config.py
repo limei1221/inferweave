@@ -34,7 +34,7 @@ class Config:
     max_num_seqs: int = 1024
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
-    kvcache_memory_gb: float = 2.0  # cpu/mps only; cuda uses gpu_memory_utilization
+    kvcache_memory_gb: float = 2.0  # cpu only; cuda uses gpu_memory_utilization
     tensor_parallel_size: int = 1
     enable_expert_parallel: bool = False  # MoE layers hold whole experts per rank, not slices of each; as vLLM
     enforce_eager: bool = False
