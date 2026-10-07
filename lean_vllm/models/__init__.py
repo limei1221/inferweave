@@ -1,6 +1,6 @@
 from transformers import PretrainedConfig
 
-from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM
+from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from lean_vllm.models.qwen3 import Qwen3ForCausalLM
 
 ModelClass = type[DeepseekV2ForCausalLM] | type[Qwen3ForCausalLM]
@@ -8,6 +8,7 @@ ModelClass = type[DeepseekV2ForCausalLM] | type[Qwen3ForCausalLM]
 # Keyed by the architectures field of a checkpoint's config.json.
 MODELS: dict[str, ModelClass] = {
     "DeepseekV2ForCausalLM": DeepseekV2ForCausalLM,
+    "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
 }
 

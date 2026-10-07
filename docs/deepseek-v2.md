@@ -21,7 +21,7 @@ checkpoints, not yet on the real weights.
 |---|---|
 | DeepSeek-V2-Lite, V2-Lite-Chat (16B total, 2.4B active) | Runs; served and benchmarked on one H100 |
 | DeepSeek-V2 (236B) | Its extra features (`q_lora_rank`, group-limited routing) are tested on tiny checkpoints; never run at full size |
-| DeepSeek-V3 and later | Not supported: `DeepseekV3ForCausalLM` is not registered, and V3's sigmoid routing is refused |
+| DeepSeek-V3 architecture (`DeepseekV3ForCausalLM`) | `noaux_tc` routing (sigmoid scores, correction bias) and skipping the MTP layer's weights are tested on tiny checkpoints; FP8 checkpoints are not supported, and no real V3-architecture model has run |
 
 The runner picks the model class from `architectures` in `config.json`
 (`lean_vllm/models/__init__.py`). The config and tokenizer load with

@@ -151,18 +151,23 @@ class DeepseekV2MoE(nn.Module):
         enable_expert_parallel: bool = False,
     ) -> None:
         super().__init__()
-        assert getattr(config, "scoring_func", "softmax") == "softmax"
-        assert config.topk_method in ("greedy", "group_limited_greedy"), (
-            f"unsupported topk_method {config.topk_method!r}"
+        # transformers' V3 config has neither field: its router is always noaux_tc over sigmoid scores
+        self.topk_method = getattr(config, "topk_method", "noaux_tc")
+        self.scoring_func = getattr(config, "scoring_func", "sigmoid" if self.topk_method == "noaux_tc" else "softmax")
+        assert self.topk_method in ("greedy", "group_limited_greedy", "noaux_tc"), (
+            f"unsupported topk_method {self.topk_method!r}"
         )
+        assert self.scoring_func in ("softmax", "sigmoid"), f"unsupported scoring_func {self.scoring_func!r}"
         self.top_k = config.num_experts_per_tok
-        self.topk_method = config.topk_method
         self.num_expert_group = config.n_group
         self.topk_group = config.topk_group
         self.renormalize = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = ReplicatedLinear(config.hidden_size, config.n_routed_experts, bias=False)
         self.gate.weight.data = self.gate.weight.data.float()  # held in fp32, so no step casts it
+        if self.topk_method == "noaux_tc":
+            # Added to the scores to pick experts, as V3's auxiliary-loss-free balancing; the weights ignore it.
+            self.gate.e_score_correction_bias = nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
         self.experts = FusedMoE(
             config.n_routed_experts,
             self.top_k,
@@ -182,7 +187,7 @@ class DeepseekV2MoE(nn.Module):
     def route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # hidden_states: [N, D]; the gate runs in fp32, as transformers'
         router_logits = F.linear(hidden_states.float(), self.gate.weight)
-        grouped = self.topk_method == "group_limited_greedy"
+        grouped = self.topk_method != "greedy"
         return torch.ops.lean_vllm.select_experts(
             router_logits,
             self.top_k,
@@ -190,6 +195,8 @@ class DeepseekV2MoE(nn.Module):
             float(self.routed_scaling_factor),
             self.num_expert_group if grouped else 1,
             self.topk_group if grouped else 1,
+            self.scoring_func,
+            getattr(self.gate, "e_score_correction_bias", None),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -299,6 +306,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "q_a_proj": ("fused_qkv_a_proj", 0),
                 "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
             }
+        # The checkpoint's multi-token prediction layers follow the last one; nothing here runs them.
+        self.skipped_weight_prefixes = tuple(
+            f"model.layers.{config.num_hidden_layers + i}."
+            for i in range(getattr(config, "num_nextn_predict_layers", None) or 0)
+        )
         self.model = DeepseekV2Model(config, enable_expert_parallel)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
@@ -316,3 +328,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+
+class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
+    """V2's layers; V3 differs in its router (noaux_tc over sigmoid scores), which the config selects."""

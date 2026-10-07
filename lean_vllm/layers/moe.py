@@ -75,22 +75,33 @@ def torch_select_experts(
     scaling: float,
     num_groups: int = 1,
     topk_group: int = 1,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The portable routing: softmax, the best groups when grouped, then top-k. fp32 weights, int32 ids."""
-    scores = router_logits.softmax(dim=-1)
+    """The portable routing: score, the best groups when grouped, then top-k. fp32 weights, int32 ids.
+
+    With a correction bias (V3's noaux_tc) the bias steers which experts are picked, but not their weights.
+    """
+    scores = router_logits.softmax(dim=-1) if scoring_func == "softmax" else router_logits.sigmoid()
     # scores: [N, E]
+    choice = scores if e_score_correction_bias is None else scores + e_score_correction_bias
     if num_groups > 1:
         # Only experts in the topk_group best groups stay eligible.
-        num_token = scores.size(0)
-        group_scores = scores.view(num_token, num_groups, -1).max(dim=-1).values  # [N, G]
+        num_token = choice.size(0)
+        grouped = choice.view(num_token, num_groups, -1)
+        if e_score_correction_bias is None:
+            group_scores = grouped.max(dim=-1).values  # [N, G]
+        else:  # a group scores its best two experts, as V3's
+            group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)  # [N, G]
         group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]  # [N, topk_group]
         group_mask = torch.zeros_like(group_scores)
         group_mask.scatter_(1, group_idx, 1)
         score_mask = (
-            group_mask.unsqueeze(-1).expand(num_token, num_groups, scores.size(-1) // num_groups).reshape(num_token, -1)
+            group_mask.unsqueeze(-1).expand(num_token, num_groups, choice.size(-1) // num_groups).reshape(num_token, -1)
         )  # [N, E]
-        scores = scores.masked_fill(~score_mask.bool(), float("-inf"))  # [N, E]
-    topk_weights, topk_ids = torch.topk(scores, k=top_k, dim=-1, sorted=False)
+        choice = choice.masked_fill(~score_mask.bool(), float("-inf"))  # [N, E]
+    topk_ids = torch.topk(choice, k=top_k, dim=-1, sorted=False)[1]
+    topk_weights = scores.gather(1, topk_ids)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     if scaling != 1.0:
@@ -107,10 +118,13 @@ def select_experts(
     scaling: float,
     num_groups: int,
     topk_group: int,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    args = (router_logits, top_k, renormalize, scaling, num_groups, topk_group, scoring_func, e_score_correction_bias)
     if fused_moe.use_triton(router_logits):
-        return fused_moe.topk_softmax(router_logits, top_k, renormalize, scaling, num_groups, topk_group)
-    return torch_select_experts(router_logits, top_k, renormalize, scaling, num_groups, topk_group)
+        return fused_moe.topk_softmax(*args)
+    return torch_select_experts(*args)
 
 
 @select_experts.register_fake
@@ -121,6 +135,8 @@ def _(
     scaling: float,
     num_groups: int,
     topk_group: int,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shape = (router_logits.size(0), top_k)
     return router_logits.new_empty(shape, dtype=torch.float32), router_logits.new_empty(shape, dtype=torch.int32)

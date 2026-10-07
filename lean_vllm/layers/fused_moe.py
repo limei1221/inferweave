@@ -99,6 +99,7 @@ else:
     @triton.jit
     def topk_softmax_kernel(
         logits_ptr,
+        bias_ptr,
         weights_ptr,
         ids_ptr,
         num_tokens,
@@ -111,10 +112,13 @@ else:
         NUM_GROUPS: tl.constexpr,
         GROUPS_POW2: tl.constexpr,
         TOPK_GROUP: tl.constexpr,
+        SIGMOID: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
         RENORMALIZE: tl.constexpr,
         BLOCK_T: tl.constexpr,
     ):
-        """vLLM's topk_softmax for BLOCK_T tokens: softmax, the best groups if grouped, top-k, all in registers."""
+        """vLLM's topk_softmax and grouped_topk for BLOCK_T tokens: score, the best groups if grouped, top-k, all in
+        registers. A correction bias steers the picks, not the weights."""
         rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
         cols = tl.arange(0, EXPERTS_POW2)
         row_mask = rows < num_tokens
@@ -124,34 +128,46 @@ else:
             mask=row_mask[:, None] & col_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        logits = tl.where(col_mask[None, :], logits, float("-inf"))
-        scores = tl.exp(logits - tl.max(logits, axis=1)[:, None])
-        scores = scores / tl.sum(scores, axis=1)[:, None]
-        scores = tl.where(col_mask[None, :], scores, float("-inf"))  # padding is never picked
+        if SIGMOID:
+            scores = tl.sigmoid(logits)
+        else:
+            logits = tl.where(col_mask[None, :], logits, float("-inf"))
+            scores = tl.exp(logits - tl.max(logits, axis=1)[:, None])
+            scores = scores / tl.sum(scores, axis=1)[:, None]
+        choice = scores
+        if HAS_BIAS:
+            choice += tl.load(bias_ptr + cols, mask=col_mask, other=0.0)[None, :]
+        choice = tl.where(col_mask[None, :], choice, float("-inf"))  # padding is never picked
         if NUM_GROUPS > 1:
-            # A group scores its best expert; only the TOPK_GROUP best groups stay eligible.
+            # A group scores its best expert, or its best two with a bias, as V3's; only the TOPK_GROUP best groups
+            # stay eligible.
             group = cols // (NUM_EXPERTS // NUM_GROUPS)
             group_cols = tl.arange(0, GROUPS_POW2)
             group_scores = tl.full((BLOCK_T, GROUPS_POW2), float("-inf"), tl.float32)
             for g in tl.static_range(NUM_GROUPS):
-                best = tl.max(tl.where(group[None, :] == g, scores, float("-inf")), axis=1)
+                in_group = tl.where(group[None, :] == g, choice, float("-inf"))
+                best, best_col = tl.max(in_group, axis=1, return_indices=True)
+                if HAS_BIAS:
+                    best += tl.max(tl.where(cols[None, :] == best_col[:, None], float("-inf"), in_group), axis=1)
                 group_scores = tl.where(group_cols[None, :] == g, best[:, None], group_scores)
             eligible = tl.zeros((BLOCK_T, EXPERTS_POW2), dtype=tl.int32)
             for _ in tl.static_range(TOPK_GROUP):
                 picked = tl.argmax(group_scores, axis=1)
                 eligible = tl.where(group[None, :] == picked[:, None], 1, eligible)
                 group_scores = tl.where(group_cols[None, :] == picked[:, None], float("-inf"), group_scores)
-            scores = tl.where(eligible != 0, scores, float("-inf"))
+            choice = tl.where(eligible != 0, choice, float("-inf"))
 
         # Top-k by repeated argmax, as vLLM's kernel: k is small, and a tie goes to the lower expert.
         k_cols = tl.arange(0, TOP_K_POW2)
         weights = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.float32)
         ids = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.int32)
         for k in tl.static_range(TOP_K):
-            weight, expert = tl.max(scores, axis=1, return_indices=True)
+            expert = tl.argmax(choice, axis=1)
+            picked = cols[None, :] == expert[:, None]
+            weight = tl.sum(tl.where(picked, scores, 0.0), axis=1)
             weights = tl.where(k_cols[None, :] == k, weight[:, None], weights)
             ids = tl.where(k_cols[None, :] == k, expert[:, None], ids)
-            scores = tl.where(cols[None, :] == expert[:, None], float("-inf"), scores)
+            choice = tl.where(picked, float("-inf"), choice)
         if RENORMALIZE:
             weights = weights / tl.sum(weights, axis=1)[:, None]
         weights = weights * scaling
@@ -407,8 +423,10 @@ def topk_softmax(
     scaling: float,
     num_groups: int = 1,
     topk_group: int = 1,
+    scoring_func: str = "softmax",
+    e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Routing in one launch: fp32 weights and int32 expert ids, [T, top_k] each, in descending order."""
+    """Routing in one launch: fp32 weights and int32 expert ids, [T, top_k] each, in descending order of pick."""
     num_tokens, num_experts = router_logits.shape
     assert num_experts % num_groups == 0, f"{num_experts} experts do not split into {num_groups} groups"
     weights = torch.empty(num_tokens, top_k, dtype=torch.float32, device=router_logits.device)
@@ -417,6 +435,7 @@ def topk_softmax(
     block_t = max(1, 4096 // experts_pow2)
     topk_softmax_kernel[(triton.cdiv(num_tokens, block_t),)](
         router_logits,
+        e_score_correction_bias,
         weights,
         ids,
         num_tokens,
@@ -429,6 +448,8 @@ def topk_softmax(
         NUM_GROUPS=num_groups,
         GROUPS_POW2=triton.next_power_of_2(num_groups),
         TOPK_GROUP=topk_group,
+        SIGMOID=scoring_func == "sigmoid",
+        HAS_BIAS=e_score_correction_bias is not None,
         RENORMALIZE=renormalize,
         BLOCK_T=block_t,
     )

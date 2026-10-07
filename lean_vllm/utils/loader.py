@@ -17,10 +17,13 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    skipped_weight_prefixes = getattr(model, "skipped_weight_prefixes", ())
     loaded: set[str] = set()
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
+                if weight_name.startswith(skipped_weight_prefixes):
+                    continue
                 if expert := EXPERT_WEIGHT.fullmatch(weight_name):
                     prefix, expert_id, proj = expert.groups()
                     param_name = f"{prefix}.{STACKED_EXPERT_PARAMS[proj]}"

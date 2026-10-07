@@ -1,4 +1,4 @@
-"""DeepSeek-V2 (MLA, MoE, YaRN) against transformers on a tiny random checkpoint, fp32 on the torch backend.
+"""DeepSeek-V2 and V3 (MLA, MoE, YaRN) against transformers on a tiny random checkpoint, fp32 on the torch backend.
 
 Paged steps go through the runner's real batch preparation, so mixed batches are compared too.
 """
@@ -6,15 +6,18 @@ Paged steps go through the runner's real batch preparation, so mixed batches are
 import pytest
 import torch
 import torch.distributed as dist
-from transformers import DeepseekV2Config
+from safetensors.torch import save_file
+from transformers import DeepseekV2Config, DeepseekV3Config
 from transformers import DeepseekV2ForCausalLM as HFDeepseekV2ForCausalLM
+from transformers import DeepseekV3ForCausalLM as HFDeepseekV3ForCausalLM
 
 from lean_vllm.attention import TorchAttention
 from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.layers.attention import MLAAttention, plan_context_chunks, register_layers
+from lean_vllm.layers.moe import torch_select_experts
 from lean_vllm.models import get_model_class
-from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM
+from lean_vllm.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from lean_vllm.utils.context import reset_context, set_context
 from lean_vllm.utils.loader import load_model
 
@@ -25,12 +28,15 @@ CONFIGS = {
     "lite": {},
     "q_lora": dict(q_lora_rank=24, attention_bias=True),  # biases load into the fused down-projection too
     "grouped_routing": dict(topk_method="group_limited_greedy", n_group=4, topk_group=2),
+    # V3's noaux_tc: sigmoid scores, groups ranked by their best two, picks steered by a correction bias
+    "v3": dict(version=3, q_lora_rank=24, n_routed_experts=16, n_group=4, topk_group=2, num_nextn_predict_layers=1),
+    "v3_ungrouped": dict(version=3, n_group=1, topk_group=1, norm_topk_prob=False, routed_scaling_factor=2.5),
 }
 
 
-def tiny_config(**overrides) -> DeepseekV2Config:
+def tiny_config(version: int = 2, **overrides) -> DeepseekV2Config | DeepseekV3Config:
     """DeepSeek-V2-Lite's shape in miniature: one dense layer, then MoE with a shared expert."""
-    return DeepseekV2Config(
+    return (DeepseekV2Config if version == 2 else DeepseekV3Config)(
         **{
             **dict(
                 hidden_size=64,
@@ -79,8 +85,20 @@ def models(request, process_group, tmp_path_factory):
     """The transformers model and ours, loaded from the same checkpoint on disk."""
     torch.manual_seed(0)
     path = tmp_path_factory.mktemp(request.param)
-    HFDeepseekV2ForCausalLM(tiny_config(**CONFIGS[request.param])).save_pretrained(path)
-    reference = HFDeepseekV2ForCausalLM.from_pretrained(path, attn_implementation="eager").eval()
+    config = tiny_config(**CONFIGS[request.param])
+    hf_class = HFDeepseekV3ForCausalLM if isinstance(config, DeepseekV3Config) else HFDeepseekV2ForCausalLM
+    hf_model = hf_class(config)
+    with torch.no_grad():
+        for name, buffer in hf_model.named_buffers():
+            if name.endswith("e_score_correction_bias"):  # zeros at init, which would pick as if absent
+                buffer.normal_(0, 0.2)
+    hf_model.save_pretrained(path)
+    reference = hf_class.from_pretrained(path, attn_implementation="eager").eval()
+    if getattr(config, "num_nextn_predict_layers", 0):
+        # V3 checkpoints carry a multi-token prediction layer past the last one, which the loader must skip.
+        save_file(
+            {f"model.layers.{config.num_hidden_layers}.eh_proj.weight": torch.zeros(2, 2)}, path / "mtp.safetensors"
+        )
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("LEAN_VLLM_ATTENTION_BACKEND", "torch")
         model = get_model_class(reference.config)(reference.config)
@@ -330,5 +348,18 @@ def test_an_unknown_architecture_is_refused():
         get_model_class(config)
 
 
-def test_the_registry_resolves_deepseek_v2():
+def test_the_registry_resolves_deepseek_v2_and_v3():
     assert get_model_class(DeepseekV2Config(architectures=["DeepseekV2ForCausalLM"])) is DeepseekV2ForCausalLM
+    assert get_model_class(DeepseekV3Config(architectures=["DeepseekV3ForCausalLM"])) is DeepseekV3ForCausalLM
+
+
+@pytest.mark.parametrize("scoring_func", ["softmax", "sigmoid"])
+def test_a_correction_bias_picks_but_does_not_weigh(scoring_func):
+    """A bias big enough to force experts 0 and 1: they are picked, at their unbiased scores."""
+    logits = torch.randn(5, 8)
+    bias = torch.zeros(8)
+    bias[:2] = 100.0
+    weights, ids = torch_select_experts(logits, 2, False, 1.0, scoring_func=scoring_func, e_score_correction_bias=bias)
+    scores = logits.softmax(-1) if scoring_func == "softmax" else logits.sigmoid()
+    assert ids.sort(dim=-1).values.tolist() == [[0, 1]] * 5
+    torch.testing.assert_close(weights, scores.gather(1, ids.long()))

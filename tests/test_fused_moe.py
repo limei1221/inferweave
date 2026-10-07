@@ -402,15 +402,19 @@ def test_triton_alignment_matches_the_reference(num_tokens, num_experts, block_m
     [
         dict(num_groups=1, topk_group=1),
         dict(num_groups=8, topk_group=3),  # DeepSeek-V2's group-limited greedy
+        dict(num_groups=8, topk_group=3, scoring_func="sigmoid", bias=True),  # V3's noaux_tc
+        dict(num_groups=1, topk_group=1, scoring_func="sigmoid", bias=True),
     ],
-    ids=["greedy", "grouped"],
+    ids=["greedy", "grouped", "noaux_tc", "noaux_tc_ungrouped"],
 )
 @pytest.mark.parametrize("renormalize, scaling", [(False, 1.0), (True, 2.5)])
 @pytest.mark.parametrize("num_experts", [64, 160])
 def test_triton_routing_matches_torch(routing, renormalize, scaling, num_experts):
     torch.manual_seed(0)
     router_logits = torch.randn(300, num_experts, device="cuda")
-    args = (router_logits, 6, renormalize, scaling, routing["num_groups"], routing["topk_group"])
+    bias = torch.randn(num_experts, device="cuda") * 0.2 if routing.get("bias") else None
+    scoring_func = routing.get("scoring_func", "softmax")
+    args = (router_logits, 6, renormalize, scaling, routing["num_groups"], routing["topk_group"], scoring_func, bias)
     got_weights, got_ids = fused_moe.topk_softmax(*args)
     want_weights, want_ids = torch_select_experts(*args)
     assert got_ids.dtype == want_ids.dtype == torch.int32
