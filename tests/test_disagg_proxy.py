@@ -111,7 +111,7 @@ def test_a_prefill_error_is_the_answer(proxy, upstreams):
 
 
 def test_no_params_back_means_the_decode_prefills_itself(proxy, upstreams):
-    """A prefill that stopped before its token hands nothing over."""
+    """An aborted prefill hands nothing over."""
     upstreams.prefill_reply = httpx.Response(200, json={"choices": [{"text": ""}], "kv_transfer_params": None})
     complete(proxy)
     assert "kv_transfer_params" not in upstreams.sent[1][1]

@@ -4,7 +4,7 @@ import pytest
 
 from lean_vllm.engine.scheduler import DuplicateRequestId
 from lean_vllm.engine.sequence import SequenceStatus
-from lean_vllm.kv_transfer import KVConnectorOutput, KVTransferConfig
+from lean_vllm.kv_transfer import KVConnectorOutput, KVTransferConfig, KVTransferStats
 from lean_vllm.sampling_params import SamplingParams
 
 BLOCK = 8
@@ -208,13 +208,14 @@ class TestPrefillSide:
         engine.step()
         assert engine.last_output.num_cached_blocks == 2
 
-    def test_a_prefill_that_stops_early_hands_nothing_over(self, make_disagg_engine):
-        """As vLLM: only a prefill capped by max_tokens is sent; a stop token ends the request there."""
+    def test_a_prefill_that_stops_on_a_stop_token_hands_over_too(self, make_disagg_engine):
+        """As vLLM: a stop token hands over as max_tokens does; the decode instance samples its own first token."""
         engine = make_disagg_engine(eos_after={"p-1": 0})
-        engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params={"do_remote_decode": True}), "p-1")
+        seq = engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params={"do_remote_decode": True}), "p-1")
         final = [output for output in engine.step() + engine.step() if output.finished]
-        assert final[0].finish_reason == "stop" and final[0].kv_transfer_params is None
-        assert engine.is_finished() and not engine.scheduler.block_manager.used_block_ids
+        assert final[0].finish_reason == "stop"
+        assert final[0].kv_transfer_params["remote_block_ids"] == seq.block_table
+        assert not engine.is_finished() and len(engine.scheduler.block_manager.used_block_ids) == 3
 
     def test_an_aborted_prefill_hands_nothing_over(self, make_disagg_engine):
         engine = make_disagg_engine()
@@ -275,3 +276,27 @@ def test_decode_waits_for_blocks_held_by_a_transfer(make_disagg_engine, async_sc
     assert len(tokens + rest["local"]) == 2
     assert local.finish_reason == remote.finish_reason == "length"
     assert not engine.scheduler.block_manager.used_block_ids
+
+
+class TestMetrics:
+    def test_loads_failures_and_expiries_are_recorded(self, make_disagg_engine):
+        engine = make_disagg_engine()
+        for request_id in ("d-1", "d-2"):
+            engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), request_id)
+        engine.step()
+        stats = KVTransferStats(0.25, 4096, "ipc")
+        engine.model_runner.kv_outputs.append(
+            KVConnectorOutput(
+                finished_recving={"d-1"},
+                failed_recving={"d-2"},
+                recv_stats={"d-1": stats},
+                expired_sending={"p-9"},
+            )
+        )
+        engine.step()
+        metrics = engine.metrics
+        assert metrics.kv_transfers.values == {"ipc": 1}
+        assert (metrics.kv_transfer_failures.total, metrics.kv_transfer_expired.total) == (1, 1)
+        assert (metrics.kv_transfer_time.sum, metrics.kv_transfer_bytes.sum) == (0.25, 4096)
+        assert 'lean_vllm:kv_transfers_total{transport="ipc"} 1' in metrics.render()
+        assert metrics.summary()["kv_transfer"]["mib_per_second"] == 4096 / 2**20 / 0.25

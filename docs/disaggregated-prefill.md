@@ -9,23 +9,25 @@ sized and batched for its own phase.
 The design follows vLLM V1: a KV connector with a scheduler half and a worker
 half (`KVConnectorBase_V1`), the request flow and `kv_transfer_params` of its
 `NixlConnector`, and its `toy_proxy_server.py`. The difference is the transport.
-NIXL moves blocks GPU to GPU over RDMA; lean-vLLM's `TcpConnector` stages them
-through host memory over a TCP socket.
+NIXL moves blocks GPU to GPU over RDMA, across hosts. lean-vLLM's `TcpConnector`
+copies them GPU to GPU over CUDA IPC when both instances share a host, and
+otherwise stages them through host memory over a TCP socket.
 
 ## What is supported
 
 | | Support |
 | --- | --- |
-| Connector | `TcpConnector`: the decode instance pulls, as NIXL does |
+| Connector | `TcpConnector`: the decode instance pulls, as NIXL does; over CUDA IPC on one host, TCP otherwise |
 | Roles | `kv_producer` (prefill), `kv_consumer` (decode), `kv_both` (either, per request) |
 | Models | Every model the engine loads: Qwen3's key/value pages, DeepSeek-V2's MLA latents |
 | Tensor parallelism | Equal sizes on both sides; rank *r* pulls from rank *r* |
 | Prefix caching | On both sides. The decode instance reads only the blocks it does not already hold |
 | Front door | `lean-vllm proxy`, round-robin over any number of prefill and decode servers |
 | Failure | A load that fails, for any reason, falls back to prefilling on the decode instance |
-| Devices | CPU verified end to end. The CUDA path (side streams, events) has not run on a GPU yet |
+| Devices | CPU verified end to end. The CUDA path (side streams, events, IPC) has not run on a GPU yet |
+| Metrics | Per-load time and bytes, transport, failures and expiries on `/metrics` |
 
-Not supported: RDMA or GPU-direct transfer, different tensor-parallel sizes on
+Not supported: GPU-direct transfer across hosts, different tensor-parallel sizes on
 the two sides, layer-by-layer streaming during the prefill (vLLM's
 `save_kv_layer`), and a streamed prefill request.
 
@@ -35,12 +37,18 @@ Two servers and a proxy. Here they share one host with a GPU each:
 
 ```bash
 MODEL=~/workspace/huggingface/Qwen3-8B
-CUDA_VISIBLE_DEVICES=0 uv run lean-vllm serve $MODEL --port 8100 --served-model-name qwen \
+CUDA_VISIBLE_DEVICES=0,1 uv run lean-vllm serve $MODEL --port 8100 --served-model-name qwen \
     --kv-transfer-config '{"kv_role": "kv_producer", "kv_port": 14579}'
-CUDA_VISIBLE_DEVICES=1 uv run lean-vllm serve $MODEL --port 8200 --served-model-name qwen \
+CUDA_VISIBLE_DEVICES=1,0 uv run lean-vllm serve $MODEL --port 8200 --served-model-name qwen \
     --kv-transfer-config '{"kv_role": "kv_consumer"}'
 uv run lean-vllm proxy --prefill http://127.0.0.1:8100 --decode http://127.0.0.1:8200 --port 8000
 ```
+
+Each instance runs on the first GPU it sees, so the two orders put them on
+different GPUs. Both GPUs stay visible to both, which CUDA IPC needs: the
+decode instance maps the prefill instance's cache only if it can see that GPU.
+With `CUDA_VISIBLE_DEVICES=0` and `=1` instead, the transfer falls back to TCP,
+and the decode instance logs why.
 
 Clients talk to the proxy on port 8000, exactly as they would to one server.
 `--prefill` and `--decode` each take several URLs. Across hosts, set `kv_ip` on
@@ -91,6 +99,11 @@ a request carrying `kv_transfer_params` with a 400.
   the consumer's own block ids, and nothing else is touched. Also covered: tail
   reads after local prefix hits, a read that arrives before the hand-over, the
   rank-to-rank pairing, and each failure below.
+- The IPC path, with the handles faked so it runs on CPU: blocks copied straight
+  out of the producer's cache land in the consumer's, the producer holds the
+  read open until the copy is done, and a GPU the consumer cannot map falls
+  back to TCP. `tests/test_kv_transfer.py` has a test of the real handles, two
+  processes on CUDA, that has not run yet.
 - No GPU run and no benchmark yet.
 
 ## How it works
@@ -99,12 +112,12 @@ a request carrying `kv_transfer_params` with a 400.
 
 ```
 client ──▶ proxy ──(max_tokens=1, do_remote_decode)──▶ prefill server
-                                                         prefills, samples 1 token, finishes "length";
+                                                         prefills, samples 1 token, finishes "length" or "stop";
                                                          holds the prompt's blocks; replies with
                                                          kv_transfer_params {remote_block_ids, host, port, ...}
              proxy ──(original request + kv_transfer_params)──▶ decode server
                                                          allocates blocks, WAITING_FOR_REMOTE_KVS,
-                                                         pulls the blocks ◀──TCP── prefill rank r
+                                                         pulls the blocks ◀──IPC or TCP── prefill rank r
                                                          sends "done" ──▶ prefill frees its blocks
                                                          computes the last prompt token, samples, decodes
 client ◀── proxy ◀── tokens, streamed or not
@@ -125,8 +138,8 @@ It lives in `Scheduler`, with vLLM's method names:
 - `build_connector_meta` collects each step's loads to start and blocks to
   expose, and goes to every rank with the step.
 - `request_finished` decides, on the producer, whether to hold a finished
-  request's blocks. Only a request that ran to its `max_tokens` is handed over,
-  as in vLLM; a stop token or an abort ends it there. Held blocks stay in the
+  request's blocks. A request that ran to its `max_tokens` or hit a stop token
+  is handed over, as in vLLM; an abort ends it there. Held blocks stay in the
   prefix cache once freed.
 
 A loading request sits in `Scheduler.recving` in `WAITING_FOR_REMOTE_KVS`. It
@@ -152,14 +165,22 @@ every rank reports it, and a load failed if any rank's did.
 - **Producer**: a threaded TCP server on `kv_ip:kv_port + rank`. A read is
   served only for blocks the engine has handed over for that request. The
   hand-over comes with the step after the request finishes, so it can trail
-  the HTTP reply; a read waits up to 30 s for it. Blocks are copied out one
-  layer at a time and sent as they arrive. `done` releases them, and so does
-  the timeout, though never during a read.
+  the HTTP reply; a read waits up to 30 s for it. Over TCP, blocks are copied
+  out one layer at a time and sent as they arrive. Over IPC, it only answers,
+  and holds the read open until the consumer's next message. `done` releases
+  the blocks, and so does the timeout, though never during a read.
 - **Consumer**: one loader thread with a connection per producer rank. A new
   connection handshakes first: the producer must be the `remote_engine_id` the
   request names, with the same per-layer shape, dtype and block size. Blocks
   land with `index_copy_` into the request's own blocks. Then it sends `done`,
   even after a refused read, since blocks it will not read are no use held.
+
+The handshake also carries IPC handles for the producer's caches when it runs
+on CUDA, as torch shares a CUDA tensor between processes, with its GPU's UUID.
+A consumer on CUDA that sees that GPU maps the caches onto its own GPU, once
+per connection, so its copies read the producer's memory peer to peer over
+NVLink or PCIe. Otherwise, or if the driver cannot map them, it reads over the
+socket. The socket carries the control messages either way.
 
 The wire format is a fixed header (JSON length, payload length), a JSON
 message, then raw bytes. No pickle crosses the socket.
@@ -173,19 +194,41 @@ flight under async scheduling: their previous owner's next token. So each load
 waits on an event recorded when it is queued, and it synchronises its stream
 before reporting itself done.
 
+### Metrics
+
+On `/metrics`, beside the engine's own, named after vLLM's NIXL metrics:
+
+| Metric | What it counts |
+| --- | --- |
+| `lean_vllm:kv_transfers_total{transport}` | Loads finished, by `ipc` or `tcp` |
+| `lean_vllm:kv_transfer_time_seconds` | Per load, from the read to the blocks landing, on the slowest rank |
+| `lean_vllm:kv_transfer_bytes` | Per load, across all ranks |
+| `lean_vllm:kv_transfer_failures_total` | Loads that failed, so the prompt prefilled on the decode instance |
+| `lean_vllm:kv_transfer_expired_total` | On the prefill instance, held blocks freed with no consumer reading them |
+
+The first four are on the decode instance. The JSON summary the benchmark
+records adds the throughput, in MiB/s. A load's time leaves out the first
+connection's handshake, as vLLM's does, and the `done` that follows.
+
 ### Aborts and failures
 
 | Event | What happens |
 | --- | --- |
 | Client aborts during the load | The request finishes at once; its blocks are freed when the load ends, since the loader is writing them |
 | Producer unreachable, restarted, refused the read, or laid out differently | The load fails; the request prefills on the decode instance from its local prefix hits |
+| Producer's GPU not visible, or not mappable | Reads go over TCP instead of IPC, logged once per connection |
 | No consumer reads the blocks | The producer frees them after `LEAN_VLLM_KV_ABORT_REQUEST_TIMEOUT` |
-| Prefill stops on a stop token | No `kv_transfer_params`; the proxy sends the request on as is and the decode instance prefills it |
+| Prefill stops on a stop token | Handed over as usual, as in vLLM; the decode instance samples its first token itself and may stop there too |
+| Prefill is aborted | No `kv_transfer_params`; the proxy sends the request on as is and the decode instance prefills it |
 
 ## Next steps
 
-- Run on GPUs and benchmark against vLLM's `NixlConnector` and a single
-  instance: TTFT, TPOT under prefill-heavy load, transfer time per block.
-- Pull GPU to GPU: CUDA IPC within a host, NIXL or NCCL across hosts.
-- Overlap loads with one another; the single loader thread serialises them.
-- Heterogeneous tensor parallelism, and transfer metrics on `/metrics`.
+This connector aims to show what P/D is, not to match NIXL feature for feature.
+P/D trades the time to move a prompt's KV for decode steps that prefills no
+longer stall. Seeing that trade needs one more step: a GPU run, benchmarked
+against a single instance, TTFT and TPOT under prefill-heavy load, set against
+`kv_transfer_time_seconds` over IPC and over TCP.
+
+Left out as production concerns, all in vLLM's NIXL connector: concurrent
+loads, leases renewed by heartbeats, a load-failure policy, heterogeneous
+tensor parallelism, push mode, and layer-wise hooks.

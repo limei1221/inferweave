@@ -220,6 +220,7 @@ class LLMEngine:
                 # Every step, scheduled or not, so loads start and finished transfers come back while idle.
                 kv_output = self.model_runner.call("kv_connector_step", output.kv_connector_metadata)
                 self.scheduler.update_from_kv_connector_output(kv_output)
+                self.metrics.record_kv_transfer(kv_output)
         if output:
             with record_function("launch"):
                 pending = self.model_runner.call("run", output.scheduled)

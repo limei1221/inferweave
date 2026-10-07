@@ -17,6 +17,9 @@ TPOT_BUCKETS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, INF)
 STEP_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, INF)
 TOKEN_BUCKETS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, INF)
 BATCH_BUCKETS = (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, INF)
+# As vLLM's NIXL transfer histograms.
+TRANSFER_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 5.0, INF)
+BYTE_BUCKETS = tuple(2 ** (10 + i) for i in range(1, 25, 2)) + (INF,)
 
 
 def _number(value: float) -> str:
@@ -183,6 +186,19 @@ class Metrics:
             "lean_vllm:iteration_tokens_total", "Tokens in one step's batch.", BATCH_BUCKETS
         )
 
+        # Disaggregated prefill: the decode instance's loads, and the prefill instance's blocks nobody read.
+        self.kv_transfers = Counter("lean_vllm:kv_transfers_total", "KV loads finished.", label="transport")
+        self.kv_transfer_failures = Counter(
+            "lean_vllm:kv_transfer_failures_total", "KV loads that failed, so the prompt prefilled here."
+        )
+        self.kv_transfer_expired = Counter(
+            "lean_vllm:kv_transfer_expired_total", "Held KV blocks freed with no decode instance reading them."
+        )
+        self.kv_transfer_time = Histogram(
+            "lean_vllm:kv_transfer_time_seconds", "Read to blocks landed, per load, slowest rank.", TRANSFER_BUCKETS
+        )
+        self.kv_transfer_bytes = Histogram("lean_vllm:kv_transfer_bytes", "Bytes per load, all ranks.", BYTE_BUCKETS)
+
     def record_received(self):
         with self.lock:
             self.requests_received.inc()
@@ -221,6 +237,15 @@ class Metrics:
             for request_output in outputs:
                 if request_output.finished:
                     self._record_finished(request_output)
+
+    def record_kv_transfer(self, kv_output):
+        with self.lock:
+            for stats in kv_output.recv_stats.values():
+                self.kv_transfers.inc(label_value=stats.transport)
+                self.kv_transfer_time.observe(stats.seconds)
+                self.kv_transfer_bytes.observe(stats.num_bytes)
+            self.kv_transfer_failures.inc(len(kv_output.failed_recving))
+            self.kv_transfer_expired.inc(len(kv_output.expired_sending))
 
     def _record_finished(self, request_output):
         self.requests_finished.inc(label_value=request_output.finish_reason)
@@ -283,6 +308,14 @@ class Metrics:
                 "kv_cache_usage": self.kv_usage.value,
                 "kv_cache_usage_peak": self.kv_usage.peak,
                 "preemptions": self.preemptions.total,
+                "kv_transfer": {
+                    "loads": dict(sorted(self.kv_transfers.values.items())),
+                    "failed": self.kv_transfer_failures.total,
+                    "expired": self.kv_transfer_expired.total,
+                    "time": self.kv_transfer_time.summary(),
+                    "bytes": int(self.kv_transfer_bytes.sum),
+                    "mib_per_second": _rate(self.kv_transfer_bytes.sum / 2**20, self.kv_transfer_time.sum),
+                },
                 # Percentiles are the client's job; these buckets are too coarse.
                 "latency": {
                     "ttft": self.ttft.summary(),

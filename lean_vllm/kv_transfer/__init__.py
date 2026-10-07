@@ -5,6 +5,7 @@ from lean_vllm.kv_transfer.base import (
     KVConnectorWorker,
     KVOutputAggregator,
     KVTransferConfig,
+    KVTransferStats,
     ReqToRecv,
     check_kv_transfer_params,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "KVConnectorWorker",
     "KVOutputAggregator",
     "KVTransferConfig",
+    "KVTransferStats",
     "ReqToRecv",
     "check_kv_transfer_params",
     "create_scheduler_connector",

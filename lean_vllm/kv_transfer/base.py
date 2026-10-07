@@ -99,12 +99,28 @@ class KVConnectorMetadata:
 
 
 @dataclass(slots=True)
+class KVTransferStats:
+    """One load, as vLLM's NIXL stats record a transfer: from the read to the blocks landing."""
+
+    seconds: float
+    num_bytes: int
+    transport: str  # "ipc" or "tcp"
+
+    def merge(self, other: "KVTransferStats") -> "KVTransferStats":
+        """Ranks load in parallel: the slowest sets the time, and the bytes add up."""
+        transport = self.transport if self.transport == other.transport else "mixed"
+        return KVTransferStats(max(self.seconds, other.seconds), self.num_bytes + other.num_bytes, transport)
+
+
+@dataclass(slots=True)
 class KVConnectorOutput:
     """Transfers a worker half finished since its last report. A failed load leaves its blocks to recompute."""
 
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
     failed_recving: set[str] = field(default_factory=set)
+    expired_sending: set[str] = field(default_factory=set)  # of finished_sending, freed with no consumer read
+    recv_stats: dict[str, KVTransferStats] = field(default_factory=dict)  # of finished_recving
 
     def __bool__(self):
         return bool(self.finished_sending or self.finished_recving or self.failed_recving)
@@ -118,23 +134,38 @@ class KVOutputAggregator:
         self._sent: Counter[str] = Counter()
         self._recved: Counter[str] = Counter()
         self._failed: set[str] = set()
+        self._expired: set[str] = set()
+        self._stats: dict[str, KVTransferStats] = {}
 
     def aggregate(self, outputs: list[KVConnectorOutput]) -> KVConnectorOutput:
         result = KVConnectorOutput()
         for output in outputs:
             self._failed |= output.failed_recving
+            self._expired |= output.expired_sending
+            for request_id, stats in output.recv_stats.items():
+                seen = self._stats.get(request_id)
+                self._stats[request_id] = stats if seen is None else seen.merge(stats)
             for request_id in output.finished_sending:
                 self._sent[request_id] += 1
                 if self._sent[request_id] == self.world_size:
                     del self._sent[request_id]
                     result.finished_sending.add(request_id)
+                    if request_id in self._expired:
+                        self._expired.discard(request_id)
+                        result.expired_sending.add(request_id)
             for request_id in output.finished_recving | output.failed_recving:
                 self._recved[request_id] += 1
                 if self._recved[request_id] == self.world_size:
                     del self._recved[request_id]
                     failed = request_id in self._failed
                     self._failed.discard(request_id)
-                    (result.failed_recving if failed else result.finished_recving).add(request_id)
+                    stats = self._stats.pop(request_id, None)
+                    if failed:
+                        result.failed_recving.add(request_id)
+                    else:
+                        result.finished_recving.add(request_id)
+                        if stats is not None:
+                            result.recv_stats[request_id] = stats
         return result
 
 

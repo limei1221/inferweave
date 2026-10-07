@@ -155,6 +155,7 @@ class FakeEngine:
         if output.kv_connector_metadata is not None:
             kv_output = self.model_runner.call("kv_connector_step", output.kv_connector_metadata)
             self.scheduler.update_from_kv_connector_output(kv_output)
+            self.metrics.record_kv_transfer(kv_output)
         if output:
             pending = self.model_runner.call("run", output.scheduled)
             rows = self.scheduler.advance(output.scheduled)
