@@ -2,19 +2,14 @@ from lean_vllm import envs
 from lean_vllm.attention.abstract import AttentionBackend, LayerSpec
 from lean_vllm.attention.flash_backend import FlashAttention3Backend
 from lean_vllm.attention.flashinfer_backend import FlashInferBackend
-from lean_vllm.attention.flashinfer_mla_backend import FlashInferMLABackend
 from lean_vllm.attention.flashmla_backend import FlashMLABackend
 from lean_vllm.attention.torch_backend import TorchAttention
-from lean_vllm.attention.triton_mla_backend import TritonMLABackend
 
-# In priority order, as vLLM's per-platform lists. The MLA backends serve MLA layers only, so a plain layer passes
-# them by; as in vLLM, Triton MLA follows FlashMLA where FlashMLA is missing, and FlashInfer MLA is chosen by name.
+# In priority order, as vLLM's per-platform lists. FlashMLA serves MLA layers only, so a plain layer passes it by.
 # FA3 serves MLA layers too, by expanding latents even to decode. TorchAttention is last and serves any layer, so
 # resolution cannot fail.
 BACKENDS: tuple[type[AttentionBackend], ...] = (
     FlashMLABackend,
-    TritonMLABackend,
-    FlashInferMLABackend,
     FlashAttention3Backend,
     FlashInferBackend,
     TorchAttention,

@@ -30,22 +30,17 @@ transformers ≥ 4.56 and need no `trust_remote_code`.
 ### Hardware and attention backends
 
 Each MLA layer chooses its backend at init. The preference is `flashmla`, then
-`triton_mla`, as in vLLM, then `flashinfer_mla`, `flash_attn_3` and `torch`;
-`flashinfer` serves no MLA layer itself. Set `LEAN_VLLM_ATTENTION_BACKEND` to
-force one.
+`flash_attn_3` and `torch`; `flashinfer` serves no MLA layer. Set
+`LEAN_VLLM_ATTENTION_BACKEND` to force one.
 
 | Backend | Runs on | How decode reads the cache | CUDA graphs |
 |---|---|---|---|
 | `flashmla` | H100/H200, with FlashMLA built from source | FlashMLA kernel over the latents | full + piecewise |
-| `triton_mla` | sm80 and newer | vLLM's Triton MLA kernel over the latents | full + piecewise |
-| `flashinfer_mla` | sm80 and newer | FlashInfer's FA2/FA3 MLA kernel over the latents | full + piecewise |
 | `flash_attn_3` | H100/H200 | expands latents into keys and values | piecewise only |
 | `torch` | anything: CPU or any CUDA GPU | over the latents, in plain torch | none (eager) |
 
 `flashmla` switches the KV cache to 64-token pages, the only size its kernel
-reads; `triton_mla` and `flashinfer_mla` read any. Those two prefill on FA3 on
-Hopper and on FlashInfer elsewhere, so an A100 now has a fast MLA path. Neither
-has run on a GPU yet ([attention-backends.md](attention-backends.md#mla-decode-triton-and-flashinfer)).
+reads. Off Hopper, MLA layers fall back to `torch`.
 
 The routed experts run a Triton kernel on CUDA and `F.grouped_mm` elsewhere.
 Set `LEAN_VLLM_MOE_BACKEND=triton|torch` to force one. The kernel's tile sizes
@@ -145,8 +140,8 @@ layer for its `kv_cache_shape` rather than reading head counts off the config.
    every layer.
 
 Values are 128 wide and keys 192. FA3 on Hopper takes them as they are, as
-vLLM's MLA prefill does there, and so do FlashInfer's prefill and `torch`, so
-values are never padded. vLLM's `_pad_v` zero-pads them to 192 only for FA2,
+vLLM's MLA prefill does there, and so does `torch`, so values are never
+padded. vLLM's `_pad_v` zero-pads them to 192 only for FA2,
 which lean-vllm does not have.
 
 **Decode** skips the expansion. Since `q · (W_UK c) = (W_UKᵀ q) · c`, each head's

@@ -89,9 +89,6 @@ ignore = [
     "B027",    # optional hooks on an ABC are empty on purpose
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"lean_vllm/attention/triton_mla_decode.py" = ["E741"]    # m, l, acc: the online-softmax names
-
 [tool.mypy]
 files = ["lean_vllm"]
 python_version = "3.10"

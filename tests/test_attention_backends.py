@@ -1,8 +1,5 @@
 """Backends checked against dense_attention, an independent oracle using no SDPA or paging."""
 
-import math
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import torch
@@ -11,11 +8,9 @@ from lean_vllm.attention import (
     BACKENDS,
     FlashAttention3Backend,
     FlashInferBackend,
-    FlashInferMLABackend,
     FlashMLABackend,
     LayerSpec,
     TorchAttention,
-    TritonMLABackend,
     flash_backend,
     flashinfer_backend,
     get_attention_backend,
@@ -23,7 +18,7 @@ from lean_vllm.attention import (
 )
 from lean_vllm.attention.merge import merge_attention, merge_attention_
 from lean_vllm.layers.attention import Attention
-from lean_vllm.utils.context import Context, set_context, split_decodes_and_prefills
+from lean_vllm.utils.context import Context, split_decodes_and_prefills
 
 torch.manual_seed(0)
 
@@ -40,8 +35,6 @@ DTYPE = {
     "flash_attn_3": torch.float16,
     "flashinfer": torch.float16,
     "flashmla": torch.float16,
-    "triton_mla": torch.float16,
-    "flashinfer_mla": torch.float16,
 }
 
 # Tolerances against the fp32 oracle; bf16 uses test_low_precision_no_worse_than_naive.
@@ -202,6 +195,8 @@ def test_prefill_without_cache(backend, device, dtype, tol):
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
 def test_varlen_with_lse(backend, device, dtype, tol, causal):
     """Uncached attention and its log-sum-exp, by which MLA merges chunks of cached keys."""
+    if "mla" not in backend.supported_kinds:
+        pytest.skip(f"{backend.get_name()} serves no MLA layer")
     seqlens_q = [5, 1, 12]
     seqlens_k = seqlens_q if causal else [7, 4, 16]  # unmasked chunks hold more keys than queries
     qs = [randn(n, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_q]
@@ -234,6 +229,8 @@ def test_narrow_values_match_padded_ones(backend, device, dtype, tol, causal):
 
     Padded values are what every backend is checked on above, so they are the reference.
     """
+    if "mla" not in backend.supported_kinds:
+        pytest.skip(f"{backend.get_name()} serves no MLA layer")
     qk_dim, v_dim = 192, 128
     mla = type(backend)(NUM_HEADS, qk_dim, SCALE, NUM_HEADS)  # expanded MLA: a key head per query head
     seqlens_q = [5, 1, 12]
@@ -431,19 +428,6 @@ def check_mla_decode(backend_cls, block_size, context_lens, block_tables_list):
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
 
-@pytest.mark.skipif(not TritonMLABackend.is_available(), reason="needs Triton and a GPU of sm80 or newer")
-def test_triton_mla_decode_writes_zeros_for_a_row_with_no_keys():
-    """A full graph's padding rows have no keys; they must come out zero, not 0 / 0, beside a real row."""
-    from lean_vllm.attention import triton_mla_decode
-
-    cache = randn(2, BLOCK_SIZE, LATENT_DIM, device="cuda", dtype=torch.float16)
-    q = randn(2, NUM_HEADS, LATENT_DIM, device="cuda", dtype=torch.float16)
-    block_tables = torch.tensor([[0], [1]], dtype=torch.int32, device="cuda")
-    context_lens = torch.tensor([5, 0], dtype=torch.int32, device="cuda")
-    out = triton_mla_decode.mla_decode(q, cache, block_tables, context_lens, LATENT_V_DIM, SCALE)
-    assert out[0].isfinite().all() and (out[1] == 0).all()
-
-
 @pytest.mark.parametrize("backend_cls", MLA_CASES, ids=[b.get_name() for b in MLA_CASES])
 def test_store_latents_skips_negative_slots(backend_cls):
     """A full graph pads its batch, so slot -1 must leave that cache row untouched."""
@@ -490,7 +474,7 @@ def test_each_layer_takes_the_first_backend_that_serves_it(all_available, monkey
         monkeypatch.setattr(hopper_only, "is_available", staticmethod(lambda: False))
     assert get_attention_backend(PLAIN_SPEC) is FlashInferBackend
     assert get_attention_backend(LayerSpec(96, 32, 8, torch.bfloat16)) is TorchAttention  # not 64, 128 or 256
-    assert get_attention_backend(MLA_SPEC) is TritonMLABackend  # prefilling on FlashInfer
+    assert get_attention_backend(MLA_SPEC) is TorchAttention  # FlashInfer serves plain layers only
 
 
 @pytest.mark.parametrize(
@@ -526,24 +510,9 @@ def test_layers_of_one_model_can_take_different_backends(all_available):
     ]
 
 
-def test_mla_layers_take_triton_mla_where_flashmla_is_missing(all_available, monkeypatch):
-    """As vLLM's MLA lists: FlashMLA, then Triton MLA. FlashInfer MLA serves when named; plain layers pass both by."""
+def test_mla_layers_take_fa3_where_flashmla_is_missing(all_available, monkeypatch):
     monkeypatch.setattr(FlashMLABackend, "is_available", staticmethod(lambda: False))
-    assert get_attention_backend(MLA_SPEC) is TritonMLABackend
-    assert get_attention_backend(MLA_SPEC, "flashinfer_mla") is FlashInferMLABackend
-    assert get_attention_backend(PLAIN_SPEC) is FlashAttention3Backend
-
-
-def test_mla_decode_backends_prefill_on_fa3_else_flashinfer(all_available, monkeypatch):
-    from lean_vllm.attention import mla_common
-
-    assert mla_common.prefill_backend() is FlashAttention3Backend
-    monkeypatch.setattr(FlashAttention3Backend, "is_available", staticmethod(lambda: False))
-    assert mla_common.prefill_backend() is FlashInferBackend
-    # FlashInfer's prefill takes MLA's 192-wide keys and 128-wide values, though its decode takes neither.
-    assert TritonMLABackend.validate(MLA_SPEC) == []
-    monkeypatch.setattr(FlashInferBackend, "is_available", staticmethod(lambda: False))
-    assert "neither FlashAttention-3 nor FlashInfer" in "; ".join(TritonMLABackend.validate(MLA_SPEC))
+    assert get_attention_backend(MLA_SPEC) is FlashAttention3Backend
 
 
 def test_decode(backend, device, block_size, dtype, tol):
@@ -988,149 +957,32 @@ def test_flashinfer_full_graphs_get_a_wrapper_per_batch_size_replanned_before_re
 
 
 class FakeRaggedWrapper:
-    """Records what FlashInfer's ragged prefill wrapper is planned with; runs to zeros and a base-2 lse of 2."""
+    """Records what FlashInfer's ragged prefill wrapper is planned with; runs to zeros."""
 
     def __init__(self, workspace, layout):
         self.plans = []
 
     def plan(self, qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, causal, **options):
-        self.plans.append((qo_indptr.tolist(), kv_indptr.tolist(), head_dim_vo, causal))
+        self.plans.append((qo_indptr.tolist(), kv_indptr.tolist(), causal))
 
-    def run(self, q, k, v, return_lse=False, out=None):
-        out = q.new_zeros(*q.shape[:2], v.size(-1)) if out is None else out.zero_()
-        return (out, torch.full(q.shape[:2], 2.0)) if return_lse else out
+    def run(self, q, k, v, out=None):
+        return q.new_zeros(q.shape) if out is None else out.zero_()
 
 
-@pytest.fixture
-def fake_ragged(monkeypatch):
+def test_flashinfer_plans_a_pageless_prefill_once_per_lengths(monkeypatch):
+    """Every layer of a warmup step poses the same problem: planned once, and again only when the lengths change."""
     monkeypatch.setattr(flashinfer_backend, "BatchPrefillWithRaggedKVCacheWrapper", FakeRaggedWrapper, raising=False)
-    monkeypatch.setattr(FlashInferBackend, "_ragged", [])
+    monkeypatch.setattr(FlashInferBackend, "_ragged", {})
     monkeypatch.setattr(FlashInferBackend, "_workspace", torch.zeros(1, dtype=torch.uint8))
-    q = k = torch.zeros(6, NUM_HEADS, 192)
-    return FlashInferBackend(NUM_HEADS, 192, SCALE, NUM_HEADS), q, k, torch.zeros(6, NUM_HEADS, 128)
-
-
-def test_flashinfer_plans_each_ragged_problem_once_a_step(fake_ragged):
-    """An MLA step's layers pose the same problems, its new tokens and each chunk of cached keys: each is planned
-    once, on a wrapper of its own, and a later step posing one again reuses its plan."""
-    backend, q, k, v = fake_ragged
-    new, chunk = ([0, 2, 6], [0, 2, 6]), ([0, 6], [0, 5])
-    with set_context(True):
+    backend = FlashInferBackend(NUM_HEADS, HEAD_DIM, SCALE, NUM_KV_HEADS)
+    q, kv = torch.zeros(6, NUM_HEADS, HEAD_DIM), torch.zeros(6, NUM_KV_HEADS, HEAD_DIM)
+    for lengths in ([0, 2, 6], [0, 2, 6], [0, 6]):  # steps
+        context = Context(is_prefill=True, cu_seqlens_q_host=lengths, cu_seqlens_k_host=lengths)
         for _ in range(3):  # layers
-            out, lse = backend.varlen_with_lse(q, k, v, None, None, 4, 4, True, host_cu_seqlens=new)
-            backend.varlen_with_lse(q, k, v, None, None, 6, 5, False, host_cu_seqlens=chunk)
-    assert [wrapper.plans for wrapper, _ in FlashInferBackend._ragged] == [
-        [([0, 2, 6], [0, 2, 6], 128, True)],
-        [([0, 6], [0, 5], 128, False)],
-    ]
-    assert out.shape == (6, NUM_HEADS, 128)
-    torch.testing.assert_close(lse, torch.full((6, NUM_HEADS), 2 * math.log(2)))  # base e
-
-    with set_context(True):
-        backend.varlen_with_lse(q, k, v, None, None, 4, 4, True, host_cu_seqlens=new)
-    assert len(FlashInferBackend._ragged[0][0].plans) == 1
-
-
-def test_flashinfer_ragged_problems_past_the_pool_share_its_last_wrapper(fake_ragged, monkeypatch):
-    backend, q, k, v = fake_ragged
-    monkeypatch.setattr(flashinfer_backend, "MAX_RAGGED_PLANS", 2)
-    problems = [([0, n], [0, n]) for n in (1, 2, 3)]
-    with set_context(True):
-        for _ in range(2):  # layers
-            for host in problems:
-                backend.varlen_with_lse(q, k, v, None, None, 1, 1, False, host_cu_seqlens=host)
-    pool = FlashInferBackend._ragged
-    assert len(pool) == 2 and len(pool[0][0].plans) == 1
-    assert [plan[0] for plan in pool[1][0].plans] == [[0, 2], [0, 3], [0, 2], [0, 3]]  # re-planned as they alternate
-
-
-class FakeMLAWrapper:
-    """Records what FlashInfer's MLA wrapper is built and planned with, and copies plans into its buffers under
-    use_cuda_graph, as the real one does."""
-
-    def __init__(
-        self, workspace, use_cuda_graph=False, qo_indptr=None, kv_indptr=None, kv_indices=None, kv_len_arr=None
-    ):
-        self.use_cuda_graph = use_cuda_graph
-        self.buffers = (qo_indptr, kv_indptr, kv_indices, kv_len_arr)
-        self.plans = []
-
-    def plan(
-        self, *, metadata, num_heads, head_dim_ckv, head_dim_kpe, page_size, causal, sm_scale, q_data_type, kv_data_type
-    ):
-        assert (head_dim_ckv, head_dim_kpe, causal) == (LATENT_V_DIM, LATENT_DIM - LATENT_V_DIM, False)
-        self.plans.append(tuple(tensor.tolist() for tensor in metadata))
-        if self.use_cuda_graph:
-            assert len(metadata[3]) == len(self.buffers[3]), "a graph's wrapper plans its own batch size only"
-            for buffer, tensor in zip(self.buffers, metadata):
-                buffer[: len(tensor)].copy_(tensor)
-
-    def run(self, *, query, kv_cache):
-        return query.new_zeros(*query.shape[:2], LATENT_V_DIM)
-
-
-@pytest.fixture
-def fake_flashinfer_mla(monkeypatch):
-    from lean_vllm.attention import flashinfer_mla_backend, mla_common
-
-    monkeypatch.setattr(flashinfer_mla_backend, "BatchMLAPagedAttentionWrapper", FakeMLAWrapper, raising=False)
-    monkeypatch.setattr(
-        flashinfer_mla_backend, "MLAPlanMetadata", SimpleNamespace(csr=lambda *tensors: tensors), raising=False
-    )
-    monkeypatch.setattr(mla_common, "prefill_backend", lambda: TorchAttention)
-    monkeypatch.setattr(FlashInferMLABackend, "_wrappers", {})
-    monkeypatch.setattr(FlashInferMLABackend, "_graph_metadata", None)
-    monkeypatch.setattr(FlashInferBackend, "_workspace", torch.zeros(1, dtype=torch.uint8))
-    return FlashInferMLABackend(NUM_HEADS, 192, SCALE, NUM_HEADS)
-
-
-def test_flashinfer_mla_metadata_lists_each_rows_pages_and_pads_with_one_key_rows():
-    """Its CSR plan: one query per row, the pages a row's keys fill, and its key count; padding reads page 0."""
-    context = Context(
-        cu_seqlens_k_host=[0, 5, 5 + 2 * BLOCK_SIZE],
-        block_tables=torch.tensor([[4, 9, -1], [7, 2, -1]], dtype=torch.int32),
-    )
-    metadata = FlashInferMLABackend._metadata(context, BLOCK_SIZE, num_rows=4)
-    assert [tensor.tolist() for tensor in metadata] == [
-        [0, 1, 2, 3, 4],
-        [0, 1, 3, 4, 5],
-        [4, 7, 2, 0, 0],
-        [5, 2 * BLOCK_SIZE, 1, 1],
-    ]
-    assert all(tensor.dtype == torch.int32 for tensor in metadata)
-
-
-def test_flashinfer_mla_full_graphs_get_a_wrapper_per_batch_size_replanned_before_replay(fake_flashinfer_mla):
-    """Captured as the runner captures, largest first with worst-case lengths, then re-planned for a real step."""
-    backend, width = fake_flashinfer_mla, 3
-    cache = torch.zeros(8, BLOCK_SIZE, LATENT_DIM)
-    for bs in (4, 2):
-        context = Context(
-            context_lens=torch.full((bs,), width * BLOCK_SIZE, dtype=torch.int32),
-            block_tables=torch.zeros(bs, width, dtype=torch.int32),
-            full_graph_size=bs,
-        )
-        for _ in range(2):  # layers, which share the step's plan
-            out = backend.mla_decode(torch.zeros(bs, NUM_HEADS, LATENT_DIM), cache, LATENT_V_DIM, context)
-    assert out.shape == (2, NUM_HEADS, LATENT_V_DIM)
-    graphs = {key[-1]: wrapper for key, wrapper in FlashInferMLABackend._wrappers.items()}
-    assert set(graphs) == {4, 2} and all(w.use_cuda_graph and len(w.plans) == 1 for w in graphs.values())
-    qo_indptr, kv_indptr, kv_indices, kv_lens = FlashInferMLABackend._graph_metadata
-    assert graphs[2].buffers[2] is kv_indices and graphs[2].buffers[3].data_ptr() == kv_lens.data_ptr()
-
-    step = Context(
-        cu_seqlens_k_host=[0, 5, 5 + BLOCK_SIZE + 1, 6 + BLOCK_SIZE + 1],
-        block_tables=torch.tensor([[4, -1], [7, 2], [3, -1]], dtype=torch.int32),
-    )
-    FlashInferMLABackend.before_full_graph_replay(step, 4)
-
-    assert graphs[4].plans[-1] == ([0, 1, 2, 3, 4], [0, 1, 3, 4, 5], [4, 7, 2, 3, 0], [5, BLOCK_SIZE + 1, 1, 1])
-    assert len(graphs[2].plans) == 1  # another graph's wrapper is left alone
-    assert kv_indptr[:5].tolist() == [0, 1, 3, 4, 5] and kv_lens[:4].tolist() == [5, BLOCK_SIZE + 1, 1, 1]
-
-    backend.mla_decode(torch.zeros(3, NUM_HEADS, LATENT_DIM), cache, LATENT_V_DIM, step)  # an eager step
-    eager = [w for key, w in FlashInferMLABackend._wrappers.items() if key[-1] is None]
-    assert len(eager) == 1 and not eager[0].use_cuda_graph
+            out = backend.prefill(q, kv, kv, None, None, context)
+    ((wrapper, _),) = FlashInferBackend._ragged.values()
+    assert wrapper.plans == [([0, 2, 6], [0, 2, 6], True), ([0, 6], [0, 6], True)]
+    assert out.shape == q.shape
 
 
 def _paged_attention_with_lse(q, k_cache, v_cache, n: int, pages, causal: bool):
