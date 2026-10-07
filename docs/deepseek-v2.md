@@ -62,7 +62,8 @@ vLLM's defaults otherwise; see [Tuning the MoE kernel](#tuning-the-moe-kernel).
 | bf16 | Used on GPU; fp32 is used in the tests |
 | Tensor parallelism | Implemented (attention heads and expert width are sharded); checked at TP=2 on CPU, only run at TP=1 on a GPU |
 | Expert parallelism | `--enable-expert-parallel`: each rank holds whole experts, as vLLM does without DP; checked at 2 ranks on CPU, not yet run on GPUs |
-| Pipeline parallelism, data parallelism, all-to-all dispatch, expert load balancing | Not supported |
+| Expert load balancing (EPLB) | `--enable-eplb`: redundant copies of busy experts, moved between ranks by their load, as vLLM's synchronous EPLB on one node; checked at 2 ranks on CPU, not yet run on GPUs |
+| Pipeline parallelism, data parallelism, all-to-all dispatch, async EPLB | Not supported |
 | Weight or KV-cache quantization | Not supported |
 
 ## Running it
@@ -166,8 +167,9 @@ reused by every layer.
 
 `FusedMoE` (`layers/moe.py`) stacks the routed experts into one `gate_up_proj`
 of shape `[E, 2I, H]` and one `down_proj` of shape `[E, H, I]`. Routing follows
-vLLM's `grouped_topk`: softmax scores, `greedy` or `group_limited_greedy`
-selection, then `norm_topk_prob` and `routed_scaling_factor`. Shared experts
+vLLM's `grouped_topk`: softmax scores with `greedy` or `group_limited_greedy`
+selection, or V3's `noaux_tc` (sigmoid scores, picks steered by a correction
+bias), then `norm_topk_prob` and `routed_scaling_factor`. Shared experts
 load into the dense gated MLP, but `FusedMoE` runs them, in the same op as the
 routed experts. Their output is added before the all-reduce, so under TP a layer
 reduces once rather than twice, as vLLM's `SharedFusedMoE` does. A step of at
@@ -236,6 +238,36 @@ TP already does, so communication is unchanged; what changes is that each rank
 runs full-width GEMMs for 1/N of the experts instead of 1/N-width GEMMs for all
 of them. Without data parallelism there are no other ranks' tokens to exchange,
 so vLLM's all-to-all backends do not apply.
+
+### Expert load balancing
+
+`--enable-eplb` (with `--enable-expert-parallel`) follows vLLM's EPLB, run
+synchronously. `--eplb-config` takes vLLM's JSON keys `window_size` (1000),
+`step_interval` (3000), `num_redundant_experts` (0) and `log_balancedness`.
+
+- **Slots.** Each MoE layer holds `n_routed_experts + num_redundant_experts`
+  physical slots, the same number on every rank. They start as slot `p` holding
+  expert `p mod n_routed_experts`, so the spare slots copy the first experts.
+- **Routing.** After the router picks logical experts, the `eplb_map` op sends
+  each pick to one replica of its expert, chosen by a hash of the token, and
+  counts the load per slot. It reads a device-side token count, so a graph
+  replay's padding rows count nothing. It needs no host sync, so full and
+  piecewise graphs hold it.
+- **Rearranging.** `EplbState.step()` runs on every rank after each forward. It
+  keeps the last `window_size` steps of load. Every `step_interval` steps the
+  ranks all-reduce the load per logical expert and run vLLM's default policy
+  (`eplb/policy.py`, one node): spare slots go to the experts with the most
+  load per replica, then replicas are packed so each rank's load is as even as
+  possible, and an expert a rank keeps stays in its slot. `move_experts` then
+  fills each changed slot from the rank's own old slots, or from a rank that
+  held the expert, with one batch of point-to-point sends per layer, through a
+  one-layer buffer. Weights and maps change in place, so captured graphs stay
+  valid.
+
+The step blocks while experts move. vLLM's async mode, which moves them on a
+side thread a layer at a time, is not implemented. Neither is a profiling run
+that reserves NCCL's point-to-point buffers before the KV cache is sized, so
+leave some headroom in `--gpu-memory-utilization`.
 
 ### YaRN
 

@@ -13,6 +13,7 @@ from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, ma
 from lean_vllm.engine.input_buffers import InputBuffers
 from lean_vllm.engine.sampled_tokens import SampledTokens
 from lean_vllm.engine.sequence import Sequence
+from lean_vllm.eplb import EplbState
 from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, KVOutputAggregator, create_worker_connector
 from lean_vllm.layers.attention import Attention, MLAAttention, register_layers
 from lean_vllm.layers.sampler import Sampler
@@ -44,6 +45,7 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
 
 class ModelRunner:
     cascade_layers: list[Attention] = []  # one layer per kind, backend and head count; each must agree to cascade
+    eplb: EplbState | None = None  # with enable_eplb
 
     def __init__(self, config: Config, rank: int):
         self.config = config
@@ -73,9 +75,13 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
-        model_kwargs = {"enable_expert_parallel": True} if config.enable_expert_parallel else {}
+        model_kwargs: dict = {"enable_expert_parallel": True} if config.enable_expert_parallel else {}
+        if config.eplb is not None:
+            model_kwargs["eplb_config"] = config.eplb
         self.model = model_cls(hf_config, **model_kwargs)
         register_layers(self.model)  # before warmup_model, which runs the op
+        # Binds the MoE layers' maps, which every forward reads, and holds a layer's worth of buffer before warmup.
+        self.eplb = EplbState(self.model, config.eplb) if config.eplb is not None else None
         # Each layer chose its backend as it was built; graphs depend on all of them.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
         if rank == 0:
@@ -117,6 +123,8 @@ class ModelRunner:
             self.capture_cudagraph()
         if self.cudagraph_mode in PIECEWISE_MODES:
             self.capture_piecewise()
+        if self.eplb is not None:
+            self.eplb.reset()  # warmup's and capture's load is not the workload's
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -371,6 +379,8 @@ class ModelRunner:
         self.step_kind = self._step_kind(is_prefill, input_ids.size(0), get_context().common_prefix_len > 0)
         if self.compile_backend is not None and not self.compile_backend.pieces:  # this call traces
             mark_dynamic_tokens(input_ids, positions)
+        if self.eplb is not None:
+            self.eplb.num_tokens.fill_(input_ids.size(0))  # a replay's padding rows record no load
         if self.step_kind == "graph":
             return self.model.compute_logits(self._replay_full(input_ids, positions))
         if self.step_kind == "piecewise":
@@ -421,6 +431,8 @@ class ModelRunner:
                 logits = self.run_model(input_ids, positions, context["is_prefill"])
             with record_function("sample"):
                 tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
+        if self.eplb is not None:
+            self.eplb.step()  # every rank runs every step, so they rearrange together
         if tokens is None:
             return None
         pending = SampledTokens(tokens, self.device)

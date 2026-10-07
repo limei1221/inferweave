@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from lean_vllm.eplb import EplbConfig
 from lean_vllm.layers.attention import MLAAttention
 from lean_vllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from lean_vllm.layers.layernorm import RMSNorm
@@ -149,6 +150,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         enable_expert_parallel: bool = False,
+        eplb_config: EplbConfig | None = None,
     ) -> None:
         super().__init__()
         # transformers' V3 config has neither field: its router is always noaux_tc over sigmoid scores
@@ -174,6 +176,8 @@ class DeepseekV2MoE(nn.Module):
             config.hidden_size,
             config.moe_intermediate_size,
             enable_expert_parallel,
+            enable_eplb=eplb_config is not None,
+            num_redundant_experts=eplb_config.num_redundant_experts if eplb_config is not None else 0,
         )
         self.shared_experts = None
         if config.n_shared_experts:
@@ -211,6 +215,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_idx: int,
         enable_expert_parallel: bool = False,
+        eplb_config: EplbConfig | None = None,
     ) -> None:
         super().__init__()
         self.self_attn = DeepseekV2Attention(config)
@@ -221,7 +226,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_idx % moe_layer_freq == 0
         )
         if is_moe_layer:
-            self.mlp: DeepseekV2MoE | DeepseekV2MLP = DeepseekV2MoE(config, enable_expert_parallel)
+            self.mlp: DeepseekV2MoE | DeepseekV2MLP = DeepseekV2MoE(config, enable_expert_parallel, eplb_config)
         else:
             self.mlp = DeepseekV2MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -265,11 +270,15 @@ class DeepseekV2Model(nn.Module):
         self,
         config: PretrainedConfig,
         enable_expert_parallel: bool = False,
+        eplb_config: EplbConfig | None = None,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [DeepseekV2DecoderLayer(config, i, enable_expert_parallel) for i in range(config.num_hidden_layers)]
+            [
+                DeepseekV2DecoderLayer(config, i, enable_expert_parallel, eplb_config)
+                for i in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -298,6 +307,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         enable_expert_parallel: bool = False,
+        eplb_config: EplbConfig | None = None,
     ) -> None:
         super().__init__()
         if config.q_lora_rank is not None:
@@ -311,7 +321,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             f"model.layers.{config.num_hidden_layers + i}."
             for i in range(getattr(config, "num_nextn_predict_layers", None) or 0)
         )
-        self.model = DeepseekV2Model(config, enable_expert_parallel)
+        self.model = DeepseekV2Model(config, enable_expert_parallel, eplb_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
