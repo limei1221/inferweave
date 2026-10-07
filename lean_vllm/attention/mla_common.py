@@ -44,11 +44,6 @@ class MLACommonBackend(AttentionBackend):
             prefill.supports_head_size(head_size) or (prefill is FlashInferBackend and head_size == 192)
         )
 
-    @staticmethod
-    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        prefill = prefill_backend()
-        return prefill is not None and prefill.supports_value_head_size(head_size, v_head_size)
-
     @classmethod
     def validate(cls, spec: LayerSpec) -> list[str]:
         reasons = super().validate(spec)

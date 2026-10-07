@@ -167,8 +167,7 @@ and `MLAAttention` answers with its own latent layout
 
 Capability flags tell the runner what a backend can do: `supports_cuda_graph()`,
 `supports_full_cudagraph()`, `split_decodes()`, `supports_mla_decode()`,
-`supports_value_head_size()`, `supports_full_cudagraph_mla_decode()` and
-`mla_block_size()`. One hook,
+`supports_full_cudagraph_mla_decode()` and `mla_block_size()`. One hook,
 `before_full_graph_replay(context, batch_size)`, runs on each layer's backend
 class before a full graph replays, to refresh state the graph reads but the
 host computes; it does nothing by default.

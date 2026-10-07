@@ -30,9 +30,9 @@ class Context:
 def split_decodes_and_prefills(context: Context) -> tuple[int, Context | None, Context | None]:
     """A prefill step's leading one-query rows, as (their count, a decode context, a context for the rest).
 
-    Either context is None when it has no rows. The runner puts one-query rows first, so this is a slice, built on
-    the host once per step and shared by every layer, as vLLM's split_decodes_and_prefills. A row decodes by its
-    shape, so a one-token prompt chunk does too: attention cannot tell it from a decode.
+    Each context is None when its group has no rows. The runner puts one-query rows first, so the split is a
+    slice, built on the host once per step and shared by every layer, as vLLM's split_decodes_and_prefills.
+    A one-token prompt chunk decodes too: attention can't tell it from a decode, as the query shape is the same.
     """
     if context.block_tables is None or context.cu_seqlens_q_host is None:
         return 0, None, context  # nothing cached to decode against, or no host lengths to split by

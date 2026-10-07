@@ -230,13 +230,11 @@ def test_varlen_with_lse(backend, device, dtype, tol, causal):
 
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
 def test_narrow_values_match_padded_ones(backend, device, dtype, tol, causal):
-    """MLA prefill's shape, 192-wide keys and 128-wide values, taken as they are by a backend that can.
+    """MLA prefill's shape, 192-wide keys and 128-wide values, taken as they are, as MLAAttention hands them over.
 
     Padded values are what every backend is checked on above, so they are the reference.
     """
     qk_dim, v_dim = 192, 128
-    if not backend.supports_value_head_size(qk_dim, v_dim):
-        pytest.skip(f"{backend.get_name()} pads values")
     mla = type(backend)(NUM_HEADS, qk_dim, SCALE, NUM_HEADS)  # expanded MLA: a key head per query head
     seqlens_q = [5, 1, 12]
     seqlens_k = seqlens_q if causal else [7, 4, 16]
@@ -543,7 +541,7 @@ def test_mla_decode_backends_prefill_on_fa3_else_flashinfer(all_available, monke
     monkeypatch.setattr(FlashAttention3Backend, "is_available", staticmethod(lambda: False))
     assert mla_common.prefill_backend() is FlashInferBackend
     # FlashInfer's prefill takes MLA's 192-wide keys and 128-wide values, though its decode takes neither.
-    assert TritonMLABackend.validate(MLA_SPEC) == [] and TritonMLABackend.supports_value_head_size(192, 128)
+    assert TritonMLABackend.validate(MLA_SPEC) == []
     monkeypatch.setattr(FlashInferBackend, "is_available", staticmethod(lambda: False))
     assert "neither FlashAttention-3 nor FlashInfer" in "; ".join(TritonMLABackend.validate(MLA_SPEC))
 

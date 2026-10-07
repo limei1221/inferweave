@@ -108,6 +108,7 @@ class DeepseekV2Attention(nn.Module):
         )
         W_UK, W_UV = kv_b_proj_weight.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         # (L, N, P) -> (N, P, L) and (L, N, V) -> (N, L, V)
+        # L kv_lora_rank, N num_local_heads, P qk_nope_head_dim, V v_head_dim
         return W_UK.permute(1, 2, 0), W_UV.transpose(0, 1)
 
     def process_weights_after_loading(self):

@@ -137,9 +137,7 @@ def test_a_prompt_matches_transformers(models, runner):
 @pytest.mark.parametrize("max_context_chunk", [64, 4], ids=["one_chunk", "split_rows"])
 # Pure decode attends the latents through mla_decode, or expands them as other steps do.
 @pytest.mark.parametrize("latent_decode", [True, False], ids=["latent_decode", "expanded_decode"])
-# Values as they are, as FA3 and torch take them, or padded to the keys' size, as a one-size backend needs.
-@pytest.mark.parametrize("pad_values", [False, True], ids=["narrow_values", "padded_values"])
-def test_paged_steps_match_transformers(models, runner, max_context_chunk, latent_decode, pad_values, monkeypatch):
+def test_paged_steps_match_transformers(models, runner, max_context_chunk, latent_decode, monkeypatch):
     """Chunks, a cold prompt beside a resumed one, pure decode, then decode mixed with a prompt."""
     monkeypatch.setattr(TorchAttention, "supports_mla_decode", staticmethod(lambda: latent_decode))
     reference, model = models
@@ -148,7 +146,6 @@ def test_paged_steps_match_transformers(models, runner, max_context_chunk, laten
     for layer, layer_cache in zip(layers, cache):
         layer.bind_kv_cache(layer_cache)
         layer.max_context_chunk = max_context_chunk
-        monkeypatch.setattr(layer, "pad_values", pad_values)
     a, b, c = (torch.randint(0, 128, (n,)).tolist() for n in (11, 8, 3))
     table_a, table_b, table_c = [5, 2, 9], [7, 0], [3]  # scattered, so a wrong page walk shows
 

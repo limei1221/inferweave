@@ -4,7 +4,6 @@ from typing import Callable, cast
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from lean_vllm.attention import AttentionBackend, LayerSpec, get_attention_backend
@@ -210,8 +209,8 @@ class MLAAttention(Attention):
         super().__init__(num_heads, qk_head_dim, scale, num_heads, backend)
         self.v_head_dim = v_head_dim
         self.latent_dim = latent_dim
-        # Values pad up to the keys' head size only for a backend that takes one size, as vLLM's MLA prefill.
-        self.pad_values = not self.backend.supports_value_head_size(qk_head_dim, v_head_dim)
+        # Values stay narrower than keys, so no vLLM _pad_v (FA2's): FA3 and FlashInfer build
+        # DeepSeek's (192, 128), SDPA any.
         self.expand = expand  # methods of the owning layer, so not a registered submodule
         self.latent_projections = latent_projections
         self.latent_cache = torch.tensor([])
@@ -268,18 +267,17 @@ class MLAAttention(Attention):
         if not chunks:
             # No row has cached context (vLLM's has_context), so a plain prefill with no page table covers it.
             unpaged = dataclasses.replace(context, block_tables=None)
-            if not self.pad_values:
-                return self.backend.prefill(q, k, v, self.k_cache, self.v_cache, unpaged, out)
-            return self._unpad(self.backend.prefill(q, k, self._pad(v), self.k_cache, self.v_cache, unpaged), out)
+            return self.backend.prefill(q, k, v, self.k_cache, self.v_cache, unpaged, out)
         # New tokens attend each other causally, and each chunk of cached keys unmasked. As vLLM's, the chunks
         # merge among themselves, then with the new tokens straight into out.
         cu_seqlens_q, max_seqlen_q = context.cu_seqlens_q, context.max_seqlen_q
         assert cu_seqlens_q is not None
         host = context.cu_seqlens_q_host
+        # compute attention among the new tokens
         o, lse = self.backend.varlen_with_lse(
             q,
             k,
-            self._pad(v),
+            v,
             cu_seqlens_q,
             cu_seqlens_q,
             max_seqlen_q,
@@ -289,6 +287,7 @@ class MLAAttention(Attention):
         )
         del k, v
         # Rows with no cached keys keep an lse of -inf, which the merge weighs at zero.
+        # compute and accumulate attention over cached chunks
         context_o = o.new_zeros(o.size(0), self.num_heads, self.v_head_dim)
         context_lse = torch.full_like(lse, float("-inf"))
         latents = cache.view(-1, self.latent_dim)
@@ -298,7 +297,7 @@ class MLAAttention(Attention):
             o_chunk, lse_chunk = self.backend.varlen_with_lse(
                 q[rows],
                 k,
-                self._pad(v),
+                v,
                 chunk.cu_seqlens_q,
                 chunk.cu_seqlens_k,
                 chunk.max_seqlen_q,
@@ -308,30 +307,25 @@ class MLAAttention(Attention):
             )
             del k, v
             # rows is a slice, so these are views
-            merge_attention_(context_o[rows], context_lse[rows], o_chunk[..., : self.v_head_dim], lse_chunk)
-        merge_attention_(context_o, context_lse, o[..., : self.v_head_dim], lse, out)
-        return context_o if out is None else out
+            merge_attention_(context_o[rows], context_lse[rows], o_chunk, lse_chunk)
+        # merge the cached-prefix and new-token results
+        merge_attention_(context_o, context_lse, o, lse, out)
+        return context_o if out is None else out  # (num_new_tokens, num_heads, v_head_dim)
 
     def _decode_latents(self, q: torch.Tensor, context: Context, out: torch.Tensor | None = None) -> torch.Tensor:
         """Attention over the cached latents as they are, so nothing expands.
 
-        q . W_UK c = W_UK^T q . c moves the query into latent space; W_UV applies after, as attention is linear in values.
+        q^T (W_UK c) = (W_UK^T q)^T c moves the query into latent space; W_UV applies after, as attention is linear in values.
         """
         W_UK_T, W_UV = self.latent_projections()
+        # N = heads, P = qk_nope_head_dim, L = kv_lora_rank; W_UV is (N, L, V) with V = self.v_head_dim
         N, P, L = W_UK_T.shape
         q_nope, q_pe = q.split([P, self.head_dim - P], dim=-1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L), then back to (B, N, L)
+        # Project into latent space: (N, B, P) x (N, P, L) -> (N, B, L), then back to (B, N, L)
         ql_nope = torch.bmm(q_nope.transpose(0, 1), W_UK_T).transpose(0, 1)
-        o = self.backend.mla_decode(torch.cat([ql_nope, q_pe], dim=-1), self.latent_cache, L, context)
-        # Multiply + Transpose (N, B, L) x (N, L, V) -> (N, B, V) -> (B, N, V)
+        o = self.backend.mla_decode(torch.cat([ql_nope, q_pe], dim=-1), self.latent_cache, L, context)  # (B, N, L)
         if out is None:
-            out = o.new_empty(o.size(0), N, self.v_head_dim)
+            out = o.new_empty(o.size(0), N, self.v_head_dim)  # (B, N, V)
+        # (N, B, L) x (N, L, V) -> (N, B, V) -> (B, N, V)
         torch.bmm(o.transpose(0, 1), W_UV, out=out.transpose(0, 1))
         return out
-
-    def _pad(self, v: torch.Tensor) -> torch.Tensor:
-        return F.pad(v, (0, self.head_dim - self.v_head_dim)) if self.pad_values else v
-
-    def _unpad(self, o: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        o = o[..., : self.v_head_dim] if self.pad_values else o
-        return o.contiguous() if out is None else out.copy_(o)

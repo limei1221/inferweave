@@ -144,9 +144,9 @@ layer for its `kv_cache_shape` rather than reading head counts off the config.
    every layer.
 
 Values are 128 wide and keys 192. FA3 on Hopper takes them as they are, as
-vLLM's MLA prefill does there, and so do FlashInfer's prefill and `torch`. A
-backend that takes one head size (`supports_value_head_size` false) gets values
-zero-padded to 192 and its output cut back to 128.
+vLLM's MLA prefill does there, and so do FlashInfer's prefill and `torch`, so
+values are never padded. vLLM's `_pad_v` zero-pads them to 192 only for FA2,
+which lean-vllm does not have.
 
 **Decode** skips the expansion. Since `q · (W_UK c) = (W_UKᵀ q) · c`, each head's
 query is projected into latent space and attends the cached latents directly

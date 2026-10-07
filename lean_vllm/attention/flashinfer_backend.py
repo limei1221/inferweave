@@ -57,10 +57,6 @@ class FlashInferBackend(AttentionBackend):
     def supports_head_size(head_size: int) -> bool:
         return head_size in (64, 128, 256)  # as vLLM's FlashInfer backend
 
-    @staticmethod
-    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        return head_size == v_head_size or (head_size, v_head_size) == (192, 128)  # its prefill builds DeepSeek's
-
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 

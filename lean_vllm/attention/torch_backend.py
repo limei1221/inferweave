@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
 
 from lean_vllm.attention.abstract import AttentionBackend, write_into
 from lean_vllm.utils.context import Context
@@ -27,10 +28,6 @@ class TorchAttention(AttentionBackend):
         return True
 
     @staticmethod
-    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        return True  # SDPA and the written-out varlen_with_lse take any value width
-
-    @staticmethod
     def split_decodes() -> bool:
         return True  # so decode rows skip prefill's padding to the step's longest query
 
@@ -41,7 +38,7 @@ class TorchAttention(AttentionBackend):
 
         slots = slot_mapping.long()
         keep = slots >= 0
-        if not keep.all():  # costs a host sync; kernels mask in-kernel instead
+        if not keep.all():  # syncs GPU with CPU; custom GPU kernels skip invalid slots on-device
             slots = slots[keep]
             key = key[keep]
             value = value[keep]
@@ -55,7 +52,7 @@ class TorchAttention(AttentionBackend):
 
         slots = slot_mapping.long()
         keep = slots >= 0
-        if not keep.all():  # costs a host sync; kernels mask in-kernel instead
+        if not keep.all():  # syncs GPU with CPU; custom GPU kernels skip invalid slots on-device
             slots = slots[keep]
             latent = latent[keep]
 
@@ -74,7 +71,8 @@ class TorchAttention(AttentionBackend):
             k_pad = self._pad_rows(k, cu_seqlens_k, max_seqlen_k)
             v_pad = self._pad_rows(v, cu_seqlens_k, max_seqlen_k)
         mask = self._mask(cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=True)
-        return write_into(out, self._unpad_rows(self._sdpa(q_pad, k_pad, v_pad, mask), cu_seqlens_q, q.size(0)))
+        o = self._sdpa(q_pad, k_pad, v_pad, mask)  # [B, Lq, H, D]
+        return write_into(out, self._unpad_rows(o, cu_seqlens_q, q.size(0)))
 
     def varlen_with_lse(
         self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, host_cu_seqlens=None
@@ -94,22 +92,27 @@ class TorchAttention(AttentionBackend):
     def decode(self, q, k_cache, v_cache, context: Context, out=None) -> torch.Tensor:
         block_tables, context_lens = context.block_tables, context.context_lens
         assert block_tables is not None and context_lens is not None
-        seqlen = block_tables.size(1) * k_cache.size(1)  # the table's width, so no length is read back
-        k = self._gather_pages(k_cache, block_tables, seqlen, context_lens)
-        v = self._gather_pages(v_cache, block_tables, seqlen, context_lens)
-        mask = self._key_mask(context_lens, seqlen)
-        return write_into(out, self._sdpa(q.unsqueeze(1), k, v, mask).squeeze(1))
+        # block_tables: [B, max_blocks_per_sequence]
+        # k_cache: [num_blocks, block_size, ...]
+        max_seqlen_k = block_tables.size(1) * k_cache.size(1)  # the table's width, so no length is read back
+        k = self._gather_pages(k_cache, block_tables, max_seqlen_k, context_lens)  # [B, Lk, Hkv, D]
+        v = self._gather_pages(v_cache, block_tables, max_seqlen_k, context_lens)  # [B, Lk, Hkv, D]
+        mask = self._key_mask(context_lens, max_seqlen_k)  # [B, 1, 1, Lk]
+        o = self._sdpa(rearrange(q, "b h d -> b 1 h d"), k, v, mask)
+        return write_into(out, rearrange(o, "b 1 h d -> b h d"))
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
         # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
         block_tables, context_lens = context.block_tables, context.context_lens
         assert block_tables is not None and context_lens is not None
-        seqlen = block_tables.size(1) * latent_cache.size(1)
-        latent = self._gather_pages(latent_cache, block_tables, seqlen, context_lens)  # [B, Lk, D]
-        kv = latent.unsqueeze(1).expand(-1, q.size(1), -1, -1)  # [B, H, Lk, D]
-        mask = self._key_mask(context_lens, seqlen)
-        o = F.scaled_dot_product_attention(q.unsqueeze(2), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale)
-        return o.squeeze(2)  # [B, H, v_dim]
+        max_seqlen_k = block_tables.size(1) * latent_cache.size(1)
+        latent = self._gather_pages(latent_cache, block_tables, max_seqlen_k, context_lens)  # [B, Lk, D]
+        kv = repeat(latent, "b lk d -> b h lk d", h=q.size(1))  # [B, H, Lk, D]
+        mask = self._key_mask(context_lens, max_seqlen_k)
+        o = F.scaled_dot_product_attention(
+            rearrange(q, "b h d -> b h 1 d"), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale
+        )
+        return rearrange(o, "b h 1 d -> b h d")  # [B, H, v_dim]
 
     @staticmethod
     def _pad_rows(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
@@ -134,18 +137,19 @@ class TorchAttention(AttentionBackend):
         """Each row's cached tokens, [B, seqlen, ...], with unused slots zeroed."""
         block_size = cache.size(1)  # [num_blocks, block_size, ...]
         num_blocks = (seqlen + block_size - 1) // block_size
-        blocks = block_tables[:, :num_blocks].long().clamp(min=0)
-        gathered = cache[blocks].flatten(1, 2)[:, :seqlen]
-        # The cache is uninitialized outside each row's length. An attention
-        # mask cannot hide NaN/inf keys or values from matrix multiplication.
-        padding = torch.arange(gathered.size(1), device=cache.device) >= seqlens.unsqueeze(1)
-        padding = padding.view(*padding.shape, *([1] * (gathered.ndim - 2)))
+        blocks = block_tables[:, :num_blocks].long().clamp(min=0)  # [B, num_blocks]
+        gathered = cache[blocks].flatten(1, 2)[:, :seqlen]  # [B, num_blocks, block_size, ...] -> [B, seqlen, ...]
+        # Slots past each row's length hold garbage, maybe NaN or inf. The mask only zeroes their
+        # weights, and 0 * NaN is still NaN, so overwrite the garbage itself with 0.
+        padding = torch.arange(gathered.size(1), device=cache.device) >= seqlens.unsqueeze(1)  # [B, seqlen]
+        padding = padding.view(*padding.shape, *([1] * (gathered.ndim - 2)))  # [B, seqlen, 1, ...]
         return gathered.masked_fill_(padding, 0)
 
     @staticmethod
     def _key_mask(seqlens_k: torch.Tensor, max_seqlen_k: int) -> torch.Tensor:
         """[B, 1, 1, Lk]: each row's own keys."""
         k_pos = torch.arange(max_seqlen_k, device=seqlens_k.device)
+        # [Lk] < [B, 1] -> [B, Lk] -> [B, 1, 1, Lk]
         return (k_pos < seqlens_k.unsqueeze(1)).view(-1, 1, 1, max_seqlen_k)
 
     @classmethod
@@ -162,15 +166,12 @@ class TorchAttention(AttentionBackend):
         return mask & (torch.arange(max_seqlen_k, device=device) <= q_pos)  # [B, 1, Lq, Lk]
 
     def _sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        # Each key head's query heads fold into its query axis, so keys are never repeated and no enable_gqa
-        # is needed. Query head h reads key head h // group.
-        B, Lq, _, D = q.shape
+        # Pack query heads that share a KV head into one longer query sequence.
+        # This avoids duplicating keys and values or needing enable_gqa.
+        # Query head h uses KV head h // group.
+        Lq = q.size(1)
         group = self.num_heads // self.num_kv_heads
-        q = (
-            q.view(B, Lq, self.num_kv_heads, group, D)
-            .permute(0, 2, 3, 1, 4)
-            .reshape(B, self.num_kv_heads, group * Lq, D)
-        )
-        mask = mask.unsqueeze(2).expand(-1, -1, group, -1, -1).reshape(B, 1, group * Lq, -1)
+        q = rearrange(q, "b lq (hkv g) d -> b hkv (g lq) d", g=group)
+        mask = repeat(mask, "b 1 lq lk -> b 1 (g lq) lk", g=group)
         o = F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask, scale=self.scale)
-        return o.reshape(B, self.num_kv_heads, group, Lq, -1).permute(0, 3, 1, 2, 4).reshape(B, Lq, self.num_heads, -1)
+        return rearrange(o, "b hkv (g lq) d -> b lq (hkv g) d", g=group, lq=Lq)

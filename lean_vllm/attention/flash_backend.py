@@ -78,11 +78,6 @@ class FlashAttention3Backend(AttentionBackend):
     def supports_head_size(head_size: int) -> bool:
         return head_size % 8 == 0 and head_size <= 256  # as vLLM's FlashAttention backend
 
-    @staticmethod
-    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        # FA3 builds one mixed size, for DeepSeek's MLA prefill; vLLM skips the padding on Hopper for it too.
-        return head_size == v_head_size or (head_size, v_head_size) == (192, 128)
-
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 

@@ -80,11 +80,6 @@ class AttentionBackend(ABC):
     def supports_head_size(head_size: int) -> bool:
         return True
 
-    @staticmethod
-    def supports_value_head_size(head_size: int, v_head_size: int) -> bool:
-        """Whether prefill takes values narrower than keys, as an MLA layer's are. False pads them to the keys' size."""
-        return head_size == v_head_size
-
     @classmethod
     def validate(cls, spec: LayerSpec) -> list[str]:
         """Why this backend cannot serve the layer, or nothing if it can. As vLLM's validate_configuration."""
@@ -153,8 +148,9 @@ class AttentionBackend(ABC):
     ) -> torch.Tensor:
         """Causal attention over packed varlen sequences, bottom-right aligned.
 
-        q is [num_tokens, num_heads, head_dim]; k and v hold new tokens only.
-        Keys come from the paged cache when context.block_tables is set. Writes into out, if given, and returns it.
+        q is [num_tokens, num_heads, head_dim], and q, k and v hold only this step's prefill tokens. With
+        context.block_tables set, the caller has stored k and v, and every key is read from the pages; without it,
+        k and v hold every key. Writes into out, if given, and returns it.
         """
 
     def varlen_with_lse(
@@ -185,7 +181,8 @@ class AttentionBackend(ABC):
         context: Context,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Single-query attention against the paged cache. q is [batch, heads, dim]. Writes into out, if given."""
+        """Single-query attention against the paged cache. q is [batch_size, num_heads, head_dim]. Writes into out, if
+        given."""
 
     def forward(
         self,
@@ -226,7 +223,7 @@ class AttentionBackend(ABC):
     ) -> torch.Tensor:
         """Single-query attention over a paged MLA latent cache, read as one key head shared by all.
 
-        q is [batch, heads, latent_dim] and latent_cache [num_blocks, block_size, latent_dim].
-        Values are each latent's first v_dim entries, so this returns [batch, heads, v_dim].
+        q is [batch_size, num_heads, latent_dim] and latent_cache [num_blocks, block_size, latent_dim].
+        Values are each latent's first v_dim entries, so this returns [batch_size, num_heads, v_dim].
         """
         raise NotImplementedError(f"the {self.get_name()} backend has no MLA decode")
