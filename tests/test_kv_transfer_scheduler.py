@@ -284,7 +284,7 @@ class TestMetrics:
         for request_id in ("d-1", "d-2"):
             engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), request_id)
         engine.step()
-        stats = KVTransferStats(0.25, 4096, "ipc")
+        stats = KVTransferStats(0.25, 4096)
         engine.model_runner.kv_outputs.append(
             KVConnectorOutput(
                 finished_recving={"d-1"},
@@ -295,8 +295,7 @@ class TestMetrics:
         )
         engine.step()
         metrics = engine.metrics
-        assert metrics.kv_transfers.values == {"ipc": 1}
+        assert metrics.kv_transfers.total == 1
         assert (metrics.kv_transfer_failures.total, metrics.kv_transfer_expired.total) == (1, 1)
         assert (metrics.kv_transfer_time.sum, metrics.kv_transfer_bytes.sum) == (0.25, 4096)
-        assert 'lean_vllm:kv_transfers_total{transport="ipc"} 1' in metrics.render()
-        assert metrics.summary()["kv_transfer"]["mib_per_second"] == 4096 / 2**20 / 0.25
+        assert "lean_vllm:kv_transfers_total 1" in metrics.render()

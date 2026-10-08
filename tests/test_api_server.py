@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
-from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
+from lean_vllm.engine.scheduler import InvalidRequest
 from lean_vllm.entrypoints.api_server import _serve, build_app
 from lean_vllm.entrypoints.protocol import CompletionRequest
 
@@ -55,7 +55,6 @@ class FakeAsyncEngine:
     async def add_request(self, prompt, sampling_params, request_id=None):
         self.requests.append((prompt, sampling_params, request_id))
         if self.admission_error is not None:
-            self.metrics.record_rejected()
             raise self.admission_error
         self.metrics.record_received()
         return self._outputs(request_id)
@@ -82,9 +81,6 @@ class FakeAsyncEngine:
 
     async def render_metrics(self):
         return self.metrics.render()
-
-    async def metrics_summary(self):
-        return self.metrics.summary()
 
 
 @pytest.fixture
@@ -124,12 +120,6 @@ class TestEndpoints:
         assert response.headers["content-type"].startswith("text/plain")
         assert "# TYPE lean_vllm:num_requests_received_total counter" in response.text
         assert "lean_vllm:num_requests_received_total 1" in response.text
-
-    def test_metrics_json_is_the_benchmark_summary(self, client):
-        complete(client)
-        summary = client.get("/metrics.json").json()
-        assert summary["requests"]["received"] == 1
-        assert summary["prefix_cache_hit_rate"] is None  # nothing scheduled behind this fake
 
 
 class TestCompletions:
@@ -308,10 +298,6 @@ class TestRefusals:
         assert response.status_code == 400
         assert response.json()["error"]["message"] == message
 
-    def test_a_full_queue_is_a_429(self, client, engine):
-        engine.admission_error = QueueFull("4 requests already waiting")
-        assert complete(client).status_code == 429
-
     def test_a_dead_engine_is_a_503(self, client, engine):
         engine.is_dead, engine.error = True, RuntimeError("boom")
         assert complete(client).status_code == 503
@@ -326,13 +312,6 @@ class TestRefusals:
         response = complete(client)
         assert response.status_code == 503
         assert "capacity" in response.json()["error"]["message"]
-
-    def test_a_timeout_drop_is_a_504(self, client, engine):
-        """It waited too long to be served, which is not the same as being over capacity."""
-        engine.pieces, engine.finish_reason = [""], "timeout"
-        response = complete(client)
-        assert response.status_code == 504
-        assert "timeout" in response.json()["error"]["message"]
 
     def test_a_capacity_drop_mid_stream_rides_in_the_stream(self, client, engine):
         engine.pieces, engine.finish_reason = ["Hello", ""], "capacity"

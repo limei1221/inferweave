@@ -263,13 +263,13 @@ LEAN_PROFILE_DIR="$RUN_RESULTS/offline-on" LEAN_PROFILE_CUDA=1 \
 Print the same metrics for both engines:
 
 ```bash
-jq -r '.engine as $engine | .rows[] | [$engine, .arm, .request_rate, .completed, .rejection_rate, .failure_rate, .goodput, .output_tok_s, .ttft_p99, .tpot_p50, .e2e_p99] | @tsv' \
+jq -r '.engine as $engine | .rows[] | [$engine, .arm, .request_rate, .completed, .failure_rate, .goodput, .output_tok_s, .ttft_p99, .tpot_p50, .e2e_p99] | @tsv' \
   "$RUN_RESULTS/lean-v2lite/rate/summary.json" \
   "$RUN_RESULTS/vllm-v2lite/rate/summary.json"
 ```
 
-Columns are engine, arm, offered load, completed requests, rejection rate, failure
-rate, goodput, output tokens/s, p99 TTFT, median TPOT, and p99 E2E. Latency
+Columns are engine, arm, offered load, completed requests, failure rate,
+goodput, output tokens/s, p99 TTFT, median TPOT, and p99 E2E. Latency
 values are in seconds.
 
 | Metric | What to compare |
@@ -282,7 +282,7 @@ values are in seconds.
 
 Before drawing conclusions:
 
-- Check that each run completed all 1,000 requests without failures or rejections.
+- Check that each run completed all 1,000 requests without failures.
   Goodput has no latency cutoff, so read it alongside latency.
 - Compare matching offered loads and workload settings. Both engines run with
   async scheduling on, so the curves are directly comparable. Find where throughput
@@ -293,9 +293,10 @@ Before drawing conclusions:
 - Check GPU-busy clocks and throttling for each pair. Aim for mean clocks within
   about 1%; report differences that could affect the comparison.
 
-Per-run JSON contains client summaries and server snapshots. Server counters
-include warmup; use `server.after - server.before` for cumulative counters when
-needed. Each run records `started_at` and `finished_at` in UTC around the client
+Per-run JSON contains client summaries and two scrapes of the server's
+Prometheus `/metrics`, `server.before` and `server.after`, taken after warmup
+and after the run. `server.run` holds what they moved by during the run: the
+busy fraction, mean batch tokens and preemptions the sweep table shows. Each run records `started_at` and `finished_at` in UTC around the client
 run, so align the GPU log to those rather than to file modification times.
 
 Stop the logger and archive the session:

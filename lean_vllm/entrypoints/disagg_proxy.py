@@ -59,7 +59,7 @@ async def _disaggregate(client: httpx.AsyncClient, prefill_url: str, decode_url:
     prefill_body.pop("stream_options", None)
     prefill = await client.post(prefill_url + path, json=prefill_body)
     if prefill.status_code != 200:
-        return _relay(prefill)  # a 400 or 429 there is the client's answer
+        return _relay(prefill)  # a 400 there is the client's answer
     kv_transfer_params = prefill.json().get("kv_transfer_params")
     # None when the prefill was aborted; the decode server then prefills itself.
     decode_body = dict(body, kv_transfer_params=kv_transfer_params) if kv_transfer_params else body

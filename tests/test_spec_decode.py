@@ -149,8 +149,7 @@ class TestScheduler:
         assert engine.model_runner.lookahead_short == 0
         if num_kvcache_blocks == 9:
             assert engine.metrics.preemptions.total
-        spec = engine.metrics.summary()["spec_decode"]
-        assert 0 < spec["accepted_tokens"] < spec["draft_tokens"]
+        assert 0 < engine.metrics.spec_accepted_tokens.total < engine.metrics.spec_draft_tokens.total
 
     def test_a_stop_among_the_kept_drafts_ends_the_request_there(self, make_engine, async_scheduling):
         engine = make_drafting_engine(3, eos_after={"req-0": 6}, async_scheduling=async_scheduling)

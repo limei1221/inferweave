@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.output import RequestOutput
-from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
+from lean_vllm.engine.scheduler import InvalidRequest
 from lean_vllm.entrypoints import protocol
 from lean_vllm.entrypoints.protocol import (
     BaseRequest,
@@ -29,9 +29,8 @@ from lean_vllm.sampling_params import SamplingParams
 
 DONE = "data: [DONE]\n\n"
 
-# The engine's own reasons; the drops below are not completions and never appear here.
+# The engine's own reasons; a drop, such as "capacity", is not a completion and never appears here.
 FINISH_REASONS = {"stop": "stop", "length": "length", "abort": "stop"}
-DROP_STATUS = {"capacity": 503, "timeout": 504}
 
 
 class _RequestStreamingResponse(StreamingResponse):
@@ -75,11 +74,6 @@ def build_app(engine: AsyncLLM, model: str) -> FastAPI:
     async def _invalid_request(request: Request, exc: InvalidRequest):
         return JSONResponse(status_code=400, content=_error("invalid_request_error", str(exc)))
 
-    @app.exception_handler(QueueFull)
-    async def _queue_full(request: Request, exc: QueueFull):
-        message = f"the engine is at capacity: {exc}"
-        return JSONResponse(status_code=429, content=_error("invalid_request_error", message))
-
     @app.exception_handler(EngineDeadError)
     async def _engine_dead(request: Request, exc: EngineDeadError):
         return JSONResponse(status_code=503, content=_error("server_error", str(exc)))
@@ -93,10 +87,6 @@ def build_app(engine: AsyncLLM, model: str) -> FastAPI:
     @app.get("/metrics")
     async def metrics():
         return PlainTextResponse(await engine.render_metrics(), media_type="text/plain; version=0.0.4")
-
-    @app.get("/metrics.json")
-    async def metrics_json():
-        return await engine.metrics_summary()
 
     @app.get("/v1/models")
     async def models():
@@ -195,8 +185,7 @@ async def _deltas(
                 return
             if output.finished:
                 if output.finish_reason not in FINISH_REASONS:
-                    status = DROP_STATUS.get(output.finish_reason or "", 503)
-                    raise HTTPException(status, f"the engine dropped the request: {output.finish_reason}")
+                    raise HTTPException(503, f"the engine dropped the request: {output.finish_reason}")
                 reason = FINISH_REASONS[output.finish_reason]
                 yield text + checker.flush(), reason, num_tokens, output.kv_transfer_params
                 return

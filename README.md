@@ -102,7 +102,7 @@ uv run lean-vllm serve ~/workspace/huggingface/Qwen3-0.6B --port 8000 --served-m
 
 An OpenAI-compatible server: `/v1/completions`, `/v1/chat/completions` (both
 with SSE streaming), `/v1/models`, `/health`, and `/metrics` in Prometheus
-format (plus `/metrics.json` for the same numbers as a summary). Requests arrive at any time and
+format. Requests arrive at any time and
 share one token budget per step, so a prompt being prefilled in chunks and a
 batch of decoding requests run together; a client that hangs up frees its KV
 blocks straight away.
@@ -129,7 +129,7 @@ Sampling parameters the engine does not implement (`top_p`, `seed`, penalties,
 the server does not serve is a 404 — `/v1/models` lists the name it answers to.
 Every engine flag is a `Config` field; `lean-vllm serve --help` lists them.
 [docs/online-serving.md](docs/online-serving.md) covers the endpoints, the
-scheduling flags, admission control, and how `step` overlaps detokenization
+scheduling flags, and how `step` overlaps detokenization
 and batch preparation with the forward pass.
 
 ## Benchmarks
@@ -147,7 +147,8 @@ uv run python benchmarks/bench_offline.py
 
 `benchmarks/bench_serving.py` is the online one: requests arrive as a Poisson
 process, and it reports goodput, TTFT, TPOT and end-to-end percentiles beside
-the rejection rate. Point it at a running lean-vLLM or vLLM server.
+the failure rate, and scrapes the server's `/metrics` before and after the run.
+Point it at a running lean-vLLM or vLLM server.
 
 ```bash
 uv run python benchmarks/bench_serving.py --dataset lognormal --request-rate 8

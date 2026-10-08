@@ -21,7 +21,6 @@ it matches vLLM below saturation and trails it by 3.7–3.9% at the plateau
 | `GET /v1/models` | Lists the one model id this server answers to |
 | `GET /health` | 200, or 503 once the engine has died |
 | `GET /metrics` | Prometheus text |
-| `GET /metrics.json` | The same numbers as a JSON summary |
 
 Both completion endpoints stream over Server-Sent Events (SSE) with
 `"stream": true`. No API key is checked.
@@ -51,9 +50,7 @@ silently return the wrong output. A field set to its no-op value, such as
 | ---: | --- |
 | 400 | An unsupported field, or prompt + `max_tokens` longer than the context |
 | 404 | A `model` this server does not serve |
-| 429 | The waiting queue is full (`--max-waiting-requests`) |
 | 503 | The engine died, or the request can never fit in the KV cache |
-| 504 | The request waited past `--request-timeout` without being scheduled |
 
 Once a stream has sent its 200, a later error arrives as an SSE error event. A
 client that disconnects frees its KV blocks straight away.
@@ -68,7 +65,6 @@ client that disconnects frees its KV blocks straight away.
 | CUDA graphs | `full_and_piecewise` | Full graphs for decode, piecewise for small prefill and mixed steps |
 | `torch.compile` | On, unless graphs are off | Inductor compiles the model between attention ops, as vLLM does |
 | Priority scheduling | Off (`fcfs`) | `--scheduling-policy priority` |
-| Admission control, queue timeout | Off | `--max-waiting-requests`, `--request-timeout` |
 | Preemption | Recompute | The sequence goes back to the head of the queue; there is no swapping to CPU |
 | Tensor parallelism | 1 | Up to 8 GPUs |
 | Expert parallelism | Off | MoE models, over the tensor-parallel GPUs |
@@ -114,8 +110,6 @@ time to first token.
 | `--enable-chunked-prefill` | on | Mixing prompt chunks with decode |
 | `--long-prefill-token-threshold` | 0 | Per-step token cap on one prompt, as in vLLM V1; 0 is none |
 | `--scheduling-policy` | `fcfs` | Or `priority` |
-| `--max-waiting-requests` | 0 | Queue length past which arrivals get a 429; 0 is none |
-| `--request-timeout` | 0 | Seconds a request may wait unscheduled before a 504; 0 is none |
 | `--gpu-memory-utilization` | 0.9 | Share of GPU memory for weights, activations and KV cache |
 | `--num-kvcache-blocks` | profiled | Pins the cache size, to hold it fixed across runs |
 | `--kvcache-block-size` | 16 | Tokens per KV block |
@@ -126,11 +120,11 @@ time to first token.
 | `--enforce-eager` | off | Same as `--cudagraph-mode none` |
 | `--tensor-parallel-size` | 1 | GPUs per model, up to 8 |
 | `--enable-expert-parallel` | off | MoE models: each GPU holds whole experts, not a slice of each ([deepseek-v2.md](deepseek-v2.md#expert-parallelism)) |
-| `--enable-eplb`, `--eplb-config` | off | Copies and moves experts across GPUs by their load ([deepseek-v2.md](deepseek-v2.md#expert-load-balancing)) |
 | `--kv-transfer-config` | none | JSON; makes the server a prefill or decode instance ([disaggregated-prefill.md](disaggregated-prefill.md)) |
 
-Admission control is off by default, as in vLLM, so overload shows up as p99
-latency rather than rejections. Read goodput alongside p99.
+There is no admission control, as in vLLM by default: the waiting queue is
+unbounded, so overload shows up as p99 latency rather than rejections. Read
+goodput alongside p99.
 
 ## Performance
 
@@ -172,8 +166,8 @@ and the server turns them into text.
 The core takes every queued request, runs one step, sends that step's outputs,
 and repeats; when it has nothing to run it blocks on its socket. New requests
 and aborts reach the engine between steps. An add waits for the core's answer,
-so a full queue is still a 429 and an invalid prompt a 400. `/metrics` asks the
-core, since that is where the counters live. On Ctrl-C the server tells the core
+so an invalid prompt or a duplicate request id is still a 400. `/metrics` asks
+the core, since that is where the counters live. On Ctrl-C the server tells the core
 to finish its step and exit. If the server process disappears, the core notices
 and exits on its own.
 
@@ -291,12 +285,12 @@ way, the tokens behind a hit are compared before reuse.
 
 ### Metrics
 
-`/metrics.json` reports:
+`/metrics` reports, in Prometheus text:
 
 - steps: count, time, batch tokens, the prefill/decode split, and how each step
   ran;
-- preemptions, prefix-cache hit rate, and peak KV usage;
-- counts and means of TTFT, TPOT, queue delay and end-to-end latency.
+- preemptions, prefix-cache queries and hits, and KV usage;
+- histograms of TTFT, TPOT, queue delay and end-to-end latency.
 
 Names mirror vLLM's under the `lean_vllm:` prefix, except that the prefix-cache
 counters count blocks where vLLM's count tokens. Compute latency percentiles on
@@ -309,9 +303,10 @@ with a reason:
 - `decode`: a decode step no graph covers, run compiled;
 - `enforced`: graphs and compilation are off, so the step ran eager.
 
-For GPU utilization, trust `model_busy_fraction`, the share of wall-clock time
-spent inside a forward pass. The nvidia-smi figure beside it counts any running
-kernel as busy.
+For GPU utilization, trust `model_busy_seconds_total` over wall-clock time,
+the share spent inside a forward pass; `bench_serving.py` reports it for the
+run as `model_busy_fraction`. nvidia-smi counts any running kernel as busy, so
+it reads higher.
 
 ## Benchmarking
 

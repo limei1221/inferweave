@@ -19,7 +19,6 @@ from transformers import PreTrainedTokenizerFast
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.core_client import AsyncMPClient
 from lean_vllm.engine.exceptions import EngineDeadError
-from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVTransferConfig
 from lean_vllm.sampling_params import SamplingParams
@@ -111,9 +110,8 @@ class TestAcrossTheProcess:
     async def test_metrics_come_from_the_core(self, make_client):
         client = make_client()
         await collect(client, list(range(8)), SamplingParams(max_tokens=3, ignore_eos=True))
-        summary = await client.metrics_summary()
-        assert summary["requests"]["finished"] == {"length": 1}
-        assert "lean_vllm" in await client.render_metrics()
+        text = await client.render_metrics()
+        assert 'lean_vllm:request_success_total{finished_reason="length"} 1' in text
 
 
 class TestAdmissionAndAbort:
@@ -137,22 +135,11 @@ class TestAdmissionAndAbort:
         )
         second = await client.add_request([20], params, "reused")
         await first.aclose()
-        summary = await client.metrics_summary()  # processed after any abort sent by cleanup
-        assert summary["requests"]["aborted"] == 0
+        text = await client.render_metrics()  # processed after any abort sent by cleanup
+        assert "lean_vllm:num_requests_aborted_total 0" in text
         assert "reused" in client.output_processor.request_states
         client.abort("reused")
         await second.aclose()
-
-    @asyncio_test
-    async def test_a_full_queue_is_refused_before_any_output(self, make_client):
-        client = make_client(max_num_seqs=1, max_waiting_requests=1)
-        running = await client.add_request(list(range(8)), FOREVER)
-        await anext(running)  # scheduled, so the waiting queue is empty again
-        waiting = await client.add_request(list(range(8)), FOREVER)
-        with pytest.raises(QueueFull):
-            await client.add_request(list(range(8)), FOREVER)
-        await running.aclose()
-        await waiting.aclose()
 
     @asyncio_test
     async def test_closing_the_stream_aborts_in_the_core(self, make_client):
@@ -161,11 +148,11 @@ class TestAdmissionAndAbort:
         await anext(outputs)
         await outputs.aclose()
         for _ in range(100):
-            summary = await client.metrics_summary()
-            if summary["requests"]["aborted"]:
+            text = await client.render_metrics()
+            if "lean_vllm:num_requests_aborted_total 1" in text:
                 break
             await asyncio.sleep(0.01)
-        assert summary["requests"]["aborted"] == 1
+        assert "lean_vllm:num_requests_aborted_total 1" in text
 
 
 class TestDeath:

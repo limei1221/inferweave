@@ -1,11 +1,10 @@
-"""Server-side metrics, as Prometheus text and as a JSON summary.
+"""Server-side metrics, as Prometheus text.
 
 Names mirror vLLM's under a `lean_vllm:` prefix, so one dashboard reads both. The prefix-cache counters
 count blocks where vLLM's count tokens, so only their ratio compares.
 """
 
 import threading
-from time import perf_counter
 
 INF = float("inf")
 
@@ -50,7 +49,6 @@ class Counter(_Metric):
     def __init__(self, name: str, documentation: str, label: str | None = None):
         super().__init__(name, documentation)
         self.label = label
-        # Ints, so a count stays a count in the JSON summary; only seconds go float.
         self.values: dict[str | None, float] = {} if label else {None: 0}
 
     def inc(self, amount: float = 1, label_value: str | None = None):
@@ -74,11 +72,9 @@ class Gauge(_Metric):
     def __init__(self, name: str, documentation: str):
         super().__init__(name, documentation)
         self.value: float = 0.0
-        self.peak: float = 0.0
 
     def set(self, value: float):
         self.value = value
-        self.peak = max(self.peak, value)
 
     def render(self) -> list[str]:
         return self._header() + [f"{self.name} {_number(self.value)}"]
@@ -101,10 +97,6 @@ class Histogram(_Metric):
             if value <= bound:
                 self.counts[i] += 1
 
-    @property
-    def mean(self) -> float | None:
-        return self.sum / self.count if self.count else None
-
     def render(self) -> list[str]:
         lines = self._header()
         for bound, count in zip(self.buckets, self.counts):
@@ -113,29 +105,9 @@ class Histogram(_Metric):
         lines.append(f"{self.name}_count {self.count}")
         return lines
 
-    def summary(self) -> dict:
-        return {"count": self.count, "sum": self.sum, "mean": self.mean}
-
-
-def _rate(numerator: float, denominator: float) -> float | None:
-    return numerator / denominator if denominator else None
-
-
-def gpu_utilization() -> float | None:
-    """GPU utilization as nvidia-smi reports it, for comparison only."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return None
-        return float(torch.cuda.utilization())
-    except Exception:
-        return None  # no NVML, no CUDA, or a driver that will not answer
-
 
 class Metrics:
     def __init__(self):
-        self.start_time = perf_counter()
         self.lock = threading.Lock()  # so a render never catches a histogram mid-update
 
         self.running = Gauge("lean_vllm:num_requests_running", "Requests in the running set.")
@@ -143,9 +115,6 @@ class Metrics:
         self.kv_usage = Gauge("lean_vllm:kv_cache_usage_perc", "Fraction of KV blocks in use.")
 
         self.requests_received = Counter("lean_vllm:num_requests_received_total", "Requests admitted.")
-        self.requests_rejected = Counter(
-            "lean_vllm:num_requests_rejected_total", "Requests refused by admission control."
-        )
         self.requests_aborted = Counter("lean_vllm:num_requests_aborted_total", "Requests cancelled by their client.")
         self.requests_finished = Counter(
             "lean_vllm:request_success_total", "Requests that ran to a finish.", label="finished_reason"
@@ -189,7 +158,7 @@ class Metrics:
         )
 
         # Disaggregated prefill: the decode instance's loads, and the prefill instance's blocks nobody read.
-        self.kv_transfers = Counter("lean_vllm:kv_transfers_total", "KV loads finished.", label="transport")
+        self.kv_transfers = Counter("lean_vllm:kv_transfers_total", "KV loads finished.")
         self.kv_transfer_failures = Counter(
             "lean_vllm:kv_transfer_failures_total", "KV loads that failed, so the prompt prefilled here."
         )
@@ -212,10 +181,6 @@ class Metrics:
     def record_received(self):
         with self.lock:
             self.requests_received.inc()
-
-    def record_rejected(self):
-        with self.lock:
-            self.requests_rejected.inc()
 
     def record_aborted(self, request_output):
         with self.lock:
@@ -251,7 +216,7 @@ class Metrics:
     def record_kv_transfer(self, kv_output):
         with self.lock:
             for stats in kv_output.recv_stats.values():
-                self.kv_transfers.inc(label_value=stats.transport)
+                self.kv_transfers.inc()
                 self.kv_transfer_time.observe(stats.seconds)
                 self.kv_transfer_bytes.observe(stats.num_bytes)
             self.kv_transfer_failures.inc(len(kv_output.failed_recving))
@@ -297,65 +262,3 @@ class Metrics:
                 if isinstance(metric, _Metric):
                     lines += metric.render()
             return "\n".join(lines) + "\n"
-
-    def summary(self) -> dict:
-        """What the benchmark records beside its own client-side numbers."""
-        with self.lock:
-            uptime = perf_counter() - self.start_time
-            return {
-                "uptime_seconds": uptime,
-                # Fraction of wall clock in a forward pass; nvidia-smi's figure reads higher.
-                "model_busy_fraction": _rate(self.model_busy.total, uptime),
-                "gpu_utilization_percent_nvidia_smi": gpu_utilization(),
-                "steps": self.steps.total,
-                "graph_step_fraction": _rate(self.graph_steps.total, self.steps.total),
-                "eager_steps": dict(sorted(self.eager_steps.values.items())),
-                "step_seconds": dict(sorted(self.step_seconds.values.items())),
-                "mean_step_seconds": self.step_duration.mean,
-                "mean_batch_tokens": self.iteration_tokens.mean,
-                "prefix_cache_hit_rate": _rate(self.prefix_cache_hits.total, self.prefix_cache_queries.total),
-                "requests": {
-                    "received": self.requests_received.total,
-                    "rejected": self.requests_rejected.total,
-                    "aborted": self.requests_aborted.total,
-                    "finished": dict(sorted(self.requests_finished.values.items())),
-                    "running": self.running.value,
-                    "waiting": self.waiting.value,
-                    "waiting_peak": self.waiting.peak,
-                },
-                "tokens": {
-                    "prompt": self.prompt_tokens.total,
-                    "generation": self.generation_tokens.total,
-                    "prefill": self.prefill_tokens.total,
-                    "decode": self.decode_tokens.total,
-                },
-                "kv_cache_usage": self.kv_usage.value,
-                "kv_cache_usage_peak": self.kv_usage.peak,
-                "preemptions": self.preemptions.total,
-                "spec_decode": {
-                    "drafts": self.spec_drafts.total,
-                    "draft_tokens": self.spec_draft_tokens.total,
-                    "accepted_tokens": self.spec_accepted_tokens.total,
-                    "acceptance_rate": _rate(self.spec_accepted_tokens.total, self.spec_draft_tokens.total),
-                    # Tokens per verifying step, the drafts kept plus the one sampled; as vLLM's mean acceptance length.
-                    "mean_acceptance_length": (
-                        1 + self.spec_accepted_tokens.total / self.spec_drafts.total if self.spec_drafts.total else None
-                    ),
-                    "accepted_per_position": dict(sorted(self.spec_accepted_per_pos.values.items())),
-                },
-                "kv_transfer": {
-                    "loads": dict(sorted(self.kv_transfers.values.items())),
-                    "failed": self.kv_transfer_failures.total,
-                    "expired": self.kv_transfer_expired.total,
-                    "time": self.kv_transfer_time.summary(),
-                    "bytes": int(self.kv_transfer_bytes.sum),
-                    "mib_per_second": _rate(self.kv_transfer_bytes.sum / 2**20, self.kv_transfer_time.sum),
-                },
-                # Percentiles are the client's job; these buckets are too coarse.
-                "latency": {
-                    "ttft": self.ttft.summary(),
-                    "tpot": self.tpot.summary(),
-                    "queue": self.queue_time.summary(),
-                    "e2e": self.e2e.summary(),
-                },
-            }

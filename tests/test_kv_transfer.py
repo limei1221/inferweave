@@ -1,6 +1,5 @@
 """The KV connector's worker halves over real sockets, a producer and a consumer in one process, on CPU caches."""
 
-import logging
 import socket
 from dataclasses import dataclass
 from time import monotonic, sleep
@@ -160,78 +159,13 @@ class TestStats:
         consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": recv(producer, [0, 5], [7, 2])}))
         stats = wait_for(consumer).recv_stats["d-1"]
         block_bytes = sum(cache[:, 0].numel() * cache.element_size() for cache in consumer.kv_caches)
-        assert stats.transport == "tcp" and stats.num_bytes == 2 * block_bytes and stats.seconds > 0
+        assert stats.num_bytes == 2 * block_bytes and stats.seconds > 0
 
     def test_a_failed_load_reports_none(self, make_worker):
         consumer = make_worker("kv_consumer", make_caches(1))
         req = ReqToRecv([0], [0], "p-1", "engine", "127.0.0.1", free_port())
         consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": req}))
         assert wait_for(consumer).recv_stats == {}
-
-
-@pytest.fixture
-def fake_ipc(monkeypatch):
-    """CUDA IPC with the handles faked: the producer's caches, in this same process, stand in for the mapped ones."""
-    exported = {}
-
-    def export_ipc(caches):
-        exported[id(caches[0])] = caches
-        return {"caches": id(caches[0])}
-
-    monkeypatch.setattr(tcp_connector, "export_ipc", export_ipc)
-    monkeypatch.setattr(tcp_connector, "open_ipc", lambda ipc, caches: exported[ipc["caches"]])
-
-
-class TestIpc:
-    def test_the_blocks_are_copied_straight_out_of_the_producer_s_cache(self, make_worker, fake_ipc):
-        producer = make_worker("kv_producer", make_caches(0))
-        consumer = make_worker("kv_consumer", make_caches(1))
-        producer.start_load_kv(KVConnectorMetadata(reqs_to_send={"p-1": [7, 2, 9]}))
-        consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": recv(producer, [0, 5, 3], [7, 2, 9])}))
-        output = wait_for(consumer)
-        assert output.recv_stats["d-1"].transport == "ipc"
-        for theirs, ours in zip(producer.kv_caches, consumer.kv_caches):
-            assert torch.equal(ours[:, [0, 5, 3]], theirs[:, [7, 2, 9]])
-        assert wait_for(producer).finished_sending == {"p-1"}
-
-    def test_the_producer_holds_the_read_open_while_the_consumer_copies(self, make_worker, fake_ipc, monkeypatch):
-        """So the abort timeout cannot free the blocks mid-copy."""
-        producer = make_worker("kv_producer", make_caches(0))
-        consumer = make_worker("kv_consumer", make_caches(1))
-        reading = []
-        copy = consumer._copy_blocks
-
-        def copy_blocks(*args):
-            reading.append(dict(producer._reading))
-            copy(*args)
-
-        monkeypatch.setattr(consumer, "_copy_blocks", copy_blocks)
-        producer.start_load_kv(KVConnectorMetadata(reqs_to_send={"p-1": [4]}))
-        consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": recv(producer, [0], [4])}))
-        wait_for(consumer)
-        assert reading == [{"p-1": 1}]
-        wait_for(producer)
-        assert not producer._reading
-
-    def test_a_gpu_it_cannot_map_falls_back_to_tcp(self, make_worker, monkeypatch, caplog):
-        caplog.set_level(logging.INFO)
-
-        def open_ipc(ipc, caches):
-            raise RuntimeError("its GPU GPU-1234 is not visible here")
-
-        monkeypatch.setattr(tcp_connector, "export_ipc", lambda caches: {"device_uuid": "GPU-1234"})
-        monkeypatch.setattr(tcp_connector, "open_ipc", open_ipc)
-        producer = make_worker("kv_producer", make_caches(0))
-        consumer = make_worker("kv_consumer", make_caches(1))
-        producer.start_load_kv(KVConnectorMetadata(reqs_to_send={"p-1": [4]}))
-        consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": recv(producer, [0], [4])}))
-        assert wait_for(consumer).recv_stats["d-1"].transport == "tcp"
-        assert torch.equal(consumer.kv_caches[0][:, 0], producer.kv_caches[0][:, 4])
-        assert "over TCP, not CUDA IPC: its GPU GPU-1234 is not visible here" in caplog.text
-
-    def test_off_cuda_nothing_is_offered(self):
-        assert tcp_connector.export_ipc(make_caches(0)) is None
-        assert tcp_connector.open_ipc({"device_uuid": "GPU-1234", "layers": []}, make_caches(0)) is None
 
 
 def _cuda_producer(conn, kv_port: int):
@@ -247,8 +181,8 @@ def _cuda_producer(conn, kv_port: int):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_cuda_ipc_between_two_processes(make_worker):
-    """The real handles: a producer process on GPU 0, read by this one on its last GPU."""
+def test_cuda_caches_between_two_processes(make_worker):
+    """A producer process on GPU 0, read by this one on its last GPU."""
     import multiprocessing as mp
 
     kv_port = free_port()
@@ -261,7 +195,7 @@ def test_cuda_ipc_between_two_processes(make_worker):
         consumer = make_worker("kv_consumer", [cache.cuda() for cache in make_caches(1)])
         req = ReqToRecv([0, 5, 3], [7, 2, 9], "p-1", "engine", "127.0.0.1", kv_port)
         consumer.start_load_kv(KVConnectorMetadata(reqs_to_recv={"d-1": req}))
-        assert wait_for(consumer, timeout=60).recv_stats["d-1"].transport == "ipc"
+        assert "d-1" in wait_for(consumer, timeout=60).finished_recving
         for theirs, ours in zip(make_caches(0), consumer.kv_caches):
             assert torch.equal(ours[:, [0, 5, 3]].cpu(), theirs[:, [7, 2, 9]])
     finally:
@@ -363,18 +297,18 @@ class TestAggregator:
         aggregator = KVOutputAggregator(world_size=2)
         result = aggregator.aggregate(
             [
-                KVConnectorOutput(finished_recving={"a"}, recv_stats={"a": KVTransferStats(0.1, 100, "ipc")}),
-                KVConnectorOutput(finished_recving={"a"}, recv_stats={"a": KVTransferStats(0.3, 100, "ipc")}),
+                KVConnectorOutput(finished_recving={"a"}, recv_stats={"a": KVTransferStats(0.1, 100)}),
+                KVConnectorOutput(finished_recving={"a"}, recv_stats={"a": KVTransferStats(0.3, 100)}),
             ]
         )
-        assert result.recv_stats == {"a": KVTransferStats(0.3, 200, "ipc")}
+        assert result.recv_stats == {"a": KVTransferStats(0.3, 200)}
 
     def test_a_failed_load_has_no_stats(self):
         aggregator = KVOutputAggregator(world_size=2)
         result = aggregator.aggregate(
             [
                 KVConnectorOutput(failed_recving={"a"}),
-                KVConnectorOutput(finished_recving={"a"}, recv_stats={"a": KVTransferStats(0.3, 100, "tcp")}),
+                KVConnectorOutput(finished_recving={"a"}, recv_stats={"a": KVTransferStats(0.3, 100)}),
             ]
         )
         assert result.failed_recving == {"a"} and result.recv_stats == {}

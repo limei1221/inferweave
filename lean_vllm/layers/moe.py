@@ -142,41 +142,6 @@ def _(
     return router_logits.new_empty(shape, dtype=torch.float32), router_logits.new_empty(shape, dtype=torch.int32)
 
 
-# floor(2^32 / phi), as vLLM's: hashes a token to one replica of each expert it picked.
-KNUTH_MULTIPLIER = 2654435769
-
-
-# Opaque to torch.compile, as moe_experts; no host sync, so a graph can hold it.
-@torch.library.custom_op("lean_vllm::eplb_map", mutates_args=("expert_load",))
-def eplb_map(
-    topk_ids: torch.Tensor,
-    logical_to_physical_map: torch.Tensor,
-    logical_replica_count: torch.Tensor,
-    expert_load: torch.Tensor,
-    num_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """vLLM's eplb_map_to_physical_and_record: each pick goes to a replica of its expert, and the first num_tokens
-    rows' picks count toward the load of the slots they land on. Physical ids, int32."""
-    tokens = torch.arange(topk_ids.size(0), device=topk_ids.device).unsqueeze(1)
-    ids = topk_ids.long()
-    replica = (tokens * KNUTH_MULTIPLIER & 0xFFFFFFFF) % logical_replica_count[ids]
-    physical = logical_to_physical_map[ids, replica]
-    real = (tokens < num_tokens).expand_as(physical)  # padding a graph replays carries no load
-    expert_load.index_add_(0, physical.flatten(), real.flatten().to(expert_load.dtype))
-    return physical.to(torch.int32)
-
-
-@eplb_map.register_fake
-def _(
-    topk_ids: torch.Tensor,
-    logical_to_physical_map: torch.Tensor,
-    logical_replica_count: torch.Tensor,
-    expert_load: torch.Tensor,
-    num_tokens: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty_like(topk_ids, dtype=torch.int32)
-
-
 # Opaque to torch.compile, as vLLM's: the Triton path picks its launch from the batch size, which a trace would fix.
 @torch.library.custom_op("lean_vllm::moe_experts", mutates_args=())
 def moe_experts(
@@ -236,9 +201,6 @@ class FusedMoE(nn.Module):
     Triton kernels from `fused_moe.py` on CUDA, `grouped_mm` elsewhere. TP shards each expert's intermediate size;
     with expert parallelism each rank holds whole experts instead, as in vLLM without DP. Either way the ranks'
     partial sums meet in one all-reduce.
-
-    With EPLB the layer has num_experts + num_redundant_experts physical slots, and routes each logical pick to
-    one of them through maps an EplbState binds, which also moves the weights between slots.
     """
 
     def __init__(
@@ -248,27 +210,17 @@ class FusedMoE(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         enable_expert_parallel: bool = False,
-        enable_eplb: bool = False,
-        num_redundant_experts: int = 0,
     ):
         super().__init__()
         rank, world_size = dist.get_rank(), dist.get_world_size()
         use_ep = enable_expert_parallel and world_size > 1
         self.tp_rank, self.tp_size = (0, 1) if use_ep else (rank, world_size)
         self.ep_rank, self.ep_size = (rank, world_size) if use_ep else (0, 1)
-        self.num_experts = num_experts  # global and logical; the stacked weights hold local_num_experts slots
-        self.enable_eplb = enable_eplb
-        self.num_physical_experts = num_experts + num_redundant_experts
+        self.num_experts = num_experts  # global; the stacked weights hold local_num_experts
         self.top_k = top_k
         self.intermediate_size = divide(intermediate_size, self.tp_size)
-        self.local_num_experts, expert_map = determine_expert_map(self.ep_size, self.ep_rank, self.num_physical_experts)
-        held = (
-            range(self.num_physical_experts) if expert_map is None else (expert_map >= 0).nonzero().flatten().tolist()
-        )
-        # For the loader: the local slots of each logical expert, slot p holding p % num_experts, as EplbState expects.
-        self.local_slots: dict[int, list[int]] = {}
-        for slot, physical in enumerate(held):
-            self.local_slots.setdefault(physical % num_experts, []).append(slot)
+        self.local_num_experts, expert_map = determine_expert_map(self.ep_size, self.ep_rank, num_experts)
+        self.local_expert_ids = expert_map.tolist() if expert_map is not None else None  # for the loader
         self.gate_up_proj = nn.Parameter(torch.empty(self.local_num_experts, 2 * self.intermediate_size, hidden_size))
         self.down_proj = nn.Parameter(torch.empty(self.local_num_experts, hidden_size, self.intermediate_size))
         self.gate_up_proj.weight_loader = self.weight_loader  # type: ignore[attr-defined]
@@ -276,22 +228,19 @@ class FusedMoE(nn.Module):
         if expert_map is not None:
             expert_map = expert_map.to(self.gate_up_proj.device)
         self.register_buffer("expert_map", expert_map, persistent=False)
-        # Views of EplbState's tensors, bound by it; buffers, so a compiled graph takes them as inputs.
-        for name in ("logical_to_physical_map", "logical_replica_count", "expert_load", "num_tokens"):
-            self.register_buffer(name, None, persistent=False)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: tuple[int, str]):
         expert_id, proj = shard_id
+        if self.local_expert_ids is not None:
+            expert_id = self.local_expert_ids[expert_id]
+            if expert_id == -1:  # another rank's expert
+                return
         if proj == "down_proj":
-            shard = loaded_weight.chunk(self.tp_size, 1)[self.tp_rank]
-        else:
-            shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
+            param.data[expert_id].copy_(loaded_weight.chunk(self.tp_size, 1)[self.tp_rank])
+            return
         offset = 0 if proj == "gate_proj" else self.intermediate_size
-        for slot in self.local_slots.get(expert_id, ()):  # none when another rank holds the expert
-            if proj == "down_proj":
-                param.data[slot].copy_(shard)
-            else:
-                param.data[slot].narrow(0, offset, self.intermediate_size).copy_(shard)
+        shard = loaded_weight.chunk(self.tp_size, 0)[self.tp_rank]
+        param.data[expert_id].narrow(0, offset, self.intermediate_size).copy_(shard)
 
     def forward(
         self,
@@ -302,11 +251,6 @@ class FusedMoE(nn.Module):
         shared_down: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """With the shared experts' weights, their output is added in, before the one all-reduce both need."""
-        if self.enable_eplb:
-            assert self.expert_load is not None, "an EplbState must bind the layer's maps before it runs"
-            topk_ids = torch.ops.lean_vllm.eplb_map(
-                topk_ids, self.logical_to_physical_map, self.logical_replica_count, self.expert_load, self.num_tokens
-            )
         out = torch.ops.lean_vllm.moe_experts(
             x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, self.expert_map, shared_gate_up, shared_down
         )

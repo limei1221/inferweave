@@ -10,7 +10,7 @@ import pytest
 
 from lean_vllm.engine.metrics import Metrics
 from lean_vllm.engine.output import RequestOutput
-from lean_vllm.engine.scheduler import QueueFull, Scheduler
+from lean_vllm.engine.scheduler import Scheduler
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVConnectorOutput
 from lean_vllm.sampling_params import SamplingParams
@@ -33,8 +33,6 @@ class FakeConfig:
     enable_prefix_caching: bool = True
     prefix_caching_hash_algo: str = "sha256"
     scheduling_policy: str = "fcfs"
-    max_waiting_requests: int = 0
-    request_timeout: float = 0.0
     long_prefill_token_threshold: int = 0
     async_scheduling: bool = False  # off, unlike Config: most tests count steps in sync order
     tensor_parallel_size: int = 1
@@ -109,11 +107,7 @@ class FakeEngine:
         self, prompt: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None
     ) -> Sequence:
         seq = Sequence(prompt, sampling_params or SamplingParams(), request_id)
-        try:
-            self.scheduler.add(seq)
-        except QueueFull:
-            self.metrics.record_rejected()
-            raise
+        self.scheduler.add(seq)
         self.metrics.record_received()
         return seq
 

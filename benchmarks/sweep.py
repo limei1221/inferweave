@@ -187,7 +187,7 @@ def utc_now() -> str:
 
 def row(arm: Arm, rate: float, result: dict) -> dict:
     summary = result["summary"]
-    server = result["server"]["after"] or {}
+    server = result["server"]["run"]
 
     def at(name, key):
         return (summary[name] or {}).get(key)
@@ -196,7 +196,6 @@ def row(arm: Arm, rate: float, result: dict) -> dict:
         "arm": arm.name,
         "request_rate": rate,
         "completed": summary["completed"],
-        "rejection_rate": summary["rejection_rate"],
         "failure_rate": summary["failure_rate"],
         "goodput": summary["goodput_requests_per_second"],
         "output_tok_s": summary["output_token_throughput"],
@@ -218,7 +217,7 @@ COLUMNS = [
     ("arm", "arm", "s"),
     ("request_rate", "rate", ".1f"),
     ("completed", "done", "d"),
-    ("rejection_rate", "rejected", ".1%"),
+    ("failure_rate", "failed", ".1%"),
     ("goodput", "goodput", ".2f"),
     ("output_tok_s", "tok/s", ".0f"),
     ("ttft_p50", "ttft_p50", ".3f"),

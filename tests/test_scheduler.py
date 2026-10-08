@@ -6,12 +6,11 @@ TestChunkedPrefillDisabled covers `enable_chunked_prefill=False`, kept as the A/
 import os
 import subprocess
 import sys
-from time import sleep
 
 import pytest
 
 from lean_vllm.engine import sequence
-from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull, SchedulerOutput
+from lean_vllm.engine.scheduler import DuplicateRequestId, SchedulerOutput
 from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -259,7 +258,7 @@ class TestPrefixCache:
         engine.step()
         assert dict(engine.model_runner.batches[1][1])[second.request_id] == 16
         assert not engine.scheduler.block_manager.hash_to_block_id
-        assert engine.metrics.summary()["prefix_cache_hit_rate"] == 0.0
+        assert engine.metrics.prefix_cache_queries.total and not engine.metrics.prefix_cache_hits.total
 
     def test_a_block_is_hashed_on_arrival_and_never_again(self, make_engine, monkeypatch):
         """The queue head is re-queried every step, and rehashing it is the whole cost."""
@@ -403,7 +402,7 @@ class TestPolicy:
             make_engine(scheduling_policy="lifo")
 
 
-class TestAdmissionControl:
+class TestAdmission:
     @pytest.mark.parametrize("chunked", [False, True])
     def test_oversized_prompt_is_dropped_without_blocking_smaller_requests(self, make_engine, chunked):
         engine = make_engine(num_kvcache_blocks=1, enable_chunked_prefill=chunked)
@@ -423,19 +422,6 @@ class TestAdmissionControl:
         assert not engine.scheduler.block_manager.used_block_ids
         assert engine.metrics.requests_finished.values == {"length": 1, "capacity": 1}
 
-    def test_a_full_queue_is_refused(self, make_engine):
-        engine = make_engine(max_waiting_requests=2)
-        engine.add(prompt(8), FOREVER)
-        engine.add(prompt(8, 100), FOREVER)
-        with pytest.raises(QueueFull):
-            engine.add(prompt(8, 200), FOREVER)
-
-    def test_the_queue_reopens_once_requests_are_admitted(self, make_engine):
-        engine = make_engine(max_waiting_requests=1)
-        engine.add(prompt(8), FOREVER)
-        engine.step()
-        engine.add(prompt(8, 100), FOREVER)  # the first one left the queue
-
     def test_a_duplicate_request_id_is_refused(self, make_engine):
         """Both would queue behind one entry in seqs, and the second to finish would KeyError."""
         engine = make_engine()
@@ -450,60 +436,6 @@ class TestAdmissionControl:
         engine.add(prompt(8), SamplingParams(max_tokens=1, ignore_eos=True), request_id="reused")
         engine.run_to_completion()
         engine.add(prompt(8, 100), FOREVER, request_id="reused")
-
-    def test_unlimited_by_default(self, make_engine):
-        engine = make_engine()
-        for s in range(20):
-            engine.add(prompt(8, s * 100), FOREVER)
-        assert len(engine.scheduler.waiting) == 20
-
-
-class TestRequestTimeout:
-    def test_a_request_that_waits_too_long_is_dropped(self, make_engine):
-        engine = make_engine(num_kvcache_blocks=1, request_timeout=0.05)
-        engine.add(prompt(1), FOREVER)
-        engine.step()
-        engine.add(prompt(8, 100), FOREVER)  # fits the cache once the running request leaves
-        engine.step()
-        assert len(engine.scheduler.waiting) == 1
-        sleep(0.06)
-        outputs = engine.step()
-        assert not engine.scheduler.waiting
-        assert [o.finish_reason for o in outputs if o.finished] == ["timeout"]
-
-    def test_a_request_that_ran_is_never_expired(self, make_engine):
-        """A preempted sequence has tokens to show for itself; shedding it wastes them."""
-        engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8, max_num_seqs=2, request_timeout=0.01)
-        engine.add(prompt(8), FOREVER)
-        engine.add(prompt(8, 100), FOREVER)
-        engine.step()  # both admitted, so neither is waiting unscheduled
-        for _ in range(8):
-            sleep(0.015)
-            engine.step()
-        assert engine.metrics.preemptions.total > 0  # it did go back to the queue
-        assert "timeout" not in engine.metrics.requests_finished.values
-
-    def test_the_clock_starts_at_arrival_not_at_the_step(self, make_engine):
-        engine = make_engine(num_kvcache_blocks=1, request_timeout=0.05)
-        engine.add(prompt(8), FOREVER)
-        sleep(0.06)
-        assert [o.finish_reason for o in engine.step()] == ["timeout"]
-
-    def test_no_timeout_by_default(self, make_engine):
-        engine = make_engine(num_kvcache_blocks=1)
-        engine.add(prompt(1), FOREVER)
-        engine.step()
-        engine.add(prompt(8, 100), FOREVER)
-        sleep(0.02)
-        engine.step()
-        assert len(engine.scheduler.waiting) == 1
-
-    def test_an_expired_request_is_counted_as_finished(self, make_engine):
-        engine = make_engine(num_kvcache_blocks=1, request_timeout=0.01)
-        engine.add(prompt(8), FOREVER)
-        sleep(0.02)
-        engine.step()
-        assert engine.metrics.requests_finished.values == {"timeout": 1}
 
 
 class TestLongPrompts:

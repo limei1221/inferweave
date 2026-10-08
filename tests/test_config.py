@@ -61,30 +61,3 @@ def test_the_rendezvous_port_is_picked_unless_given(make_config):
     """A fixed port would keep a second engine on the host from starting."""
     assert make_config().dist_port > 0
     assert make_config(dist_port=29500).dist_port == 29500
-
-
-def test_eplb_needs_expert_parallelism_and_an_even_split(make_config, monkeypatch):
-    monkeypatch.setattr(FakeHFConfig, "architectures", ["DeepseekV2ForCausalLM"], raising=False)
-    monkeypatch.setattr(FakeHFConfig, "n_routed_experts", 64, raising=False)
-    assert make_config().eplb is None
-    with pytest.raises(ValueError, match="enable_eplb needs enable_expert_parallel"):
-        make_config(enable_eplb=True)
-    with pytest.raises(ValueError, match="eplb_config needs enable_eplb"):
-        make_config(eplb_config='{"num_redundant_experts": 2}')
-    with pytest.raises(ValueError, match="do not split over 4 ranks"):
-        make_config(
-            enable_expert_parallel=True,
-            enable_eplb=True,
-            tensor_parallel_size=4,
-            eplb_config='{"num_redundant_experts": 2}',
-        )
-    with pytest.raises(ValueError, match="unknown eplb_config keys"):
-        make_config(enable_expert_parallel=True, enable_eplb=True, eplb_config='{"window": 2}')
-
-    config = make_config(
-        enable_expert_parallel=True,
-        enable_eplb=True,
-        tensor_parallel_size=4,
-        eplb_config='{"num_redundant_experts": 4}',
-    )
-    assert config.eplb.num_redundant_experts == 4 and config.eplb.step_interval == 3000  # vLLM's default

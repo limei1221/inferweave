@@ -104,16 +104,10 @@ class AsyncLLM:
         self.engine_core.abort_request(request_id, reason)
 
     async def render_metrics(self) -> str:
-        return await self._call_metrics("render")
-
-    async def metrics_summary(self) -> dict:
-        return await self._call_metrics("summary")
-
-    async def _call_metrics(self, method: str):
         """The counters live with the engine, maybe in another process."""
         if self.is_dead:
             raise self._dead_error()
-        return await self.engine_core.call_metrics_async(method)
+        return await self.engine_core.render_metrics_async()
 
     async def _handle_outputs(self):
         try:

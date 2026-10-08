@@ -2,8 +2,8 @@
 
 Requests come in and outputs go out over two ZMQ sockets, as pickled tuples:
 in:  ("add", request_id, prompt_token_ids, sampling_params), ("abort", request_id, reason),
-     ("metrics", call_id, "render" | "summary"), ("shutdown",)
-out: ("added", request_id, error or None), ("outputs", [RequestOutput]), ("metrics", call_id, value), ("dead", error)
+     ("metrics", call_id), ("shutdown",)
+out: ("added", request_id, error or None), ("outputs", [RequestOutput]), ("metrics", call_id, text), ("dead", error)
 """
 
 import logging
@@ -15,7 +15,7 @@ from typing import Callable
 
 import zmq
 
-from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
+from lean_vllm.engine.scheduler import InvalidRequest
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ class EngineCore:
             error: BaseException | None = None
             try:
                 self.engine.add_request(prompt, sampling_params, request_id)
-            except (InvalidRequest, QueueFull) as refused:  # the client turns these into a 400 or a 429
+            except InvalidRequest as refused:  # the client turns it into a 400
                 error = refused
             except Exception as unexpected:  # the request's alone, so the engine serves on
                 logger.exception("add_request failed for %s", request_id)
@@ -94,8 +94,8 @@ class EngineCore:
             _, request_id, reason = message
             self.engine.abort_request(request_id, reason)
         elif kind == "metrics":
-            _, call_id, method = message
-            self.output.send_pyobj(("metrics", call_id, getattr(self.engine.metrics, method)()))
+            _, call_id = message
+            self.output.send_pyobj(("metrics", call_id, self.engine.metrics.render()))
         elif kind == "shutdown":
             self.running = False
         else:

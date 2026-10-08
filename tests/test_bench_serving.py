@@ -1,6 +1,6 @@
 """The benchmark client against the HTTP layer and a fake engine, so no GPU.
 
-Under test: a 429 is a never-retried rejection, a 503 a failure, and percentiles cover completions only.
+Under test: a 503 is a never-retried failure, percentiles cover completions only, and server counters are scraped.
 """
 
 import sys
@@ -17,7 +17,6 @@ from openai import AsyncOpenAI
 from test_api_server import MODEL, FakeAsyncEngine
 
 from lean_vllm.engine.exceptions import EngineDeadError
-from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.entrypoints.api_server import build_app
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))  # scripts, not a package
@@ -118,15 +117,13 @@ class TestStatistics:
     def test_percentiles_cover_completed_requests_only(self):
         results = [
             bench.Result(0, "all", 0, 4, 4, 0.0, "ok", output_len=4, ttft=0.1, latency=0.4),
-            bench.Result(1, "all", 0, 4, 4, 0.0, "rejected"),
-            bench.Result(2, "all", 0, 4, 4, 0.0, "failed"),
+            bench.Result(1, "all", 0, 4, 4, 0.0, "failed"),
         ]
         summary = bench.summarize(results, duration=2.0)
         assert summary["ttft_seconds"]["count"] == 1
-        assert summary["rejection_rate"] == pytest.approx(1 / 3)
-        assert summary["failure_rate"] == pytest.approx(1 / 3)
+        assert summary["failure_rate"] == pytest.approx(1 / 2)
         assert summary["goodput_requests_per_second"] == pytest.approx(0.5)
-        assert summary["attempted_requests_per_second"] == pytest.approx(1.5)
+        assert summary["attempted_requests_per_second"] == pytest.approx(1.0)
 
 
 class TestRun:
@@ -138,11 +135,29 @@ class TestRun:
         run.finish(bench.Result(5, "all", 0, 4, 4, 0.0, "failed", error="boom"))
         assert run.aborted and run.first_error == "boom"
 
-    def test_rejections_never_abort_the_run(self):
-        run = bench.Run(total=10, max_failure_rate=0.0, quiet=True)
-        for index in range(10):
-            run.finish(bench.Result(index, "all", 0, 4, 4, 0.0, "rejected"))
-        assert not run.aborted
+
+class TestServerStats:
+    def test_the_run_counts_only_what_moved_during_it(self):
+        before = {
+            "lean_vllm:model_busy_seconds_total": 3.0,
+            "lean_vllm:iteration_tokens_total_sum": 100.0,
+            "lean_vllm:iteration_tokens_total_count": 10.0,
+            "lean_vllm:num_preemptions_total": 1.0,
+        }
+        after = {
+            "lean_vllm:model_busy_seconds_total": 4.5,
+            "lean_vllm:iteration_tokens_total_sum": 700.0,
+            "lean_vllm:iteration_tokens_total_count": 30.0,
+            "lean_vllm:num_preemptions_total": 4.0,
+        }
+        stats = bench.server_run_stats(before, after, duration=2.0)
+        assert stats == {"model_busy_fraction": 0.75, "mean_batch_tokens": 30.0, "preemptions": 3}
+
+    def test_a_server_without_these_counters_reports_none(self):
+        """vLLM names its own, and a server may expose no /metrics at all."""
+        empty = {"model_busy_fraction": None, "mean_batch_tokens": None, "preemptions": None}
+        assert bench.server_run_stats({"vllm:num_preemptions_total": 0.0}, {}, 2.0) == empty
+        assert bench.server_run_stats(None, None, 2.0) == empty
 
 
 class TestAgainstTheServer:
@@ -153,13 +168,15 @@ class TestAgainstTheServer:
         async with clients(engine) as (api, http):
             result = await bench.benchmark(args, api, http)
         summary = result["summary"]
-        assert summary["completed"] == 6 and summary["rejected"] == 0 and summary["failed"] == 0
+        assert summary["completed"] == 6 and summary["failed"] == 0
         assert len(engine.requests) == 6
         assert all(record["ttft"] > 0 and record["latency"] >= record["ttft"] for record in result["requests"])
         # Two scripted pieces, so usage says two tokens and one inter-token gap.
         assert {record["output_len"] for record in result["requests"]} == {2}
         assert all(len(record["itls"]) == 1 for record in result["requests"])
-        assert result["server"]["after"]["requests"]["received"] == 6
+        server, received = result["server"], "lean_vllm:num_requests_received_total"
+        assert (server["before"][received], server["after"][received]) == (0, 6)  # scraped from /metrics
+        assert server["run"] == {"model_busy_fraction": 0.0, "mean_batch_tokens": None, "preemptions": 0}
 
     @asyncio_test
     async def test_the_model_name_comes_off_the_server(self):
@@ -186,25 +203,14 @@ class TestAgainstTheServer:
         assert [len(prompt) for prompt, _, _ in engine.requests] == [11, 11]
 
     @asyncio_test
-    async def test_a_429_is_a_rejection_and_is_not_retried(self):
-        engine = FakeAsyncEngine()
-        engine.admission_error = QueueFull("the queue is full")
-        args = make_args("--num-requests", "4", "--request-rate", "inf")
-        async with clients(engine) as (api, http):
-            result = await bench.benchmark(args, api, http)
-        assert result["summary"]["rejected"] == 4 and result["summary"]["failed"] == 0
-        assert result["summary"]["rejection_rate"] == 1.0
-        assert len(engine.requests) == 4, "a retry would make the offered load a lie"
-        assert not result["aborted"]
-
-    @asyncio_test
     async def test_a_503_is_a_failure_and_aborts_the_run(self):
         engine = FakeAsyncEngine()
         engine.admission_error = EngineDeadError("the engine thread died")
         args = make_args("--num-requests", "8", "--request-rate", "inf")
         async with clients(engine) as (api, http):
             result = await bench.benchmark(args, api, http)
-        assert result["summary"]["failed"] == 8 and result["summary"]["rejected"] == 0
+        assert result["summary"]["failed"] == 8
+        assert len(engine.requests) == 8, "a retry would make the offered load a lie"
         assert result["aborted"]
 
     @asyncio_test

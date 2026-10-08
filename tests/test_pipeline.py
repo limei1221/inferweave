@@ -106,7 +106,7 @@ class TestAsyncScheduling:
             for i in range(3):
                 engine.add(list(range(24)), params, request_id=f"r{i}")
                 engine.run_to_completion()
-            rates.append(engine.metrics.summary()["prefix_cache_hit_rate"])
+            rates.append((engine.metrics.prefix_cache_hits.total, engine.metrics.prefix_cache_queries.total))
         assert rates[0] == rates[1]
 
 
@@ -128,7 +128,7 @@ def test_a_capacity_drop_after_a_token_finishes_once(make_engine, async_scheduli
     while not engine.is_finished():
         finals += [output for output in engine.step() if output.finished]
     assert [output.finish_reason for output in finals] == ["capacity"]
-    assert engine.metrics.summary()["requests"]["finished"] == {"capacity": 1}
+    assert engine.metrics.requests_finished.values == {"capacity": 1}
     assert seq.num_completion_tokens == 2
 
 

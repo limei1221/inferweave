@@ -3,7 +3,6 @@
 import pytest
 
 from lean_vllm.engine.metrics import Counter, Gauge, Histogram, Metrics
-from lean_vllm.engine.scheduler import QueueFull
 from lean_vllm.sampling_params import SamplingParams
 
 FOREVER = SamplingParams(max_tokens=64, ignore_eos=True)
@@ -98,16 +97,6 @@ class TestEngineRecording:
         assert engine.metrics.waiting.value == 0
         assert engine.metrics.kv_usage.value == 1.0  # both blocks taken
 
-    def test_the_kv_usage_peak_outlives_the_drain(self, make_engine):
-        """The benchmark reads the summary once, after everything finished."""
-        engine = make_engine(num_kvcache_blocks=2)
-        engine.add(prompt(8), SamplingParams(max_tokens=3, ignore_eos=True))
-        engine.add(prompt(8, 100), SamplingParams(max_tokens=3, ignore_eos=True))
-        engine.run_to_completion()
-        summary = engine.metrics.summary()
-        assert summary["kv_cache_usage"] == 0.0
-        assert summary["kv_cache_usage_peak"] == 1.0  # both blocks were taken while they ran
-
     def test_preemptions_are_counted(self, make_engine):
         engine = make_engine(num_kvcache_blocks=3, kvcache_block_size=8, max_num_seqs=2)
         engine.add(prompt(8), FOREVER)
@@ -125,15 +114,12 @@ class TestEngineRecording:
         metrics = engine.metrics
         assert metrics.prefix_cache_queries.total == 4  # two blocks each
         assert metrics.prefix_cache_hits.total == 1  # the trailing block is never a candidate
-        assert engine.metrics.summary()["prefix_cache_hit_rate"] == 0.25
 
-    def test_admission_outcomes_are_counted(self, make_engine):
-        engine = make_engine(max_waiting_requests=1, num_kvcache_blocks=1)
-        engine.add(prompt(16), FOREVER)  # too big for the cache, so it stays waiting
-        with pytest.raises(QueueFull):
-            engine.add(prompt(16, 100), FOREVER)
-        assert engine.metrics.requests_received.total == 1
-        assert engine.metrics.requests_rejected.total == 1
+    def test_admitted_requests_are_counted(self, make_engine):
+        engine = make_engine()
+        engine.add(prompt(8), FOREVER)
+        engine.add(prompt(8, 100), FOREVER)
+        assert engine.metrics.requests_received.total == 2
 
     def test_a_step_that_scheduled_nothing_is_not_a_forward_pass(self, make_engine):
         """Otherwise an idle poll loop would inflate the step count and deflate the busy fraction."""
@@ -144,26 +130,14 @@ class TestEngineRecording:
         engine.step()
         assert engine.metrics.steps.total == 1
 
-
-class TestSummary:
-    def test_the_summary_reports_rates_not_raw_pairs(self, make_engine):
+    def test_each_step_is_counted_by_how_it_ran(self, make_engine):
         engine = make_engine()
         engine.add(prompt(8), SamplingParams(max_tokens=2, ignore_eos=True))
         engine.run_to_completion()
-        summary = engine.metrics.summary()
-        assert summary["requests"]["finished"] == {"length": 1}
-        assert summary["graph_step_fraction"] == 0.0  # the fake runner captures no graphs
-        assert summary["eager_steps"] == {"enforced": summary["steps"]}
+        metrics = engine.metrics
+        assert metrics.requests_finished.values == {"length": 1}
+        assert metrics.graph_steps.total == 0  # the fake runner captures no graphs
+        assert metrics.eager_steps.values == {"enforced": metrics.steps.total}
         # the same clock as model_busy, split by kind
-        assert summary["step_seconds"]["enforced"] == pytest.approx(
-            summary["model_busy_fraction"] * summary["uptime_seconds"]
-        )
-        assert 0 < summary["model_busy_fraction"] <= 1
-        assert summary["latency"]["e2e"]["count"] == 1
-
-    def test_rates_are_none_rather_than_zero_before_anything_happens(self):
-        """A fresh engine has no hit rate, and reporting 0.0 would read as a miss."""
-        summary = Metrics().summary()
-        assert summary["prefix_cache_hit_rate"] is None
-        assert summary["graph_step_fraction"] is None
-        assert summary["latency"]["ttft"]["mean"] is None
+        assert metrics.step_seconds.values["enforced"] == pytest.approx(metrics.model_busy.total)
+        assert metrics.e2e.count == 1

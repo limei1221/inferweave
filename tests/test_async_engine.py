@@ -16,7 +16,7 @@ from conftest import FakeConfig, FakeLLMEngine, FakeModelRunner, asyncio_test
 
 from lean_vllm.engine.async_llm import AsyncLLM
 from lean_vllm.engine.exceptions import EngineDeadError
-from lean_vllm.engine.scheduler import DuplicateRequestId, QueueFull
+from lean_vllm.engine.scheduler import DuplicateRequestId
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.sampling_params import SamplingParams
 
@@ -100,8 +100,8 @@ class AsyncInprocClient:
             raise item
         return item
 
-    async def call_metrics_async(self, method: str):
-        return getattr(self.engine.metrics, method)()
+    async def render_metrics_async(self):
+        return self.engine.metrics.render()
 
     async def _run(self):
         try:
@@ -336,22 +336,6 @@ class TestAdmission:
         outputs = await asyncio.wait_for(read_second(), 1)
         assert sum(len(output.token_ids) for output in outputs) == 2
         assert outputs[-1].finish_reason == "length"
-
-    @asyncio_test
-    async def test_a_full_queue_is_refused_before_any_output(self, make_async_engine):
-        """The 429 must surface from add_request, while a status code can still be chosen."""
-        engine = make_async_engine(gated=True, max_waiting_requests=1, num_kvcache_blocks=1)
-        await engine.add_request(prompt(1), FOREVER)  # occupies the cache
-        waiting = asyncio.create_task(engine.add_request(prompt(8, 100), FOREVER))
-        await asyncio.sleep(0)  # enqueue before releasing the current step
-        runner_of(engine).release()
-        await waiting
-
-        refused = asyncio.create_task(engine.add_request(prompt(8, 200), FOREVER))
-        await asyncio.sleep(0)
-        runner_of(engine).release()
-        with pytest.raises(QueueFull):
-            await refused
 
     @asyncio_test
     async def test_a_duplicate_id_is_refused_without_disturbing_the_original(self, make_async_engine):

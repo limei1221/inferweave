@@ -168,14 +168,14 @@ def test_a_drafter_that_predicts_the_target_has_every_draft_kept(make_engine, k)
     engine = make_engine()
     predict_the_target(engine)
     want = generate(engine)
-    plain_steps = engine.metrics.summary()["steps"]
+    plain_steps = engine.metrics.steps.total
     assert all(b == (a + 1) % VOCAB for tokens in want for a, b in zip(tokens, tokens[1:]))
     engine = make_engine(k)
     predict_the_target(engine)
     assert generate(engine) == want
-    summary = engine.metrics.summary()
-    assert summary["spec_decode"]["acceptance_rate"] == 1.0
-    assert summary["steps"] < plain_steps
+    metrics = engine.metrics
+    assert metrics.spec_accepted_tokens.total == metrics.spec_draft_tokens.total > 0
+    assert metrics.steps.total < plain_steps
 
 
 def no_cache_context(n: int) -> dict:
@@ -288,7 +288,7 @@ def test_the_drafts_are_those_of_one_pass_over_the_sequence(
     generate(engine, max_tokens=12)
 
     assert len(proposed) > len(PROMPTS)
-    assert engine.metrics.summary()["spec_decode"]["accepted_per_position"].keys() == {"0", "1"}
+    assert engine.metrics.spec_accepted_per_pos.values.keys() == {"0", "1"}
     for token_ids, drafts in proposed:
         assert drafts == reference_drafts(engine, token_ids, k), f"after {len(token_ids)} tokens"
     assert sorted(graphs) == [(0, size) for size in graph_sizes or []]

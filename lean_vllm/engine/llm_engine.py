@@ -16,7 +16,7 @@ from lean_vllm.engine.model_runner import ModelRunner
 from lean_vllm.engine.output import RequestOutput
 from lean_vllm.engine.output_processor import OutputProcessor
 from lean_vllm.engine.sampled_tokens import SampledTokens
-from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, Scheduler, SchedulerOutput
+from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, Scheduler, SchedulerOutput
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVTransferConfig, check_kv_transfer_params
 from lean_vllm.sampling_params import SamplingParams
@@ -164,11 +164,7 @@ class LLMEngine:
             token_ids, sampling_params, config.hf_config.vocab_size, config.max_model_len, config.kv_transfer
         )
         seq = Sequence(token_ids, sampling_params, request_id)
-        try:
-            self.scheduler.add(seq)  # before the detokenizer, so a refused request leaves nothing behind
-        except QueueFull:
-            self.metrics.record_rejected()
-            raise
+        self.scheduler.add(seq)  # before the detokenizer, so a refused request leaves nothing behind
         self.metrics.record_received()
         if self.output_processor is not None:
             self.output_processor.add_request(seq.request_id, token_ids, seq.skip_special_tokens)

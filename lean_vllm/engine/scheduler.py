@@ -37,10 +37,6 @@ class LaunchedRow:
     num_draft_tokens: int = 0  # verified beside its token; those rejected give back their slots
 
 
-class QueueFull(Exception):
-    """The waiting queue is at max_waiting_requests. The server answers 429."""
-
-
 class InvalidRequest(Exception):
     """The request can never run as asked. The server answers 400."""
 
@@ -56,8 +52,6 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        self.max_waiting_requests = config.max_waiting_requests
-        self.request_timeout = config.request_timeout
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         speculative = config.speculative
         self.num_speculative_tokens = speculative.num_speculative_tokens if speculative is not None else 0
@@ -83,8 +77,6 @@ class Scheduler:
         # An aborted load or a held send still owns blocks under its id.
         if seq.request_id in self.seqs or seq.request_id in self.recving or seq.request_id in self.sending:
             raise DuplicateRequestId(f"{seq.request_id} is already in flight")
-        if self.max_waiting_requests and len(self.waiting) >= self.max_waiting_requests:
-            raise QueueFull(f"{len(self.waiting)} requests already waiting")
         self.seqs[seq.request_id] = seq
         self.waiting.add(seq)
 
@@ -105,10 +97,9 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         """One token budget per step, running sequences first so decode is never starved."""
-        dropped = self._expire_waiting()
+        dropped: list[Sequence] = []
         if not self.enable_chunked_prefill:
             output = self._schedule_whole_prompts()
-            output.dropped = dropped + output.dropped
             if output:
                 return self._with_connector_meta(output)  # prefill-only step
             dropped = output.dropped  # nothing to run, but the drops still owe an output
@@ -157,17 +148,6 @@ class Scheduler:
         if self.connector is not None:
             output.kv_connector_metadata = self.connector.build_connector_meta()
         return output
-
-    def _expire_waiting(self) -> list[Sequence]:
-        """Drop requests that waited past request_timeout without ever running. Preempted ones are kept."""
-        if not self.request_timeout:
-            return []
-        deadline = perf_counter() - self.request_timeout
-        expired = [seq for seq in self.waiting if seq.first_scheduled_time is None and seq.arrival_time < deadline]
-        for seq in expired:
-            self.waiting.remove(seq)
-            self._drop(seq, "timeout")
-        return expired
 
     def _schedule_whole_prompts(self) -> SchedulerOutput:
         """Chunked prefill disabled: whole prompts only, and never mixed with decode."""

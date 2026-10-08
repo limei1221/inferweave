@@ -132,13 +132,13 @@ class AsyncMPClient:
             raise item
         return item
 
-    async def call_metrics_async(self, method: str):
+    async def render_metrics_async(self) -> str:
         if self.error is not None:
             raise _dead_error("the engine core died", self.error)
         call_id = next(self._call_ids)
         assert self._loop is not None
         result = self._calls[call_id] = self._loop.create_future()
-        self._send(("metrics", call_id, method))
+        self._send(("metrics", call_id))
         try:
             return await result
         finally:

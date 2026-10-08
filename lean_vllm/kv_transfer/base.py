@@ -104,12 +104,10 @@ class KVTransferStats:
 
     seconds: float
     num_bytes: int
-    transport: str  # "ipc" or "tcp"
 
     def merge(self, other: "KVTransferStats") -> "KVTransferStats":
         """Ranks load in parallel: the slowest sets the time, and the bytes add up."""
-        transport = self.transport if self.transport == other.transport else "mixed"
-        return KVTransferStats(max(self.seconds, other.seconds), self.num_bytes + other.num_bytes, transport)
+        return KVTransferStats(max(self.seconds, other.seconds), self.num_bytes + other.num_bytes)
 
 
 @dataclass(slots=True)
