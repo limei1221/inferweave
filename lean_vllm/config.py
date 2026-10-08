@@ -99,10 +99,6 @@ class Config:
             get_drafter_class(self.hf_config)  # raises for a checkpoint with no MTP layers
             if self.kv_transfer is not None or self.enable_eplb:
                 raise ValueError("speculative decoding runs without kv_transfer_config and enable_eplb, for now")
-            if self.async_scheduling:
-                # The next step's rows depend on how many drafts this one keeps, which only the sampler knows.
-                logger.warning("async_scheduling is off: speculative decoding does not support it")
-                self.async_scheduling = False
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "kv_lora_rank", None) is not None:  # an MLA model
             block_size = get_attention_backend(self._mla_layer_spec()).mla_block_size()

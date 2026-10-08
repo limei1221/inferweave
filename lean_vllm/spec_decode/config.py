@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 # vLLM's names for a checkpoint's own multi-token prediction layers.
 MTP_METHODS = ("mtp", "deepseek_mtp")
+PLACEHOLDER_TOKEN_ID = -1  # past a row's last token, and a draft the host does not know yet
 
 
 @dataclass(slots=True)

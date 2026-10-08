@@ -66,7 +66,8 @@ def split_decodes_and_prefills(context: Context, query_len: int = 1) -> tuple[in
             prefills = Context(
                 is_prefill=True,
                 cu_seqlens_q=context.cu_seqlens_q[n:] - cu_q[n],
-                cu_seqlens_k=context.cu_seqlens_k[n:] - cu_k[n],
+                # The device's offset: an async step moves decode rows back there, leaving the host's a bound.
+                cu_seqlens_k=context.cu_seqlens_k[n:] - context.cu_seqlens_k[n],
                 cu_seqlens_q_host=sub_q,
                 cu_seqlens_k_host=sub_k,
                 max_seqlen_q=max(b - a for a, b in zip(sub_q, sub_q[1:])),

@@ -65,12 +65,17 @@ class TestRejectionSampler:
 
 
 class FakeDraftingRunner(FakeModelRunner):
-    """Verifies drafts as greedy rejection does, and drafts the true tokens except where wrong(seq, index) says."""
+    """Verifies drafts as greedy rejection does, and drafts the true tokens except where wrong(seq, index) says.
+
+    As the runner does on the device, a row whose last step is in flight verifies that step's drafts, which the
+    scheduler holds placeholders for, and moves back past those it rejected.
+    """
 
     def __init__(self, k: int, eos_after=None, wrong=lambda seq, index: False):
         super().__init__(eos_after)
         self.k, self.wrong = k, wrong
         self.lookahead_short = 0  # rows whose blocks could not take the drafter's writes
+        self.in_flight: dict[int, tuple[int, list[int]]] = {}  # by seq_id: the last run's rejected count and drafts
 
     def _truth(self, seq: Sequence, index: int) -> int:
         limit = self.eos_after.get(seq.request_id)
@@ -81,21 +86,29 @@ class FakeDraftingRunner(FakeModelRunner):
             (any(seq.is_prefill for seq in seqs), [(seq.request_id, seq.num_scheduled_tokens) for seq in seqs])
         )
         rows = []
+        in_flight, self.in_flight = self.in_flight, {}
         for seq in seqs:
             if not self._samples(seq):
                 continue
             last = seq.num_cached_tokens + seq.num_scheduled_tokens - 1
             if len(seq.block_table) * seq.block_size < last + self.k:  # the last draft step's slot
                 self.lookahead_short += 1
-            index = seq.num_tokens - seq.num_prompt_tokens  # the completion token this row produces first
+            spec = [] if seq.is_prefill else seq.spec_token_ids
+            back = 0
+            if seq.num_pending_tokens:
+                back, made = in_flight[seq.seq_id]
+                spec = made[: len(spec)]
+            # The completion token this row produces first, after its input tokens but its drafts.
+            index = seq.num_cached_tokens - back + seq.num_scheduled_tokens - len(spec) - seq.num_prompt_tokens
             tokens = []
-            for draft in [] if seq.is_prefill else seq.spec_token_ids:
+            for draft in spec:
                 if draft != self._truth(seq, index + len(tokens)):
                     break
                 tokens.append(draft)
             tokens.append(self._truth(seq, index + len(tokens)))
             after = index + len(tokens)
             drafts = [WRONG_DRAFT if self.wrong(seq, i) else self._truth(seq, i) for i in range(after, after + self.k)]
+            self.in_flight[seq.seq_id] = (len(spec) - (len(tokens) - 1), drafts)
             rows.append(tokens + [-1] * (self.k + 1 - len(tokens)) + drafts)
         return FakeSampledTokens(rows)
 
@@ -112,10 +125,13 @@ def add_prompts(engine: FakeEngine, max_tokens: int = 20):
         engine.add(list(range(n)), SamplingParams(max_tokens=max_tokens, ignore_eos=False))
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
 class TestScheduler:
     @pytest.mark.parametrize("k", [1, 3])
     @pytest.mark.parametrize("num_kvcache_blocks", [64, 9], ids=["roomy", "preempting"])
-    def test_completions_match_plain_decoding_in_fewer_steps(self, make_engine, k, num_kvcache_blocks):
+    def test_completions_match_plain_decoding_in_fewer_steps(
+        self, make_engine, k, num_kvcache_blocks, async_scheduling
+    ):
         plain = make_engine(num_kvcache_blocks=num_kvcache_blocks, max_num_batched_tokens=24)
         add_prompts(plain)
         want = plain.run_to_completion()
@@ -124,6 +140,7 @@ class TestScheduler:
             wrong=lambda seq, index: index % 5 == 2,
             num_kvcache_blocks=num_kvcache_blocks,
             max_num_batched_tokens=24,
+            async_scheduling=async_scheduling,
         )
         add_prompts(engine)
 
@@ -135,15 +152,15 @@ class TestScheduler:
         spec = engine.metrics.summary()["spec_decode"]
         assert 0 < spec["accepted_tokens"] < spec["draft_tokens"]
 
-    def test_a_stop_among_the_kept_drafts_ends_the_request_there(self, make_engine):
-        engine = make_drafting_engine(3, eos_after={"req-0": 6})
+    def test_a_stop_among_the_kept_drafts_ends_the_request_there(self, make_engine, async_scheduling):
+        engine = make_drafting_engine(3, eos_after={"req-0": 6}, async_scheduling=async_scheduling)
         engine.add([1, 2, 3], SamplingParams(max_tokens=50), request_id="req-0")
         completion = engine.run_to_completion()["req-0"]
         assert completion[-1] == EOS and len(completion) == 7
         assert not engine.scheduler.block_manager.used_block_ids
 
-    def test_drafts_never_run_past_max_tokens_or_the_budget(self):
-        engine = make_drafting_engine(3, max_num_batched_tokens=10)
+    def test_drafts_never_run_past_max_tokens_or_the_budget(self, async_scheduling):
+        engine = make_drafting_engine(3, max_num_batched_tokens=10, async_scheduling=async_scheduling)
         engine.add(list(range(8)), SamplingParams(max_tokens=6), request_id="a")
         engine.add(list(range(8)), SamplingParams(max_tokens=9), request_id="b")
         completions = engine.run_to_completion()
@@ -151,20 +168,24 @@ class TestScheduler:
         for _, rows in engine.model_runner.batches:
             assert sum(n for _, n in rows) <= 10
         # A's first decode keeps its 3 drafts and one more, leaving it 1 token to go, so its next has no drafts.
+        # Async, that next is placed as if the first kept them, which it does.
         a_decodes = [n for _, rows in engine.model_runner.batches for r, n in rows if r == "a"][1:]
         assert a_decodes == [4, 1]
 
     @pytest.mark.parametrize("wrong", [lambda seq, index: True, lambda seq, index: index % 3 == 1])
-    def test_a_rejected_draft_gives_back_its_slot(self, monkeypatch, wrong):
-        """Only the newest token is left uncached after a step, however many drafts it kept."""
-        engine = make_drafting_engine(2, wrong=wrong)
+    def test_a_rejected_draft_gives_back_its_slot(self, monkeypatch, wrong, async_scheduling):
+        """Only the newest token is left uncached after a step, however many drafts it kept; async, past the
+        tokens a step in flight placed as if it keeps every draft."""
+        engine = make_drafting_engine(2, wrong=wrong, async_scheduling=async_scheduling)
         engine.add(list(range(5)), SamplingParams(max_tokens=10))
         reconcile = engine.scheduler.reconcile
         checked = []
 
         def checking_reconcile(*args):
             stepped = reconcile(*args)
-            checked.extend(seq.num_cached_tokens == seq.num_tokens - 1 for seq in stepped if not seq.is_finished)
+            checked.extend(
+                seq.num_cached_tokens == seq.num_planned_tokens - 1 for seq in stepped if not seq.is_finished
+            )
             return stepped
 
         monkeypatch.setattr(engine.scheduler, "reconcile", checking_reconcile)
@@ -201,11 +222,10 @@ def make_config(tmp_path, monkeypatch):
 
 
 class TestConfig:
-    def test_drafting_turns_async_scheduling_off(self, make_config, caplog):
+    def test_drafting_keeps_async_scheduling_on(self, make_config):
         config = make_config(speculative_config=json.dumps({"method": "mtp", "num_speculative_tokens": 2}))
         assert config.speculative == SpeculativeConfig("mtp", 2)
-        assert not config.async_scheduling
-        assert "speculative decoding does not support it" in caplog.text
+        assert config.async_scheduling
 
     def test_a_checkpoint_without_mtp_layers_is_refused(self, make_config):
         class NoMTP(FakeHFConfig):

@@ -13,11 +13,12 @@ from lean_vllm.utils.context import Context, set_context
 
 @dataclass(slots=True)
 class DraftInputs:
-    """What a step's batch preparation knows that the drafter needs, on the host and in the batch's row order."""
+    """What a step's batch preparation knows that the drafter needs, in the batch's row order."""
 
-    token_ids: np.ndarray  # the target's input tokens
-    positions: np.ndarray
-    last_index: np.ndarray  # each row's last token in token_ids
+    input_ids: torch.Tensor  # the target's, on the device, where an async step fills what the host lacks
+    positions: torch.Tensor  # the target's, on the device, where an async step moves rows back past rejected drafts
+    max_position: int  # of a sampling row's last token, as if every draft was kept: vLLM's max_seq_len bound
+    last_index: np.ndarray  # each row's last token in input_ids
     next_token_ids: np.ndarray  # the token after each row's chunk, for a row that does not sample; -1 for one that does
     sampling_rows: np.ndarray  # the batch row of each sampling row, in sampling order
     num_draft_tokens: np.ndarray  # drafts each sampling row verifies
@@ -76,20 +77,22 @@ class MTPProposer:
 
     @torch.inference_mode()
     def propose(
-        self, inputs: DraftInputs, context: dict, target_hidden_states: torch.Tensor, sampled: torch.Tensor
+        self,
+        inputs: DraftInputs,
+        context: dict,
+        target_hidden_states: torch.Tensor,
+        num_accepted: torch.Tensor,
+        next_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Drafts [sampling rows, num_speculative_tokens] after the target's step. sampled is each sampling row's
-        tokens, -1 past its last, on the device as the rejection sampler returns them; context is the target's step."""
-        num_rows = sampled.size(0)
-        token_ids = np.roll(inputs.token_ids, -1)
+        """Drafts [sampling rows, num_speculative_tokens] after the target's step, whose context this is. Each
+        sampling row kept num_accepted of its drafts, then next_token_ids; both on the device."""
+        num_rows = num_accepted.size(0)
         not_sampling = inputs.next_token_ids >= 0
-        token_ids[inputs.last_index[not_sampling]] = inputs.next_token_ids[not_sampling]
-        first_draft_index = inputs.last_index[inputs.sampling_rows] - inputs.num_draft_tokens
-
         buffers = self.buffers
         buffers.begin()
-        input_ids = buffers.put("input_ids", token_ids, torch.int64)
-        positions = buffers.put("positions", inputs.positions, torch.int64)
+        fixed_index = buffers.put("fixed_index", inputs.last_index[not_sampling], torch.int64)
+        fixed_token_ids = buffers.put("fixed_token_ids", inputs.next_token_ids[not_sampling], torch.int64)
+        first_draft_index = inputs.last_index[inputs.sampling_rows] - inputs.num_draft_tokens
         sample_index = buffers.put("first_draft_index", first_draft_index, torch.int64)
         cu_seqlens_q = buffers.put("cu_seqlens_q", np.arange(num_rows + 1), torch.int32)
         table = None
@@ -97,22 +100,23 @@ class MTPProposer:
             table = buffers.put("block_table", inputs.block_table[inputs.sampling_rows], torch.int32)
         buffers.end()
 
-        # Each sampling row's first draft comes from its last kept token, beside the token sampled after it, as
-        # vLLM's eagle_prepare_inputs_padded_kernel; the rows after it are padding.
-        num_accepted = (sampled >= 0).sum(dim=1) - 1
+        # Each token beside the one after it, as vLLM's set_inputs_first_pass. Each sampling row's first draft comes
+        # from its last kept token, beside the token sampled after it, as vLLM's eagle_prepare_inputs_padded_kernel;
+        # the rows after it are padding.
+        input_ids = inputs.input_ids.roll(-1)
+        input_ids[fixed_index] = fixed_token_ids
         sample_index += num_accepted
-        input_ids[sample_index] = sampled.gather(1, num_accepted.unsqueeze(1)).squeeze(1)
+        input_ids[sample_index] = next_token_ids
+        positions = inputs.positions
         with set_context(**{**context, "logits_indices": None}):
             hidden_states = self.drafter(self.embed_tokens(input_ids), positions, target_hidden_states)
             hidden_states = hidden_states[sample_index]
             drafts = [self._draft(hidden_states)]
         if not num_rows:
             return torch.empty(0, self.num_speculative_tokens, dtype=torch.int64, device=input_ids.device)
-        # Bounded on the host by a row keeping every draft, as vLLM's max_seq_len.
-        max_position = int(inputs.positions[inputs.last_index[inputs.sampling_rows]].max())
         sample_positions = positions[sample_index]
         steps = [
-            self._step_context(sample_positions, table, cu_seqlens_q, max_position, step)
+            self._step_context(sample_positions, table, cu_seqlens_q, inputs.max_position, step)
             for step in range(1, self.num_speculative_tokens)
         ]
         graph_bs = next((size for size in self.graph_bs if size >= num_rows), None)

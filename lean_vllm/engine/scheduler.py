@@ -7,6 +7,7 @@ from lean_vllm.engine.block_manager import BlockManager
 from lean_vllm.engine.policy import SchedulingPolicy
 from lean_vllm.engine.sequence import Sequence, SequenceStatus
 from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, create_scheduler_connector
+from lean_vllm.spec_decode.config import PLACEHOLDER_TOKEN_ID
 
 
 @dataclass(slots=True)
@@ -59,8 +60,9 @@ class Scheduler:
         self.request_timeout = config.request_timeout
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         speculative = config.speculative
+        self.num_speculative_tokens = speculative.num_speculative_tokens if speculative is not None else 0
         # Slots past a row's last token that the drafter writes, its first draft aside, as vLLM's lookahead.
-        self.num_lookahead_tokens = speculative.num_speculative_tokens - 1 if speculative is not None else 0
+        self.num_lookahead_tokens = max(self.num_speculative_tokens - 1, 0)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
             config.kvcache_block_size,
@@ -295,7 +297,10 @@ class Scheduler:
             if seq.num_cached_tokens < seq.num_planned_tokens:
                 continue  # prefill or recomputation unfinished, so this row samples nothing
             seq.is_prefill = False
-            seq.reserve_token()
+            # Its next token and, optimistically, every draft it verifies, as vLLM's num_output_placeholders.
+            seq.reserve_token(1 + num_draft_tokens)
+            # The drafts it makes are on the device until reconcile; an async step schedules placeholders.
+            seq.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_speculative_tokens
             rows.append(LaunchedRow(seq, seq.num_preemptions, num_draft_tokens))
         return rows
 
@@ -315,13 +320,14 @@ class Scheduler:
             if seq.is_finished or seq.num_preemptions != row.num_preemptions:
                 continue  # aborted, finished or requeued since the launch; the token is void
             new_token_ids = [sampled] if isinstance(sampled, int) else sampled
-            # The rejected drafts' slots hold keys of the wrong tokens, so the next step writes over them.
-            seq.num_cached_tokens -= row.num_draft_tokens - (len(new_token_ids) - 1)
+            # The rejected drafts' slots hold keys of the wrong tokens, so the next step writes over them, and their
+            # reservations go. A step launched since was placed as if they were kept; the runner moved it back.
+            num_rejected = row.num_draft_tokens - (len(new_token_ids) - 1)
+            seq.num_cached_tokens -= num_rejected
+            seq.num_pending_tokens -= num_rejected
             reason = None
             seq.num_new_tokens = 0
             for token_id in new_token_ids:
-                if seq.num_new_tokens:
-                    seq.reserve_token()
                 seq.commit_token(token_id)
                 seq.num_new_tokens += 1
                 if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
@@ -334,7 +340,7 @@ class Scheduler:
                 seq.first_token_time = perf_counter()  # when the token reaches the host, not at launch
             stepped.append(seq)
             if reason is None:
-                if draft_token_ids is not None:
+                if draft_token_ids is not None and not seq.num_pending_tokens:  # else a launched step verifies them
                     seq.spec_token_ids = draft_token_ids[i]
                 continue
             seq.drop_pending()  # a later step may already have reserved one

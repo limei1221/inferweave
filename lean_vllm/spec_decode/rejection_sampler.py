@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-PLACEHOLDER_TOKEN_ID = -1
+from lean_vllm.spec_decode.config import PLACEHOLDER_TOKEN_ID
 
 
 class RejectionSampler(nn.Module):

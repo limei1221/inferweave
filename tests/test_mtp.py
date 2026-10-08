@@ -131,10 +131,11 @@ def generate(engine, prompts=PROMPTS, max_tokens: int = 24, temperature: float =
     return [output["token_ids"] for output in engine.generate(prompts, params, use_tqdm=False)]
 
 
-def test_greedy_decoding_is_unchanged_by_the_drafts(make_engine):
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_greedy_decoding_is_unchanged_by_the_drafts(make_engine, async_scheduling):
     want = generate(make_engine())
     for k in (1, 3):
-        assert generate(make_engine(k)) == want, f"num_speculative_tokens={k}"
+        assert generate(make_engine(k, async_scheduling=async_scheduling)) == want, f"num_speculative_tokens={k}"
 
 
 def predict_the_target(engine):
@@ -248,28 +249,38 @@ def capture_draft_passes(engine, monkeypatch, sizes: list[int]) -> dict:
 
 
 # Graphs of 4 rows pad every smaller step; graphs of up to 2 leave larger steps eager. A backend with no MLA decode
-# expands latents, planned on the host from key lengths a draft step reads back.
+# expands latents, planned on the host from key lengths: a draft step reads them back, and an async step waits.
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize(
     "graph_sizes, decode_latents",
     [(None, True), ([4], True), ([1, 2], True), (None, False)],
     ids=["eager", "padded_graphs", "graphs_and_eager", "expanded"],
 )
-def test_the_drafts_are_those_of_one_pass_over_the_sequence(make_engine, monkeypatch, graph_sizes, decode_latents):
+def test_the_drafts_are_those_of_one_pass_over_the_sequence(
+    make_engine, monkeypatch, graph_sizes, decode_latents, async_scheduling
+):
     """Chunked prompts, kept and rejected drafts' slots, and the later draft positions all feed the drafter's cache,
-    whether its single-token passes run eager or replay graphs."""
+    whether its single-token passes run eager or replay graphs, and whether a step is placed before the last
+    one's drafts are verified."""
     k = 2
-    engine = make_engine(k)
-    monkeypatch.setattr(engine.model_runner, "rejection_sampler", keep_drafts_at_random)
-    for module in engine.model_runner.proposer.drafter.modules():
-        if isinstance(module, MLAAttention) and not decode_latents:
-            monkeypatch.setattr(module.backend, "supports_mla_decode", lambda: False)
+    engine = make_engine(k, async_scheduling=async_scheduling)
+    runner = engine.model_runner
+    monkeypatch.setattr(runner, "rejection_sampler", keep_drafts_at_random)
+    if not decode_latents:
+        for module in [*runner.model.modules(), *runner.proposer.drafter.modules()]:
+            if isinstance(module, MLAAttention):
+                monkeypatch.setattr(module.backend, "supports_mla_decode", lambda: False)
+        monkeypatch.setattr(runner, "decodes_latents", False)
     graphs = capture_draft_passes(engine, monkeypatch, graph_sizes) if graph_sizes else {}
     proposed = []
     reconcile = engine.scheduler.reconcile
 
-    def recording_reconcile(*args):
-        stepped = reconcile(*args)
-        proposed.extend((list(seq.token_ids), list(seq.spec_token_ids)) for seq in stepped if not seq.is_finished)
+    def recording_reconcile(rows, token_ids, draft_token_ids=None):
+        """Each row's drafts with the tokens before them; async, a step in flight holds them, not the sequence."""
+        stepped = reconcile(rows, token_ids, draft_token_ids)
+        for row, drafts in zip(rows, draft_token_ids or []):
+            if row.seq in stepped and not row.seq.is_finished:
+                proposed.append((list(row.seq.token_ids), list(drafts)))  # the scheduler trims its own
         return stepped
 
     monkeypatch.setattr(engine.scheduler, "reconcile", recording_reconcile)

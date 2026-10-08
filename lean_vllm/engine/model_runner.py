@@ -1,6 +1,7 @@
 import logging
 import math
 from collections import Counter
+from dataclasses import dataclass
 from datetime import timedelta
 
 import numpy as np
@@ -52,11 +53,23 @@ def decode_query_len(lens: np.ndarray, num_speculative_tokens: int) -> int:
     return int(np.argmax(np.bincount(short))) if short.size else 1
 
 
+@dataclass(slots=True)
+class InFlightDrafts:
+    """What a launched speculative step leaves on the device for the next, by sampling row: vLLM's
+    prev_sampled_token_ids, _draft_token_ids and valid_sampled_token_count."""
+
+    next_token_ids: torch.Tensor  # each row's newest token, after its kept drafts
+    draft_token_ids: torch.Tensor  # [rows, num_speculative_tokens], for the next step to verify
+    num_rejected: torch.Tensor  # drafts it verified and rejected, by which the next step's positions move back
+
+
 class ModelRunner:
     cascade_layers: list[Attention] = []  # one layer per kind, backend and head count; each must agree to cascade
     eplb: EplbState | None = None  # with enable_eplb
     proposer: MTPProposer | None = None  # with a speculative_config
     num_speculative_tokens = 0
+    in_flight_drafts: InFlightDrafts | None = None  # with a speculative_config, the last launched step's
+    decodes_latents = True  # every MLA layer attends its latents, so no attention reads key lengths on the host
 
     def __init__(self, config: Config, rank: int):
         self.config = config
@@ -107,6 +120,9 @@ class ModelRunner:
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
         self.attention_backends = list(dict.fromkeys(type(layer.backend) for layer in layers))  # replay hooks
         groups = {(type(layer), type(layer.backend), layer.num_heads, layer.num_kv_heads): layer for layer in layers}
+        self.decodes_latents = all(
+            layer.backend.supports_mla_decode() for layer in layers if isinstance(layer, MLAAttention)
+        )
         self.cascade_layers = list(groups.values())
         self.enforce_eager = (
             config.enforce_eager
@@ -305,6 +321,20 @@ class ModelRunner:
         row_of[order] = np.arange(num_rows)  # each scheduled sequence's row in the batch
 
         lens, starts = lens[order], starts[order]
+        # A row with nothing left to prefill samples its last token, and each of its drafts' positions.
+        sampling = np.flatnonzero(starts[row_of] + lens[row_of] >= planned)  # in scheduler order
+        # Rows of an async step verifying drafts while the step before is in flight: placed as if it kept all of
+        # its own, as vLLM's optimistic num_computed_tokens, and moved back on the device, so the host never waits.
+        in_flight = self.in_flight_drafts
+        moved = [i for i, seq in enumerate(batch) if seq.num_pending_tokens] if in_flight is not None else []
+        moved_src = [self._prev_row(batch[i]) for i in moved]
+        is_prefill = any(seq.is_prefill for seq in seqs) or bool(num_drafts.any())  # rows of several queries
+        if moved and (not self.decodes_latents or (is_prefill and bool((lens[moved] != query_len).any()))):
+            # Expanding latents plans keys on the host, so it waits for the step in flight: a sync.
+            assert in_flight is not None
+            num_rejected = in_flight.num_rejected.tolist()
+            starts[moved] -= [num_rejected[src] for src in moved_src]
+            moved = []
         ends = starts + lens
         cu_q = np.zeros(num_rows + 1, np.int64)
         np.cumsum(lens, out=cu_q[1:])
@@ -316,20 +346,26 @@ class ModelRunner:
         token_ids: list[int] = []
         pending_dst: list[int] = []
         pending_src: list[int] = []
+        draft_dst: list[int] = []
+        draft_src: list[int] = []  # into the in-flight drafts, flattened
+        k = self.num_speculative_tokens
         for seq, start, end in zip(batch, starts.tolist(), ends.tolist()):
             if seq.is_prefill:
                 assert not seq.num_pending_tokens, "a prefill row carries a pending token"
                 token_ids.extend(seq[start:end])
             else:
                 if seq.num_pending_tokens:
-                    # Sampled by a step still in flight; the device copy fixes it below.
+                    # Sampled by a step still in flight, its drafts too; the device copy fixes them below.
+                    src = self._prev_row(seq)
                     pending_dst.append(len(token_ids))
-                    pending_src.append(self._prev_row(seq))
+                    pending_src.append(src)
+                    if in_flight is not None:
+                        n = len(seq.spec_token_ids)
+                        draft_dst += range(len(token_ids) + 1, len(token_ids) + 1 + n)
+                        draft_src += range(src * k, src * k + n)
                 token_ids.append(seq.last_token)
                 token_ids.extend(seq.spec_token_ids)
 
-        # A row with nothing left to prefill samples its last token, and each of its drafts' positions.
-        sampling = np.flatnonzero(starts[row_of] + lens[row_of] >= planned)  # in scheduler order
         sampling_drafts = num_drafts[sampling]
         last_index = cu_q[1:] - 1
         num_logits = sampling_drafts + 1
@@ -353,8 +389,6 @@ class ModelRunner:
             slot_mapping = blocks * block_size + kept % block_size
             block_tables = buffers.put("block_tables", table, torch.int32)
             common_prefix_len = self._cascade_prefix_len(table, starts, lens)
-        # Rows of several queries, drafts' included, run the prefill path.
-        is_prefill = any(seq.is_prefill for seq in seqs) or bool(num_drafts.any())
         cu_seqlens_q, cu_seqlens_k = cu_q.tolist(), cu_k.tolist()
         context = dict(
             is_prefill=is_prefill,
@@ -377,8 +411,11 @@ class ModelRunner:
         all_greedy = all(temperature == 0 for temperature in row_temperatures)
         temperatures = None if all_greedy else buffers.put("temperatures", row_temperatures, torch.float32)
         if pending_dst:
-            assert self._prev_tokens is not None
-            prev = self._prev_tokens.device_tokens()
+            if in_flight is not None:
+                prev = in_flight.next_token_ids
+            else:
+                assert self._prev_tokens is not None
+                prev = self._prev_tokens.device_tokens()
             num_pending = len(pending_dst)
             if pending_dst == list(range(num_pending)) == pending_src:
                 # Pending rows are the first n of both; prev may have more if a request finished.
@@ -387,37 +424,62 @@ class ModelRunner:
                 dst = buffers.put("pending_dst", pending_dst, torch.int64)
                 src = buffers.put("pending_src", pending_src, torch.int64)
                 input_ids.index_copy_(0, dst, prev.index_select(0, src))
+        if draft_dst:
+            assert in_flight is not None
+            dst = buffers.put("draft_dst", draft_dst, torch.int64)
+            src = buffers.put("draft_src", draft_src, torch.int64)
+            input_ids.index_copy_(0, dst, in_flight.draft_token_ids.flatten().index_select(0, src))
         if self.proposer is not None:
-            self._spec_inputs = self._prepare_spec(sampling_rows, sampling_drafts, buffers)
+            num_draft_tokens = buffers.put("num_draft_tokens", sampling_drafts, torch.int64)
+            draft_token_ids = None
+            if self.rank == 0:  # it alone verifies; the drafts are the tokens after each sampling row's first
+                is_draft = offsets < np.repeat(sampling_drafts, num_logits)
+                draft_token_ids = input_ids[buffers.put("draft_index", logits_indices[is_draft] + 1, torch.int64)]
+            self._spec_inputs = (draft_token_ids, num_draft_tokens)
             samples = np.zeros(num_rows, bool)
             samples[row_of[sampling]] = True
             next_token_ids = [
                 -1 if row_samples else seq[end] for seq, end, row_samples in zip(batch, ends.tolist(), samples)
             ]
             self._draft_inputs = DraftInputs(
-                token_ids=np.array(token_ids, np.int64),
-                positions=positions,
+                input_ids=input_ids,
+                positions=positions_t,
+                max_position=int(positions[last_index[row_of[sampling]]].max(initial=0)),
                 last_index=last_index,
                 next_token_ids=np.array(next_token_ids, np.int64),
                 sampling_rows=row_of[sampling],
                 num_draft_tokens=sampling_drafts,
                 block_table=table if block_tables is not None else None,
             )
+        if moved:
+            assert in_flight is not None and block_tables is not None
+            self._move_back(context, positions_t, in_flight, token_rows, moved, moved_src, buffers)
         buffers.end()
         self._sampling_rows = sampling_rows
         return input_ids, positions_t, temperatures, context
 
-    def _prepare_spec(
-        self, sampling_rows: list[Sequence], num_drafts: np.ndarray, buffers: InputBuffers
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """The drafts the sampling rows verify, and how many each has; rank 0's alone, as it samples."""
-        if self.rank != 0:
-            return None
-        draft_token_ids = [t for seq in sampling_rows if not seq.is_prefill for t in seq.spec_token_ids]
-        return (
-            buffers.put("draft_token_ids", np.array(draft_token_ids, np.int64), torch.int64),
-            buffers.put("num_draft_tokens", num_drafts, torch.int64),
-        )
+    def _move_back(
+        self,
+        context: dict,
+        positions: torch.Tensor,
+        in_flight: InFlightDrafts,
+        token_rows: np.ndarray,
+        moved: list[int],
+        moved_src: list[int],
+        buffers: InputBuffers,
+    ):
+        """Move the moved rows back past the drafts the step in flight rejected, on the device: positions, slots and
+        key lengths, as vLLM's update_num_computed_tokens_for_batch_change. The host keeps its lengths as bounds."""
+        back = torch.zeros(len(context["context_lens"]), dtype=torch.int64, device=positions.device)
+        rejected = in_flight.num_rejected.index_select(0, buffers.put("moved_src", moved_src, torch.int64))
+        back.index_copy_(0, buffers.put("moved", moved, torch.int64), rejected)
+        token_rows_t = buffers.put("token_rows", token_rows, torch.int64)
+        positions -= back[token_rows_t]
+        context_lens, block_size = context["context_lens"], self.block_size
+        context_lens -= back.to(context_lens.dtype)
+        context["cu_seqlens_k"][1:] = context_lens.cumsum(0)
+        blocks = context["block_tables"][token_rows_t, positions // block_size].long()
+        context["slot_mapping"].copy_(blocks * block_size + positions % block_size)
 
     def _cascade_prefix_len(self, table: np.ndarray, starts: np.ndarray, lens: np.ndarray) -> int:
         """vLLM's _compute_cascade_attn_prefix_len: the pages every row shares, cut to the fewest cached tokens so no
@@ -537,7 +599,12 @@ class ModelRunner:
                     tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
         if self.proposer is not None:
             with record_function("propose"):
-                drafts = self.proposer.propose(self._draft_inputs, context, self._hidden_states, verified)
+                num_accepted = (verified >= 0).sum(dim=1) - 1
+                next_token_ids = verified.gather(1, num_accepted.unsqueeze(1)).squeeze(1)
+                drafts = self.proposer.propose(
+                    self._draft_inputs, context, self._hidden_states, num_accepted, next_token_ids
+                )
+            self.in_flight_drafts = InFlightDrafts(next_token_ids, drafts, self._spec_inputs[1] - num_accepted)
             tokens = torch.cat([verified, drafts], dim=1) if self.rank == 0 else None
         if self.eplb is not None:
             self.eplb.step()  # every rank runs every step, so they rearrange together
@@ -553,8 +620,8 @@ class ModelRunner:
         every rank, as each runs the drafter on them."""
         assert self.proposer is not None
         if self.rank == 0:
-            assert logits is not None and self._spec_inputs is not None
             draft_token_ids, num_draft_tokens = self._spec_inputs
+            assert logits is not None and draft_token_ids is not None
             tokens = self.rejection_sampler(
                 logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens
             )

@@ -136,9 +136,9 @@ class Sequence:
             prefix = self.block_hashes[-1] if self.block_hashes else -1
             self.block_hashes.append(algo(tuple(self.block(i)), prefix))
 
-    def reserve_token(self):
-        """A launched step will sample here; the value is not known yet."""
-        self.num_pending_tokens += 1
+    def reserve_token(self, num_tokens: int = 1):
+        """A launched step will sample here, or keep drafts here; the values are not known yet."""
+        self.num_pending_tokens += num_tokens
 
     def commit_token(self, token_id: int):
         assert self.num_pending_tokens, "commit_token without a reservation"
