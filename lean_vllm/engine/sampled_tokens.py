@@ -13,7 +13,7 @@ class SampledTokens:
         return cls._copy_stream
 
     def __init__(self, tokens: torch.Tensor, device: torch.device):
-        self._tokens: list[int] | None = None
+        self._tokens: list | None = None
         if device.type != "cuda":
             self._device_tokens = tokens
             self._event = None
@@ -32,7 +32,8 @@ class SampledTokens:
         """The tensor itself, for filling the next step's inputs without a host round trip."""
         return self._device_tokens
 
-    def tolist(self) -> list[int]:
+    def tolist(self) -> list:
+        """One token per row, or, from a speculative step, one list per row (see spec_decode.split_sampled)."""
         if self._tokens is None:
             if self._event is None:
                 self._tokens = self._device_tokens.tolist()

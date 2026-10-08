@@ -33,6 +33,7 @@ class LaunchedRow:
 
     seq: Sequence
     num_preemptions: int
+    num_draft_tokens: int = 0  # verified beside its token; those rejected give back their slots
 
 
 class QueueFull(Exception):
@@ -57,8 +58,14 @@ class Scheduler:
         self.max_waiting_requests = config.max_waiting_requests
         self.request_timeout = config.request_timeout
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
+        speculative = config.speculative
+        # Slots past a row's last token that the drafter writes, its first draft aside, as vLLM's lookahead.
+        self.num_lookahead_tokens = speculative.num_speculative_tokens - 1 if speculative is not None else 0
         self.block_manager = BlockManager(
-            config.num_kvcache_blocks, config.kvcache_block_size, config.enable_prefix_caching
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            config.enable_prefix_caching,
+            recompute_last_hit=speculative is not None,
         )
         self.waiting = SchedulingPolicy.create(config.scheduling_policy)
         self.running: deque[Sequence] = deque()
@@ -118,9 +125,13 @@ class Scheduler:
                 still_running.append(seq)  # its reserved tokens already reach the limit
                 continue
             if not seq.is_prefill:  # decoding, so the cache grows
-                if not self._make_room(seq, still_running, output):
+                # Drafts past the budget or the request's last token would be thrown away, so they never run.
+                num_left = seq.max_tokens - (seq.num_planned_tokens - seq.num_prompt_tokens)
+                del seq.spec_token_ids[max(min(budget, num_left) - 1, 0) :]
+                num_lookahead = len(seq.spec_token_ids) + self.num_lookahead_tokens
+                if not self._make_room(seq, still_running, output, num_lookahead):
                     continue
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, num_lookahead)
             budget -= self._schedule(seq, budget, output)
             still_running.append(seq)
         self.running = still_running
@@ -133,7 +144,7 @@ class Scheduler:
                     self.waiting.pop()  # impossible even with the entire cache free
                     self._drop(seq, "capacity", output)
                     continue
-                num_cached_blocks = self.block_manager.can_allocate(seq)
+                num_cached_blocks = self.block_manager.can_allocate(seq, self.num_lookahead_tokens)
                 if num_cached_blocks == -1:
                     break
                 budget -= self._admit(seq, num_cached_blocks, budget, output)
@@ -166,7 +177,7 @@ class Scheduler:
                 self.waiting.pop()
                 self._drop(seq, "capacity", output)
                 continue
-            num_cached_blocks = self.block_manager.can_allocate(seq)
+            num_cached_blocks = self.block_manager.can_allocate(seq, self.num_lookahead_tokens)
             if num_cached_blocks == -1:
                 break
             num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
@@ -188,7 +199,7 @@ class Scheduler:
     def _admit(self, seq: Sequence, num_cached_blocks: int, budget: int, output: SchedulerOutput) -> int:
         """Move the head of the waiting queue into the running set, or to wait for its blocks from elsewhere."""
         self.waiting.pop()
-        self.block_manager.allocate(seq, num_cached_blocks)
+        self.block_manager.allocate(seq, num_cached_blocks, self.num_lookahead_tokens)
         output.num_queried_blocks += seq.num_blocks
         output.num_cached_blocks += num_cached_blocks
         if self.connector is not None:
@@ -205,9 +216,11 @@ class Scheduler:
         return num_tokens
 
     def _schedule(self, seq: Sequence, budget: int, output: SchedulerOutput) -> int:
-        """Give seq its share of the budget: a prompt chunk, or one decoded token."""
+        """Give seq its share of the budget: a prompt chunk, or one decoded token and the drafts to verify."""
         # A preempted request also prefills its generated suffix until it samples again.
-        num_tokens = min(seq.num_tokens - seq.num_cached_tokens, budget) if seq.is_prefill else 1
+        num_tokens = (
+            min(seq.num_tokens - seq.num_cached_tokens, budget) if seq.is_prefill else 1 + len(seq.spec_token_ids)
+        )
         if seq.is_prefill and self.enable_chunked_prefill and self.long_prefill_token_threshold:
             num_tokens = min(num_tokens, self.long_prefill_token_threshold)
         seq.num_scheduled_tokens = num_tokens
@@ -217,12 +230,14 @@ class Scheduler:
         if seq.is_prefill:
             output.num_prefill_tokens += num_tokens
         else:
-            output.num_decode_tokens += 1
+            output.num_decode_tokens += num_tokens
         return num_tokens
 
-    def _make_room(self, seq: Sequence, still_running: deque[Sequence], output: SchedulerOutput) -> bool:
-        """Free blocks for one more decoded token. False if seq itself gave way."""
-        while not self.block_manager.can_append(seq):
+    def _make_room(
+        self, seq: Sequence, still_running: deque[Sequence], output: SchedulerOutput, num_lookahead: int = 0
+    ) -> bool:
+        """Free blocks for one more decoded token and num_lookahead slots past it. False if seq itself gave way."""
+        while not self.block_manager.can_append(seq, num_lookahead):
             if self.running:
                 victim = self.waiting.victim(self.running)
                 self.running.remove(victim)
@@ -250,6 +265,7 @@ class Scheduler:
         seq.is_prefill = True
         seq.num_preemptions += 1
         seq.drop_pending()  # the in-flight token is discarded and recomputed
+        seq.spec_token_ids = []  # the step that samples again drafts anew
         self.block_manager.deallocate(seq)
         self.waiting.requeue(seq)
         output.preempted.append(seq)
@@ -270,33 +286,56 @@ class Scheduler:
         """Move bookkeeping forward with no token values. Returns the sampling rows, in the sampler's order."""
         rows = []
         for seq in seqs:
+            # Optimistic, as vLLM's num_computed_tokens: reconcile takes back the slots of rejected drafts.
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
+            num_draft_tokens, seq.spec_token_ids = len(seq.spec_token_ids), []
             # Before the skip, so a chunked prefill publishes each block as it lands.
             self.block_manager.hash_blocks(seq, seq.num_cached_tokens)
             if seq.num_cached_tokens < seq.num_planned_tokens:
                 continue  # prefill or recomputation unfinished, so this row samples nothing
             seq.is_prefill = False
             seq.reserve_token()
-            rows.append(LaunchedRow(seq, seq.num_preemptions))
+            rows.append(LaunchedRow(seq, seq.num_preemptions, num_draft_tokens))
         return rows
 
-    def reconcile(self, rows: list[LaunchedRow], token_ids: list[int]) -> list[Sequence]:
-        """Commit the sampled tokens and run the stop checks. Returns the rows that produced one."""
+    def reconcile(
+        self,
+        rows: list[LaunchedRow],
+        token_ids: list[int] | list[list[int]],
+        draft_token_ids: list[list[int]] | None = None,
+    ) -> list[Sequence]:
+        """Commit the sampled tokens and run the stop checks. Returns the rows that produced one.
+
+        A speculative step gives each row its kept drafts and one more token, and the drafts for its next step.
+        """
         stepped = []
-        for row, token_id in zip(rows, token_ids):
-            seq = row.seq
+        for i, row in enumerate(rows[: len(token_ids)]):
+            seq, sampled = row.seq, token_ids[i]
             if seq.is_finished or seq.num_preemptions != row.num_preemptions:
                 continue  # aborted, finished or requeued since the launch; the token is void
-            seq.commit_token(token_id)
+            new_token_ids = [sampled] if isinstance(sampled, int) else sampled
+            # The rejected drafts' slots hold keys of the wrong tokens, so the next step writes over them.
+            seq.num_cached_tokens -= row.num_draft_tokens - (len(new_token_ids) - 1)
+            reason = None
+            seq.num_new_tokens = 0
+            for token_id in new_token_ids:
+                if seq.num_new_tokens:
+                    seq.reserve_token()
+                seq.commit_token(token_id)
+                seq.num_new_tokens += 1
+                if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
+                    reason = "stop"  # ignore_eos covers the eos token only, not client stop tokens
+                elif seq.num_completion_tokens == seq.max_tokens:
+                    reason = "length"
+                if reason is not None:
+                    break  # the tokens after a stop are dropped, as vLLM's
             if seq.first_token_time is None:
                 seq.first_token_time = perf_counter()  # when the token reaches the host, not at launch
             stepped.append(seq)
-            if (token_id == self.eos and not seq.ignore_eos) or token_id in seq.stop_token_ids:
-                reason = "stop"  # ignore_eos covers the eos token only, not client stop tokens
-            elif seq.num_completion_tokens == seq.max_tokens:
-                reason = "length"
-            else:
+            if reason is None:
+                if draft_token_ids is not None:
+                    seq.spec_token_ids = draft_token_ids[i]
                 continue
             seq.drop_pending()  # a later step may already have reserved one
             self.running.remove(seq)

@@ -6,7 +6,7 @@ from dataclasses import MISSING, fields
 from lean_vllm.config import Config
 
 # Not flags: the positional, and what the engine reads from the checkpoint.
-INTERNAL = {"model", "hf_config", "eos", "kv_transfer", "eplb"}
+INTERNAL = {"model", "hf_config", "eos", "kv_transfer", "eplb", "speculative"}
 
 
 def add_engine_args(parser: argparse.ArgumentParser):

@@ -16,7 +16,7 @@ hardware.
 | 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done, plus Triton and FlashInfer MLA decode (FlashInfer and both MLA backends not yet run on a GPU) |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-10-03-Qwen3-8B.md) |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md)); GPU reference checks still to record |
-| 3 | Speculative decoding | |
+| 3 | Speculative decoding | DeepSeek-V3's MTP layers draft, verified by rejection sampling, as vLLM's MTP method; checked on CPU against plain decoding and a one-pass drafter on a tiny checkpoint; drafter eager and scheduling synchronous; not yet run on a GPU |
 | 4 | Disaggregated prefill / decode | vLLM's connector interface with NixlConnector's pull protocol over TCP, and a proxy; checked end to end on CPU against a single engine ([docs](docs/disaggregated-prefill.md)); not yet run on a GPU |
 
 ## Install
@@ -71,6 +71,20 @@ forces either. The kernel's tile sizes come from a config tuned offline by
 Qwen3 and DeepSeek-V2 checkpoints load, picked by `architectures` in
 `config.json`. [docs/deepseek-v2.md](docs/deepseek-v2.md) covers DeepSeek-V2-Lite:
 its latent KV cache, MoE layer and YaRN rope.
+
+A DeepSeek-V3 checkpoint's multi-token prediction layers can draft tokens for
+the model to verify, as vLLM's `--speculative-config` (in bf16: FP8 weights do
+not load):
+
+```bash
+uv run lean-vllm serve /path/to/deepseek-v3-bf16 --tensor-parallel-size 8 \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
+```
+
+The drafter shares the target's embedding and head, and runs eager after each
+step's sampling; the kept-draft counts come back to the host between the two,
+as vLLM's `disable_padded_drafter_batch`, so `async_scheduling` turns off.
+`/metrics` reports drafts, draft tokens and accepted tokens, by position too.
 
 ## Serving
 

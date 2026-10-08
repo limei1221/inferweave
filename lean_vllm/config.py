@@ -10,7 +10,8 @@ from lean_vllm.attention import LayerSpec, get_attention_backend
 from lean_vllm.engine.sequence import HASH_ALGOS
 from lean_vllm.eplb import EplbConfig
 from lean_vllm.kv_transfer import KVTransferConfig, parse_kv_transfer_config
-from lean_vllm.models import get_model_class
+from lean_vllm.models import get_drafter_class, get_model_class
+from lean_vllm.spec_decode import SpeculativeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,8 @@ class Config:
     dist_port: int = 0  # rendezvous port for the ranks; 0 picks a free one
     kv_transfer_config: str = ""  # JSON, as vLLM's --kv-transfer-config; empty disaggregates nothing
     kv_transfer: KVTransferConfig | None = None  # kv_transfer_config, parsed
+    speculative_config: str = ""  # JSON, as vLLM's --speculative-config: method ("mtp"), num_speculative_tokens
+    speculative: SpeculativeConfig | None = None  # speculative_config, parsed
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -90,6 +93,16 @@ class Config:
                 )
         elif self.eplb_config:
             raise ValueError("eplb_config needs enable_eplb")
+        if self.speculative_config and self.speculative is None:
+            self.speculative = SpeculativeConfig.parse(self.speculative_config)
+        if self.speculative is not None:
+            get_drafter_class(self.hf_config)  # raises for a checkpoint with no MTP layers
+            if self.kv_transfer is not None or self.enable_eplb:
+                raise ValueError("speculative decoding runs without kv_transfer_config and enable_eplb, for now")
+            if self.async_scheduling:
+                # The next step's rows depend on how many drafts this one keeps, which only the sampler knows.
+                logger.warning("async_scheduling is off: speculative decoding does not support it")
+                self.async_scheduling = False
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         if getattr(self.hf_config, "kv_lora_rank", None) is not None:  # an MLA model
             block_size = get_attention_backend(self._mla_layer_spec()).mla_block_size()

@@ -18,17 +18,21 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     skipped_weight_prefixes = getattr(model, "skipped_weight_prefixes", ())
+    remap_weight_name = getattr(model, "remap_weight_name", None)  # a drafter's name for a checkpoint weight, or None
     loaded: set[str] = set()
     for file in glob(os.path.join(path, "*.safetensors")):
         with safe_open(file, "pt", "cpu") as f:
-            for weight_name in f.keys():
-                if weight_name.startswith(skipped_weight_prefixes):
+            for checkpoint_name in f.keys():
+                if checkpoint_name.startswith(skipped_weight_prefixes):
+                    continue
+                weight_name = checkpoint_name if remap_weight_name is None else remap_weight_name(checkpoint_name)
+                if weight_name is None:
                     continue
                 if expert := EXPERT_WEIGHT.fullmatch(weight_name):
                     prefix, expert_id, proj = expert.groups()
                     param_name = f"{prefix}.{STACKED_EXPERT_PARAMS[proj]}"
                     param = model.get_parameter(param_name)
-                    param.weight_loader(param, f.get_tensor(weight_name), (int(expert_id), proj))  # type: ignore[attr-defined]
+                    param.weight_loader(param, f.get_tensor(checkpoint_name), (int(expert_id), proj))  # type: ignore[attr-defined]
                     loaded.add(param_name)
                     continue
                 for k in packed_modules_mapping:
@@ -37,13 +41,13 @@ def load_model(model: nn.Module, path: str):
                         param_name = weight_name.replace(k, v)
                         param = model.get_parameter(param_name)
                         weight_loader = param.weight_loader  # type: ignore[attr-defined]
-                        weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        weight_loader(param, f.get_tensor(checkpoint_name), shard_id)
                         loaded.add(param_name)
                         break
                 else:
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, f.get_tensor(weight_name))
+                    weight_loader(param, f.get_tensor(checkpoint_name))
                     loaded.add(weight_name)
     check_loaded(model, loaded, path)
     for module in model.modules():  # vLLM's hook, for what is derived from the weights once

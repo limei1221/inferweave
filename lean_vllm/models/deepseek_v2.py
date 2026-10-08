@@ -295,13 +295,21 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
-class DeepseekV2ForCausalLM(nn.Module):
-    supports_cuda_graph = True
-    supports_expert_parallel = True
-    packed_modules_mapping = {
+def packed_modules_mapping(config: PretrainedConfig) -> dict[str, tuple[str, int]]:
+    """Checkpoint projections that load as shards of one fused parameter."""
+    mapping = {
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
     }
+    if config.q_lora_rank is not None:
+        mapping["q_a_proj"] = ("fused_qkv_a_proj", 0)
+        mapping["kv_a_proj_with_mqa"] = ("fused_qkv_a_proj", 1)
+    return mapping
+
+
+class DeepseekV2ForCausalLM(nn.Module):
+    supports_cuda_graph = True
+    supports_expert_parallel = True
 
     def __init__(
         self,
@@ -310,13 +318,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         eplb_config: EplbConfig | None = None,
     ) -> None:
         super().__init__()
-        if config.q_lora_rank is not None:
-            self.packed_modules_mapping = {
-                **self.packed_modules_mapping,
-                "q_a_proj": ("fused_qkv_a_proj", 0),
-                "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
-            }
-        # The checkpoint's multi-token prediction layers follow the last one; nothing here runs them.
+        self.packed_modules_mapping = packed_modules_mapping(config)
+        # The checkpoint's multi-token prediction layers follow the last one; the drafter loads them.
         self.skipped_weight_prefixes = tuple(
             f"model.layers.{config.num_hidden_layers + i}."
             for i in range(getattr(config, "num_nextn_predict_layers", None) or 0)

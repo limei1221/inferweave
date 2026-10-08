@@ -14,6 +14,7 @@ from lean_vllm.engine.scheduler import QueueFull, Scheduler
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVConnectorOutput
 from lean_vllm.sampling_params import SamplingParams
+from lean_vllm.spec_decode import split_sampled
 
 EOS = 7
 
@@ -38,6 +39,7 @@ class FakeConfig:
     async_scheduling: bool = False  # off, unlike Config: most tests count steps in sync order
     tensor_parallel_size: int = 1
     kv_transfer: object = None  # a KVTransferConfig turns the connector on
+    speculative: object = None  # a SpeculativeConfig turns drafting on
 
 
 class FakeSampledTokens:
@@ -73,7 +75,7 @@ class FakeModelRunner:
 
     @staticmethod
     def _samples(seq: Sequence) -> bool:
-        return seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_planned_tokens
+        return seq.num_cached_tokens + seq.num_scheduled_tokens >= seq.num_planned_tokens
 
     @staticmethod
     def _completion_index(seq: Sequence) -> int:
@@ -127,7 +129,7 @@ class FakeEngine:
         outputs = [
             RequestOutput(
                 request_id=seq.request_id,
-                token_ids=[seq.last_token],
+                token_ids=seq.token_ids[-seq.num_new_tokens :],
                 finished=seq.is_finished,
                 finish_reason=seq.finish_reason,
                 metrics=seq.metrics() if seq.is_finished else None,
@@ -166,7 +168,11 @@ class FakeEngine:
         if draining is None:
             return []
         _, rows, pending = draining
-        return self.scheduler.reconcile(rows, pending.tolist())
+        token_ids, draft_token_ids = pending.tolist(), None
+        if self.config.speculative is not None:
+            token_ids, draft_token_ids = split_sampled(token_ids, self.config.speculative.num_speculative_tokens)
+            self.metrics.record_spec_decoding(rows, token_ids)
+        return self.scheduler.reconcile(rows, token_ids, draft_token_ids)
 
     def is_finished(self):
         return self.in_flight is None and self.scheduler.is_finished()

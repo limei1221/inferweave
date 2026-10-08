@@ -20,6 +20,7 @@ from lean_vllm.engine.scheduler import InvalidRequest, LaunchedRow, QueueFull, S
 from lean_vllm.engine.sequence import Sequence
 from lean_vllm.kv_transfer import KVTransferConfig, check_kv_transfer_params
 from lean_vllm.sampling_params import SamplingParams
+from lean_vllm.spec_decode import split_sampled
 
 
 def validate_request(
@@ -233,13 +234,17 @@ class LLMEngine:
             return []
         with record_function("await_tokens"):
             token_ids = draining.pending.tolist()
+        draft_token_ids = None
+        if self.config.speculative is not None:
+            token_ids, draft_token_ids = split_sampled(token_ids, self.config.speculative.num_speculative_tokens)
+            self.metrics.record_spec_decoding(draining.rows, token_ids)
         with record_function("reconcile"):
-            return self.scheduler.reconcile(draining.rows, token_ids)
+            return self.scheduler.reconcile(draining.rows, token_ids, draft_token_ids)
 
     def _output(self, seq: Sequence) -> RequestOutput:
         return RequestOutput(
             request_id=seq.request_id,
-            token_ids=[seq.last_token],
+            token_ids=seq.token_ids[-seq.num_new_tokens :],
             finished=seq.is_finished,
             finish_reason=seq.finish_reason,
             metrics=seq.metrics() if seq.is_finished else None,

@@ -58,6 +58,8 @@ class Sequence:
         self.num_pending_tokens = 0  # reserved by a launched step, not yet sampled here
         self.num_published_blocks = 0  # blocks already in the prefix cache
         self.num_scheduled_tokens = 0
+        self.num_new_tokens = 0  # committed by the last reconcile, which the step's output carries
+        self.spec_token_ids: list[int] = []  # drafts for the next step to verify
         self.is_prefill = True
         self.block_table: list[int] = []
         self.block_hashes: list[int] = []  # chained, one per full block, filled on demand
@@ -164,6 +166,7 @@ class Sequence:
             self.num_pending_tokens,
             self.is_prefill,
             self.block_table,
+            self.spec_token_ids,
             last_state,
         )
 
@@ -176,6 +179,7 @@ class Sequence:
             self.num_pending_tokens,
             self.is_prefill,
             self.block_table,
+            self.spec_token_ids,
             last_state,
         ) = state
         if isinstance(last_state, list):

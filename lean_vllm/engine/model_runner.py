@@ -17,7 +17,9 @@ from lean_vllm.eplb import EplbState
 from lean_vllm.kv_transfer import KVConnectorMetadata, KVConnectorOutput, KVOutputAggregator, create_worker_connector
 from lean_vllm.layers.attention import Attention, MLAAttention, register_layers
 from lean_vllm.layers.sampler import Sampler
-from lean_vllm.models import get_model_class
+from lean_vllm.models import get_drafter_class, get_model_class
+from lean_vllm.spec_decode import RejectionSampler
+from lean_vllm.spec_decode.mtp_proposer import DraftInputs, MTPProposer
 from lean_vllm.utils import device as dev
 from lean_vllm.utils.context import get_context, set_context
 from lean_vllm.utils.loader import load_model
@@ -46,6 +48,8 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
 class ModelRunner:
     cascade_layers: list[Attention] = []  # one layer per kind, backend and head count; each must agree to cascade
     eplb: EplbState | None = None  # with enable_eplb
+    proposer: MTPProposer | None = None  # with a speculative_config
+    num_speculative_tokens = 0
 
     def __init__(self, config: Config, rank: int):
         self.config = config
@@ -80,6 +84,11 @@ class ModelRunner:
             model_kwargs["eplb_config"] = config.eplb
         self.model = model_cls(hf_config, **model_kwargs)
         register_layers(self.model)  # before warmup_model, which runs the op
+        drafter = None
+        if config.speculative is not None:
+            # Its own module, so the target's compile and graphs never hold it; it runs eager.
+            drafter = get_drafter_class(hf_config)(hf_config, config.enable_expert_parallel)
+            register_layers(drafter)
         # Binds the MoE layers' maps, which every forward reads, and holds a layer's worth of buffer before warmup.
         self.eplb = EplbState(self.model, config.eplb) if config.eplb is not None else None
         # Each layer chose its backend as it was built; graphs depend on all of them.
@@ -112,6 +121,25 @@ class ModelRunner:
         if self.cudagraph_mode != "none":
             self.compile_model()
         self.sampler = Sampler()
+        if drafter is not None:
+            assert config.speculative is not None
+            for module in drafter.modules():
+                if isinstance(module, MLAAttention):
+                    module.max_context_chunk = config.max_num_batched_tokens
+            load_model(drafter, config.model)
+            self.num_speculative_tokens = config.speculative.num_speculative_tokens
+            self.rejection_sampler = RejectionSampler()
+            self.proposer = MTPProposer(
+                drafter,
+                self.model.model.embed_tokens,
+                self.model.compute_logits,
+                self.num_speculative_tokens,
+                self.block_size,
+                config.max_model_len,
+                rank,
+                self.world_size,
+                self.device,
+            )
         self.warmup_model()
         self.allocate_kv_cache()
         self.kv_connector = None
@@ -189,16 +217,24 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _dummy_sampler_run(self):
-        """As vLLM does: a step samples up to one row per sequence, far more than the warmup prefill, so measure that too."""
-        num_rows = min(self.config.max_num_seqs, self.config.max_num_batched_tokens)
+        """As vLLM does: a step samples up to one row per sequence, far more than the warmup prefill, so measure that too.
+        With drafts, each row has a logits row per draft beside its own."""
+        num_logits = 1 + self.num_speculative_tokens
+        num_rows = max(min(self.config.max_num_seqs * num_logits, self.config.max_num_batched_tokens) // num_logits, 1)
         # Random, as vLLM's: dummy hidden states could hold values that break the sampler.
-        hidden_states = torch.rand(num_rows, self.config.hf_config.hidden_size)
+        hidden_states = torch.rand(num_rows * num_logits, self.config.hf_config.hidden_size)
         with set_context(False):  # no logits_indices, so every row samples
             logits = self.model.compute_logits(hidden_states)
         if self.rank != 0:
             return  # only rank 0 gathers logits and samples
+        temperatures = torch.full((num_rows,), 0.5, dtype=torch.float32)  # non-greedy, the costlier path
         try:
-            self.sampler(logits, torch.full((num_rows,), 0.5, dtype=torch.float32))  # non-greedy, the costlier path
+            if self.proposer is None:
+                self.sampler(logits, temperatures)
+            else:
+                num_draft_tokens = torch.full((num_rows,), self.num_speculative_tokens, dtype=torch.int64)
+                drafts = torch.zeros(num_rows * self.num_speculative_tokens, dtype=torch.int64)
+                self.rejection_sampler(logits, drafts, num_draft_tokens, temperatures, self.num_speculative_tokens)
         except torch.OutOfMemoryError as error:
             raise RuntimeError(
                 f"out of memory warming up the sampler with {num_rows} rows; "
@@ -209,6 +245,8 @@ class ModelRunner:
         config = self.config
         # Each layer names its cache layout, which its backend may choose: keys and values per head, or one MLA latent.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
+        if self.proposer is not None:  # the drafter's layers cache by the target's block tables
+            layers += [module for module in self.proposer.drafter.modules() if isinstance(module, Attention)]
         block_numel = sum(math.prod(layer.kv_cache_shape(1, self.block_size)) for layer in layers)
         block_bytes = block_numel * config.hf_config.dtype.itemsize
         if config.num_kvcache_blocks <= 0:
@@ -241,6 +279,10 @@ class ModelRunner:
         lens = np.fromiter((seq.num_scheduled_tokens for seq in seqs), np.int64, num_rows)
         starts = np.fromiter((seq.num_cached_tokens for seq in seqs), np.int64, num_rows)
         planned = np.fromiter((seq.num_planned_tokens for seq in seqs), np.int64, num_rows)
+        # A decoding row verifies its drafts beside its token, so it runs and samples one more position per draft.
+        num_drafts = np.fromiter(
+            (0 if seq.is_prefill else seq.num_scheduled_tokens - 1 for seq in seqs), np.int64, num_rows
+        )
         order = np.argsort(lens > 1, kind="stable")  # decodes_first, as indices
         batch = [seqs[i] for i in order]
         row_of = np.empty(num_rows, np.int64)
@@ -268,10 +310,15 @@ class ModelRunner:
                     pending_dst.append(len(token_ids))
                     pending_src.append(self._prev_row(seq))
                 token_ids.append(seq.last_token)
+                token_ids.extend(seq.spec_token_ids)
 
-        # A row with nothing left to prefill samples its last token.
-        sampling = np.flatnonzero(starts[row_of] + lens[row_of] == planned)  # in scheduler order
-        logits_indices = cu_q[row_of[sampling] + 1] - 1
+        # A row with nothing left to prefill samples its last token, and each of its drafts' positions.
+        sampling = np.flatnonzero(starts[row_of] + lens[row_of] >= planned)  # in scheduler order
+        sampling_drafts = num_drafts[sampling]
+        last_index = cu_q[1:] - 1
+        num_logits = sampling_drafts + 1
+        offsets = np.arange(num_logits.sum()) - np.repeat(np.cumsum(num_logits) - num_logits, num_logits)
+        logits_indices = np.repeat(last_index[row_of[sampling]] - sampling_drafts, num_logits) + offsets
         sampling_rows = [seqs[i] for i in sampling.tolist()]
         # Only the sampling rank owns sampling parameters.
         row_temperatures = [seq.temperature for seq in sampling_rows] if self.rank == 0 else []
@@ -290,7 +337,8 @@ class ModelRunner:
             slot_mapping = blocks * block_size + kept % block_size
             block_tables = buffers.put("block_tables", table, torch.int32)
             common_prefix_len = self._cascade_prefix_len(table, starts, lens)
-        is_prefill = any(seq.is_prefill for seq in seqs)
+        # Rows of several queries, drafts' included, run the prefill path.
+        is_prefill = any(seq.is_prefill for seq in seqs) or bool(num_drafts.any())
         cu_seqlens_q, cu_seqlens_k = cu_q.tolist(), cu_k.tolist()
         context = dict(
             is_prefill=is_prefill,
@@ -322,9 +370,37 @@ class ModelRunner:
                 dst = buffers.put("pending_dst", pending_dst, torch.int64)
                 src = buffers.put("pending_src", pending_src, torch.int64)
                 input_ids.index_copy_(0, dst, prev.index_select(0, src))
+        if self.proposer is not None:
+            self._spec_inputs = self._prepare_spec(sampling_rows, sampling_drafts, buffers)
+            samples = np.zeros(num_rows, bool)
+            samples[row_of[sampling]] = True
+            next_token_ids = [
+                -1 if row_samples else seq[end] for seq, end, row_samples in zip(batch, ends.tolist(), samples)
+            ]
+            self._draft_inputs = DraftInputs(
+                token_ids=np.array(token_ids, np.int64),
+                positions=positions,
+                last_index=last_index,
+                next_token_ids=np.array(next_token_ids, np.int64),
+                sampling_rows=row_of[sampling],
+                num_draft_tokens=sampling_drafts,
+                block_table=table if block_tables is not None else None,
+            )
         buffers.end()
         self._sampling_rows = sampling_rows
         return input_ids, positions_t, temperatures, context
+
+    def _prepare_spec(
+        self, sampling_rows: list[Sequence], num_drafts: np.ndarray, buffers: InputBuffers
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The drafts the sampling rows verify, and how many each has; rank 0's alone, as it samples."""
+        if self.rank != 0:
+            return None
+        draft_token_ids = [t for seq in sampling_rows if not seq.is_prefill for t in seq.spec_token_ids]
+        return (
+            buffers.put("draft_token_ids", np.array(draft_token_ids, np.int64), torch.int64),
+            buffers.put("num_draft_tokens", num_drafts, torch.int64),
+        )
 
     def _cascade_prefix_len(self, table: np.ndarray, starts: np.ndarray, lens: np.ndarray) -> int:
         """vLLM's _compute_cascade_attn_prefix_len: the pages every row shares, cut to the fewest cached tokens so no
@@ -382,10 +458,14 @@ class ModelRunner:
         if self.eplb is not None:
             self.eplb.num_tokens.fill_(input_ids.size(0))  # a replay's padding rows record no load
         if self.step_kind == "graph":
-            return self.model.compute_logits(self._replay_full(input_ids, positions))
-        if self.step_kind == "piecewise":
-            return self.model.compute_logits(self._replay_piecewise(input_ids, positions))
-        return self.model.compute_logits(self.model(input_ids, positions))
+            hidden_states = self._replay_full(input_ids, positions)
+        elif self.step_kind == "piecewise":
+            hidden_states = self._replay_piecewise(input_ids, positions)
+        else:
+            hidden_states = self.model(input_ids, positions)
+        if self.proposer is not None:
+            self._hidden_states = hidden_states  # the drafter's input, after sampling
+        return self.model.compute_logits(hidden_states)
 
     def _replay_full(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """One graph for the whole model. Pure decode only: attention is inside it."""
@@ -430,7 +510,16 @@ class ModelRunner:
             with record_function("run_model"):
                 logits = self.run_model(input_ids, positions, context["is_prefill"])
             with record_function("sample"):
-                tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
+                if self.proposer is not None:
+                    verified = self._verify(logits, temperatures)
+                    tokens = None
+                else:
+                    tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
+        if self.proposer is not None:
+            with record_function("propose"):
+                sampled = verified.tolist()  # the drafter's batch depends on the kept drafts; vLLM's unpadded drafter
+                drafts = self.proposer.propose(self._draft_inputs, context, self._hidden_states, sampled)
+            tokens = torch.cat([verified, drafts], dim=1) if self.rank == 0 else None
         if self.eplb is not None:
             self.eplb.step()  # every rank runs every step, so they rearrange together
         if tokens is None:
@@ -439,6 +528,21 @@ class ModelRunner:
         self._prev_tokens = pending
         self._prev_rows = {seq.seq_id: i for i, seq in enumerate(self._sampling_rows)}
         return pending
+
+    def _verify(self, logits: torch.Tensor | None, temperatures: torch.Tensor | None) -> torch.Tensor:
+        """Each sampling row's kept drafts and next token, [rows, num_speculative_tokens + 1], -1 past the last; on
+        every rank, as each runs the drafter on them."""
+        assert self.proposer is not None
+        if self.rank == 0:
+            assert logits is not None and self._spec_inputs is not None
+            draft_token_ids, num_draft_tokens = self._spec_inputs
+            tokens = self.rejection_sampler(
+                logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens
+            )
+        else:
+            shape = (len(self._draft_inputs.sampling_rows), self.num_speculative_tokens + 1)
+            tokens = torch.empty(shape, dtype=torch.int64, device=self.device)
+        return self.proposer.broadcast(tokens)
 
     @torch.inference_mode()
     def capture_piecewise(self):
