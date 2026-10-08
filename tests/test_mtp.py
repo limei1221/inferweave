@@ -18,6 +18,7 @@ from transformers import DeepseekV3Config, PreTrainedTokenizerFast
 from transformers import DeepseekV3ForCausalLM as HFDeepseekV3ForCausalLM
 
 from lean_vllm.sampling_params import SamplingParams
+from lean_vllm.spec_decode.mtp_proposer import MTPProposer
 from lean_vllm.utils.context import set_context
 
 VOCAB = 128
@@ -225,11 +226,35 @@ def keep_drafts_at_random(logits, draft_token_ids, num_draft_tokens, temperature
     return output
 
 
-def test_the_drafts_are_those_of_one_pass_over_the_sequence(make_engine, monkeypatch):
-    """Chunked prompts, kept and rejected drafts' slots, and the later draft positions all feed the drafter's cache."""
+class ReplayedPass:
+    """A CUDA graph's stand-in on CPU: a replay runs the captured pass again, over the graph's buffers alone."""
+
+    def __init__(self, run):
+        self.run = run
+        self.replays = 0
+
+    def replay(self):
+        self.replays += 1
+        self.run()
+
+
+def capture_draft_passes(engine, monkeypatch, sizes: list[int]) -> dict:
+    """The drafter's graphs as the runner captures them on CUDA, at these batch sizes."""
+    runner = engine.model_runner
+    monkeypatch.setattr(MTPProposer, "_capture", staticmethod(lambda run, pool: ReplayedPass(run)))
+    runner.proposer.capture_cudagraphs(sizes, runner._max_num_blocks(), None, runner.attention_backends)
+    return runner.proposer.graphs
+
+
+# Graphs of 4 rows pad every smaller step; graphs of up to 2 leave larger steps eager.
+@pytest.mark.parametrize("graph_sizes", [None, [4], [1, 2]], ids=["eager", "padded_graphs", "graphs_and_eager"])
+def test_the_drafts_are_those_of_one_pass_over_the_sequence(make_engine, monkeypatch, graph_sizes):
+    """Chunked prompts, kept and rejected drafts' slots, and the later draft positions all feed the drafter's cache,
+    whether its single-token passes run eager or replay graphs."""
     k = 2
     engine = make_engine(k)
     monkeypatch.setattr(engine.model_runner, "rejection_sampler", keep_drafts_at_random)
+    graphs = capture_draft_passes(engine, monkeypatch, graph_sizes) if graph_sizes else {}
     proposed = []
     reconcile = engine.scheduler.reconcile
 
@@ -245,6 +270,8 @@ def test_the_drafts_are_those_of_one_pass_over_the_sequence(make_engine, monkeyp
     assert engine.metrics.summary()["spec_decode"]["accepted_per_position"].keys() == {"0", "1"}
     for token_ids, drafts in proposed:
         assert drafts == reference_drafts(engine, token_ids, k), f"after {len(token_ids)} tokens"
+    assert sorted(graphs) == [(0, size) for size in graph_sizes or []]
+    assert all(graph.replays for graph in graphs.values())
 
 
 def test_sampled_decoding_runs_to_its_length(make_engine):

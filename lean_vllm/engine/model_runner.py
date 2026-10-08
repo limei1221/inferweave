@@ -98,8 +98,10 @@ class ModelRunner:
             register_layers(drafter)
         # Binds the MoE layers' maps, which every forward reads, and holds a layer's worth of buffer before warmup.
         self.eplb = EplbState(self.model, config.eplb) if config.eplb is not None else None
-        # Each layer chose its backend as it was built; graphs depend on all of them.
+        # Each layer chose its backend as it was built; graphs depend on all of them, the drafter's too.
         layers = [module for module in self.model.modules() if isinstance(module, Attention)]
+        if drafter is not None:
+            layers += [module for module in drafter.modules() if isinstance(module, Attention)]
         if rank == 0:
             counts = Counter(layer.backend.get_name() for layer in layers)
             logger.info("attention backends: %s", ", ".join(f"{name} ({n} layers)" for name, n in counts.items()))
@@ -156,6 +158,10 @@ class ModelRunner:
             self.kv_aggregator = KVOutputAggregator(self.world_size)
         if self.cudagraph_mode in FULL_MODES:
             self.capture_cudagraph()
+            if self.proposer is not None:
+                self.proposer.capture_cudagraphs(
+                    self.graph_bs, self._max_num_blocks(), self.graph_pool, self.attention_backends
+                )
         if self.cudagraph_mode in PIECEWISE_MODES:
             self.capture_piecewise()
         if self.eplb is not None:
@@ -174,6 +180,8 @@ class ModelRunner:
         if self.cudagraph_mode != "none":
             for piece in self.compile_backend.pieces:
                 piece.graphs.clear()
+            if self.proposer is not None:
+                self.proposer.graphs.clear()
             del self.graphs, self.graph_pool
         dev.synchronize(self.device)  # drain the device
         dist.destroy_process_group()  # drop the comms
@@ -574,6 +582,11 @@ class ModelRunner:
                 self.model(input_ids[:size], positions[:size])
             torch.cuda.synchronize()
 
+    def _max_num_blocks(self) -> int:
+        """The widest block table a step can hand a full graph: max_model_len, plus the slots the drafter writes
+        past a row's last token, which can still be held from a step whose drafts were rejected."""
+        return (self.config.max_model_len + self.num_speculative_tokens + self.block_size - 1) // self.block_size
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
@@ -581,7 +594,7 @@ class ModelRunner:
         sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
         self.graph_bs = [size for size in sizes if size <= config.max_num_seqs]  # a decode step has a row per token
         max_bs = self.graph_bs[-1]
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = self._max_num_blocks()
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)

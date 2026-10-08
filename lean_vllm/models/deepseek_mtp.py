@@ -56,6 +56,7 @@ class DeepSeekMTP(nn.Module):
 
     def __init__(self, config: PretrainedConfig, enable_expert_parallel: bool = False) -> None:
         super().__init__()
+        self.hidden_size = config.hidden_size
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
         self.layers = nn.ModuleList(
