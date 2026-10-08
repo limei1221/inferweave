@@ -280,7 +280,10 @@ rotates adjacent pairs (GPT-J style), so its rope uses `is_neox_style=False`.
   a decode with no host-side planning or expansion, which only `flashmla`
   offers. FlashMLA builds its schedule on the GPU from the context lengths, so
   one graph captured at `max_model_len` serves any shorter lengths. On other
-  backends the runner falls back to piecewise.
+  backends the runner falls back to piecewise. With MTP drafts, the graphs
+  hold rows of 1 + k queries, so a step whose rows all verify their drafts
+  replays one, as vLLM's uniform decode; a step of one-query rows goes
+  piecewise.
 - **Piecewise graphs** capture everything around attention, and attention runs
   eager between the pieces. The MoE sits inside a piece, so the Triton path
   sizes its blocks from the batch shape rather than the routing, and never

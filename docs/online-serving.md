@@ -234,6 +234,7 @@ tokens. On an H100 it cuts offline GPU idle time from 22.4% to 3.2%.
 | Step | Under `full_and_piecewise` (default) |
 | --- | --- |
 | Pure decode, up to `max_num_seqs` rows (512 at most) | One full graph |
+| With MTP drafts, every row verifying 1 + k tokens, as many rows | One full graph |
 | Prefill or mixed, up to 512 tokens | Piecewise graphs |
 | Anything else | Compiled, no graph |
 

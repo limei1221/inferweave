@@ -295,6 +295,25 @@ def test_the_drafts_are_those_of_one_pass_over_the_sequence(
     assert all(graph.replays for graph in graphs.values())
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_verify_steps_replay_the_targets_full_graphs(make_engine, monkeypatch, async_scheduling):
+    """Rows verifying 1 + k tokens each decode in the target's full graphs, padded to a captured batch size, beside
+    the drafter's own graphs; greedy decoding stays that of plain decoding."""
+    want = generate(make_engine())
+    engine = make_engine(2, async_scheduling=async_scheduling)
+    runner = engine.model_runner
+    monkeypatch.setattr(runner, "_capture", lambda run, pool: ReplayedPass(run))
+    runner.cudagraph_mode = "full"
+    try:
+        runner.capture_cudagraph()
+        capture_draft_passes(engine, monkeypatch, [4])
+        assert generate(engine) == want
+    finally:
+        runner.cudagraph_mode = "none"  # nothing was compiled for exit to clear
+    assert runner.graph_query_len == 3 and runner.graph_bs == [1, 2, 4]
+    assert runner.graphs[4].replays and sum(graph.replays for graph in runner.graphs.values()) > 4
+
+
 def test_the_compiled_first_pass_drafts_as_the_eager_one(make_engine, monkeypatch):
     """The first pass compiled piecewise, as the runner compiles it on CUDA: steps of up to 8 tokens pad to 8, up to
     32 to 32, and longer ones run compiled with no bucket. A piece runs its compiled code where CUDA would replay."""

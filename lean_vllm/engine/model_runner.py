@@ -3,6 +3,8 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
+from typing import Callable
 
 import numpy as np
 import torch
@@ -22,7 +24,7 @@ from lean_vllm.models import get_drafter_class, get_model_class
 from lean_vllm.spec_decode import RejectionSampler
 from lean_vllm.spec_decode.mtp_proposer import DraftInputs, MTPProposer
 from lean_vllm.utils import device as dev
-from lean_vllm.utils.context import get_context, set_context
+from lean_vllm.utils.context import Context, get_context, set_context, use_context
 from lean_vllm.utils.loader import load_model
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ class ModelRunner:
     eplb: EplbState | None = None  # with enable_eplb
     proposer: MTPProposer | None = None  # with a speculative_config
     num_speculative_tokens = 0
+    graph_query_len = 1  # queries per row in a full decode graph: 1, or 1 + drafts when verifying
     in_flight_drafts: InFlightDrafts | None = None  # with a speculative_config, the last launched step's
     decodes_latents = True  # every MLA layer attends its latents, so no attention reads key lengths on the host
 
@@ -81,7 +84,7 @@ class ModelRunner:
         self._prev_tokens: SampledTokens | None = None  # the step still in flight, if any
         self._prev_rows: dict[int, int] | None = None  # seq_id -> its row in those tokens
         model_cls = get_model_class(hf_config)
-        self.graph_bs: list[int] = []  # captured batch sizes, full graphs
+        self.graph_bs: list[int] = []  # captured batch sizes in rows, full graphs
         self.piecewise_bs: list[int] = []  # captured token counts, piecewise graphs
         self.graphs: dict = {}
         self.graph_pool = None  # shared by both capture kinds
@@ -178,7 +181,7 @@ class ModelRunner:
             self.capture_cudagraph()
             if self.proposer is not None:
                 self.proposer.capture_cudagraphs(
-                    self.graph_bs, self._max_num_blocks(), self.graph_pool, self.attention_backends
+                    self._decode_graph_sizes(), self._max_num_blocks(), self.graph_pool, self.attention_backends
                 )
         if self.cudagraph_mode in PIECEWISE_MODES:
             self.capture_piecewise()
@@ -333,7 +336,11 @@ class ModelRunner:
         in_flight = self.in_flight_drafts
         moved = [i for i, seq in enumerate(batch) if seq.num_pending_tokens] if in_flight is not None else []
         moved_src = [self._prev_row(batch[i]) for i in moved]
-        is_prefill = any(seq.is_prefill for seq in seqs) or bool(num_drafts.any())  # rows of several queries
+        # Rows of several queries prefill, unless every row verifies as many drafts and attends latents: then MLA
+        # decodes them whole, every token samples, and a full graph can hold the step, as vLLM's uniform decode.
+        has_prompt = any(seq.is_prefill for seq in seqs)
+        uniform = not has_prompt and self.decodes_latents and bool((lens == query_len).all())
+        is_prefill = has_prompt or (bool(num_drafts.any()) and not uniform)
         if moved and (not self.decodes_latents or (is_prefill and bool((lens[moved] != query_len).any()))):
             # Expanding latents plans keys on the host, so it waits for the step in flight: a sync.
             assert in_flight is not None
@@ -524,13 +531,14 @@ class ModelRunner:
             return "piecewise" if mode in PIECEWISE_MODES else "none"
         return mode
 
-    def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False) -> str:
-        """How this step runs: "graph", "piecewise", or why no graph covers it. num_tokens is the batch size for decode.
-        A cascade step takes no full graph, as in vLLM: the graphs hold the one-kernel decode."""
+    def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False, query_len: int = 1) -> str:
+        """How this step runs: "graph", "piecewise", or why no graph covers it. A decode step's rows each have
+        query_len tokens; the full graphs hold rows of graph_query_len. A cascade step takes no full graph, as in
+        vLLM: the graphs hold the one-kernel decode."""
         if self.cudagraph_mode == "none":
             return "enforced"
         if not is_prefill and not cascade and self.cudagraph_mode in FULL_MODES and self.graph_bs:
-            if num_tokens <= self.graph_bs[-1]:
+            if query_len == self.graph_query_len and num_tokens <= self.graph_bs[-1] * query_len:
                 return "graph"
         if self.cudagraph_mode in PIECEWISE_MODES and self._piecewise_bucket(num_tokens):
             return "piecewise"
@@ -539,7 +547,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        self.step_kind = self._step_kind(is_prefill, input_ids.size(0), get_context().common_prefix_len > 0)
+        context = get_context()
+        self.step_kind = self._step_kind(
+            is_prefill, input_ids.size(0), context.common_prefix_len > 0, context.decode_query_len
+        )
         if self.compile_backend is not None and not self.compile_backend.pieces:  # this call traces
             mark_dynamic_tokens(input_ids, positions)
         if self.eplb is not None:
@@ -555,23 +566,24 @@ class ModelRunner:
         return self.model.compute_logits(hidden_states)
 
     def _replay_full(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """One graph for the whole model. Pure decode only: attention is inside it."""
-        bs = input_ids.size(0)
+        """One graph for the whole model. Pure decode only: attention is inside it. Padding rows hold no keys."""
+        num_tokens = input_ids.size(0)
+        bs = num_tokens // self.graph_query_len
         context = get_context()
         graph_bs = next(x for x in self.graph_bs if x >= bs)
         graph = self.graphs[graph_bs]
         graph_vars = self.graph_vars
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
+        graph_vars["input_ids"][:num_tokens] = input_ids
+        graph_vars["positions"][:num_tokens] = positions
         graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
         graph_vars["context_lens"].zero_()
         graph_vars["context_lens"][:bs] = context.context_lens
         graph_vars["block_tables"][:bs, : context.block_tables.size(1)] = context.block_tables
         for backend in self.attention_backends:  # e.g. FlashInfer re-plans the graph's decode
             backend.before_full_graph_replay(context, graph_bs)
         graph.replay()
-        return graph_vars["outputs"][:bs]
+        return graph_vars["outputs"][:num_tokens]
 
     def _piecewise_bucket(self, num_tokens: int) -> int | None:
         """The bucket a step of this size replays in, or None. Shared so dispatch and replay agree."""
@@ -660,48 +672,65 @@ class ModelRunner:
         past a row's last token, which can still be held from a step whose drafts were rejected."""
         return (self.config.max_model_len + self.num_speculative_tokens + self.block_size - 1) // self.block_size
 
+    def _decode_graph_sizes(self) -> list[int]:
+        """The batch sizes, in rows, a full decode graph may take: the capture sizes up to max_num_seqs."""
+        config = self.config
+        sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
+        return [size for size in sizes if size <= config.max_num_seqs]
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        sizes = cudagraph_capture_sizes(config.max_num_seqs, config.max_num_batched_tokens)
-        self.graph_bs = [size for size in sizes if size <= config.max_num_seqs]  # a decode step has a row per token
+        # With drafts, each decode row verifies them beside its token, so a graph's rows hold 1 + drafts queries,
+        # as vLLM's uniform_decode_query_len; a step of one query per row then runs piecewise, as in vLLM.
+        q = self.graph_query_len = 1 + self.num_speculative_tokens
+        self.graph_bs = [bs for bs in self._decode_graph_sizes() if bs * q <= config.max_num_batched_tokens]
+        if not self.graph_bs:
+            return
         max_bs = self.graph_bs[-1]
         max_num_blocks = self._max_num_blocks()
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
         # FlashMLA bakes its tile schedule and split-KV workspace from context_lens at capture, so capture the
         # worst case: block 0 is valid, so a full block_tables of zeros holds max_model_len tokens per row. Every
         # replay refreshes context_lens/block_tables (see _replay_full), and the kernel gates on those lengths.
         context_lens.fill_(config.max_model_len)
-
+        self.graph_vars = dict(
+            input_ids=torch.zeros(max_bs * q, dtype=torch.int64),
+            positions=torch.zeros(max_bs * q, dtype=torch.int64),
+            slot_mapping=torch.zeros(max_bs * q, dtype=torch.int32),
+            context_lens=context_lens,
+            block_tables=torch.zeros(max_bs, max_num_blocks, dtype=torch.int32),
+            outputs=torch.zeros(max_bs * q, hf_config.hidden_size),
+        )
+        graph_vars = self.graph_vars
         for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
             with set_context(
                 False,
-                slot_mapping=slot_mapping[:bs],
+                slot_mapping=graph_vars["slot_mapping"][: bs * q],
                 context_lens=context_lens[:bs],
-                block_tables=block_tables[:bs],
+                block_tables=graph_vars["block_tables"][:bs],
                 full_graph_size=bs,
-            ):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup, which also plans FlashInfer
+            ) as context:
+                run = partial(self._full_graph_pass, context, bs * q)
+                run()  # warmup, which also plans FlashInfer
                 # The warmup scheduled MLA decode into the default pool; clear it so the capture reschedules
                 # into the graph's own pool (else the graph bakes pointers freed with this context).
-                get_context().mla_decode_metadata = None
-                with torch.cuda.graph(graph, self.graph_pool):
-                    outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
+                context.mla_decode_metadata = None
+                self.graphs[bs] = self._capture(run, self.graph_pool)
 
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )
+    def _full_graph_pass(self, context: Context, num_tokens: int) -> None:
+        """The whole model over the graph's buffers, in the context it is captured in, which the warmup's plans
+        stay in for the capture to find."""
+        graph_vars = self.graph_vars
+        with use_context(context):
+            input_ids, positions = graph_vars["input_ids"][:num_tokens], graph_vars["positions"][:num_tokens]
+            graph_vars["outputs"][:num_tokens] = self.model(input_ids, positions)
+
+    @staticmethod
+    def _capture(run: Callable[[], None], pool) -> torch.cuda.CUDAGraph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool):
+            run()
+        torch.cuda.synchronize()
+        return graph

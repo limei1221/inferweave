@@ -89,10 +89,17 @@ def get_context():
 @contextmanager
 def set_context(is_prefill: bool, **kwargs):
     """The context for one forward pass; the previous one comes back on exit, even on error."""
+    with use_context(Context(is_prefill, **kwargs)) as context:
+        yield context
+
+
+@contextmanager
+def use_context(context: Context):
+    """An existing context for a pass, as set_context's, so a pass can run again in the context it was captured in."""
     global _CONTEXT
-    previous, _CONTEXT = _CONTEXT, Context(is_prefill, **kwargs)
+    previous, _CONTEXT = _CONTEXT, context
     try:
-        yield _CONTEXT
+        yield context
     finally:
         _CONTEXT = previous
 

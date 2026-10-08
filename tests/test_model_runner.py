@@ -172,6 +172,30 @@ def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner
     assert runner._sampling_rows == [prompt, decoding]
 
 
+@pytest.mark.parametrize("decodes_latents", [True, False], ids=["latents", "expanded"])
+def test_rows_verifying_as_many_drafts_decode_whole_when_latents_are_attended(runner, decodes_latents):
+    """As vLLM's uniform decode: MLA decodes them in one call, every token samples, and a full graph can hold them.
+    A backend that expands latents prefills them, and rows of other lengths split."""
+    runner.num_speculative_tokens = 2
+    runner.decodes_latents = decodes_latents
+    rows = []
+    for i in range(2):
+        seq = Sequence([10 + i, 20 + i])
+        seq.append_token(30 + i)
+        seq.num_cached_tokens, seq.num_scheduled_tokens, seq.is_prefill = 2, 3, False
+        seq.spec_token_ids = [40 + i, 50 + i]
+        seq.block_table = [i]
+        rows.append(seq)
+
+    _, _, _, context = runner.prepare_batch(rows)
+    assert context["is_prefill"] is not decodes_latents
+    assert (context["logits_indices"] is None) is decodes_latents
+
+    rows[1].spec_token_ids, rows[1].num_scheduled_tokens = [41], 2
+    _, _, _, context = runner.prepare_batch(rows)
+    assert context["is_prefill"]
+
+
 class CascadeLayer:
     """Stands in for a layer: records what it was asked and answers as told."""
 
@@ -275,6 +299,17 @@ class TestStepKind:
 
     def test_a_small_decode_batch_replays_a_full_graph(self, runner):
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "graph"
+
+    def test_a_verify_step_replays_the_graph_of_its_rows(self, runner):
+        """With 2 drafts a graph's rows hold 3 queries each, so the graph of 16 rows holds 48 tokens."""
+        runner.graph_query_len = 3
+        assert runner._step_kind(is_prefill=False, num_tokens=48, query_len=3) == "graph"
+        assert runner._step_kind(is_prefill=False, num_tokens=51, query_len=3) == "decode"
+
+    def test_one_query_rows_skip_graphs_of_verifying_rows(self, runner):
+        """As vLLM's: the full graphs hold the uniform 1 + drafts decode alone."""
+        runner.graph_query_len = 3
+        assert runner._step_kind(is_prefill=False, num_tokens=8) == "decode"
 
     def test_a_cascade_decode_skips_the_full_graph(self, runner):
         """The full graphs hold one-kernel decode, so a cascade step falls back, as vLLM's dispatcher does."""

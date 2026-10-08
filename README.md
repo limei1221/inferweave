@@ -89,7 +89,9 @@ placeholders the device fills, and the device moves it back past those
 rejected; only a row that expands latents (FA3) waits for the counts. Its
 first pass, over the step's batch, is compiled piecewise and replays the
 target's piecewise buckets, as vLLM's drafter; the single-token passes after it
-replay full CUDA graphs whenever the target captures its own.
+replay full CUDA graphs whenever the target captures its own. A step whose
+rows all verify their drafts replays the target's full graphs, which hold
+1 + k queries per row, as vLLM's uniform decode.
 `/metrics` reports drafts, draft tokens and accepted tokens, by position too.
 
 ## Serving
