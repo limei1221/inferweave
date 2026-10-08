@@ -339,8 +339,9 @@ class DeepseekV2ForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
+        all_gather: bool = False,
     ) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states, all_gather)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

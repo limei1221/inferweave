@@ -59,7 +59,7 @@ class MTPProposer:
         self,
         drafter: DeepSeekMTP,
         embed_tokens: Callable[[torch.Tensor], torch.Tensor],
-        compute_logits: Callable[[torch.Tensor], torch.Tensor | None],
+        compute_logits: Callable[..., torch.Tensor | None],
         num_speculative_tokens: int,
         block_size: int,
         max_model_len: int,
@@ -86,13 +86,11 @@ class MTPProposer:
         return tensor
 
     def _draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Greedy drafts, as vLLM's MTP drafts; rejection sampling then needs no draft probabilities."""
-        logits = self.compute_logits(hidden_states)  # gathered on rank 0 only
-        if logits is not None:
-            tokens = logits.argmax(dim=-1)
-        else:
-            tokens = torch.empty(hidden_states.size(0), dtype=torch.int64, device=hidden_states.device)
-        return self.broadcast(tokens)
+        """Greedy drafts, as vLLM's MTP drafts; rejection sampling then needs no draft probabilities. Every rank
+        gathers the logits and takes the argmax itself, as vLLM's default, so no rank waits on another's tokens."""
+        logits = self.compute_logits(hidden_states, all_gather=True)
+        assert logits is not None
+        return logits.argmax(dim=-1)
 
     @torch.inference_mode()
     def propose(
