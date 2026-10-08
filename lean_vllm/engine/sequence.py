@@ -1,10 +1,11 @@
 import hashlib
 import pickle
-import xxhash
 from copy import copy
 from enum import Enum, auto
 from itertools import count
 from time import perf_counter
+
+import xxhash
 
 from lean_vllm.engine.output import RequestMetrics
 from lean_vllm.sampling_params import SamplingParams
@@ -30,6 +31,7 @@ HASH_ALGOS = {"sha256": sha256_hash, "xxhash": xxhash_hash}
 
 class SequenceStatus(Enum):
     WAITING = auto()
+    WAITING_FOR_REMOTE_KVS = auto()  # admitted, its blocks loading from a prefill instance
     RUNNING = auto()
     FINISHED = auto()
 
@@ -41,7 +43,10 @@ class Sequence:
     hash_algo = "sha256"
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams(), request_id: str | None = None):
+    def __init__(
+        self, token_ids: list[int], sampling_params: SamplingParams | None = None, request_id: str | None = None
+    ):
+        sampling_params = sampling_params or SamplingParams()
         self.seq_id = next(Sequence.counter)
         self.request_id = request_id if request_id is not None else f"req-{self.seq_id}"
         self.status = SequenceStatus.WAITING
@@ -50,18 +55,24 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.num_pending_tokens = 0    # reserved by a launched step, not yet sampled here
-        self.num_published_blocks = 0    # blocks already in the prefix cache
+        self.num_pending_tokens = 0  # reserved by a launched step, not yet sampled here
+        self.num_published_blocks = 0  # blocks already in the prefix cache
         self.num_scheduled_tokens = 0
+        self.num_new_tokens = 0  # committed by the last reconcile, which the step's output carries
+        self.spec_token_ids: list[int] = []  # drafts for the next step to verify
         self.is_prefill = True
-        self.block_table = []
-        self.block_hashes: list[int] = []    # chained, one per full block, filled on demand
+        self.block_table: list[int] = []
+        self.block_hashes: list[int] = []  # chained, one per full block, filled on demand
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_token_ids = sampling_params.stop_token_ids
         self.skip_special_tokens = sampling_params.skip_special_tokens
         self.priority = sampling_params.priority
+        # Copied, as the connector marks it and generate() shares one SamplingParams across prompts.
+        params = sampling_params.kv_transfer_params
+        self.kv_transfer_params: dict | None = dict(params) if params is not None else None
+        self.kv_transfer_result: dict | None = None  # what the connector hands back on finishing
         self.finish_reason: str | None = None
         self.num_preemptions = 0
         self.arrival_time = perf_counter()
@@ -102,11 +113,11 @@ class Sequence:
 
     @property
     def prompt_token_ids(self):
-        return self.token_ids[:self.num_prompt_tokens]
+        return self.token_ids[: self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
-        return self.token_ids[self.num_prompt_tokens:]
+        return self.token_ids[self.num_prompt_tokens :]
 
     @property
     def num_blocks(self):
@@ -114,13 +125,10 @@ class Sequence:
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
-        return self.token_ids[i*self.block_size: (i+1)*self.block_size]
+        return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
 
     def _extend_block_hashes(self):
-        """Hash every block that has just become full, chaining on the one before.
-
-        A full block's hash is final, so it is computed once rather than on every cache lookup.
-        """
+        """Hash every block that has just become full, chaining on the one before. Computed once, as it is final."""
         if not self.enable_prefix_caching:
             return
         algo = HASH_ALGOS[self.hash_algo]
@@ -128,9 +136,9 @@ class Sequence:
             prefix = self.block_hashes[-1] if self.block_hashes else -1
             self.block_hashes.append(algo(tuple(self.block(i)), prefix))
 
-    def reserve_token(self):
-        """A launched step will sample here; the value is not known yet."""
-        self.num_pending_tokens += 1
+    def reserve_token(self, num_tokens: int = 1):
+        """A launched step will sample here, or keep drafts here; the values are not known yet."""
+        self.num_pending_tokens += num_tokens
 
     def commit_token(self, token_id: int):
         assert self.num_pending_tokens, "commit_token without a reservation"
@@ -150,10 +158,30 @@ class Sequence:
 
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_pending_tokens, self.is_prefill, self.block_table, last_state)
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.num_pending_tokens,
+            self.is_prefill,
+            self.block_table,
+            self.spec_token_ids,
+            last_state,
+        )
 
     def __setstate__(self, state):
-        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.num_pending_tokens, self.is_prefill, self.block_table, last_state) = state
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_scheduled_tokens,
+            self.num_pending_tokens,
+            self.is_prefill,
+            self.block_table,
+            self.spec_token_ids,
+            last_state,
+        ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

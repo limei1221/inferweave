@@ -26,7 +26,6 @@ def cache(manager: BlockManager, token_ids: list[int]) -> list[int]:
 
 
 class TestFreeQueue:
-
     def test_taking_a_block_out_of_the_middle_leaves_the_order_alone(self):
         """A prefix hit takes its blocks back from wherever they sit."""
         queue = FreeBlockQueue(range(5))
@@ -38,9 +37,8 @@ class TestFreeQueue:
 
 
 class TestEvictionOrder:
-
     def test_blocks_that_cache_nothing_are_spent_first(self, manager):
-        cache(manager, list(range(12)))    # blocks 0, 1 and 2, then released
+        cache(manager, list(range(12)))  # blocks 0, 1 and 2, then released
         assert list(manager.free_block_ids) == [3, 4, 5, 2, 1, 0]
 
     def test_a_sequence_gives_up_its_deepest_block_first(self, manager):
@@ -60,7 +58,6 @@ class TestEvictionOrder:
 
 
 class TestPublishBound:
-
     def test_it_publishes_only_blocks_whose_kv_is_computed(self, manager):
         """A chunked prefill has tokens the step has not run yet."""
         seq = Sequence(list(range(12)), SamplingParams())
@@ -76,7 +73,7 @@ class TestPublishBound:
         manager.allocate(seq, manager.can_allocate(seq))
         seq.reserve_token()
         manager.hash_blocks(seq, num_computed_tokens=5)
-        assert len(manager.hash_to_block_id) == 1    # block 0 is whole; there is no block 1 yet
+        assert len(manager.hash_to_block_id) == 1  # block 0 is whole; there is no block 1 yet
 
     def test_publishing_twice_publishes_each_block_once(self, manager):
         seq = Sequence(list(range(8)), SamplingParams())

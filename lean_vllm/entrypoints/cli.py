@@ -1,15 +1,12 @@
-"""`lean-vllm serve <model>`.
-
-Engine flags are generated from `Config`, since `LLMEngine.__init__` drops any other kwarg.
-"""
+"""`lean-vllm serve <model>`, with engine flags generated from `Config`."""
 
 import argparse
 from dataclasses import MISSING, fields
 
 from lean_vllm.config import Config
 
-# Not flags: the positional and what the tokenizer decides.
-INTERNAL = {"model", "hf_config", "eos"}
+# Not flags: the positional, and what the engine reads from the checkpoint.
+INTERNAL = {"model", "hf_config", "eos", "kv_transfer", "speculative"}
 
 
 def add_engine_args(parser: argparse.ArgumentParser):
@@ -17,7 +14,7 @@ def add_engine_args(parser: argparse.ArgumentParser):
     for field in fields(Config):
         default = field.default
         if field.name in INTERNAL or default is MISSING or default is None:
-            continue    # no default to take a type from
+            continue  # no default to take a type from
         flag = "--" + field.name.replace("_", "-")
         if isinstance(default, bool):
             group.add_argument(flag, action=argparse.BooleanOptionalAction, default=default)
@@ -35,9 +32,25 @@ def main(argv: list[str] | None = None):
     serve.add_argument("--served-model-name", default=None, help="the id reported by /v1/models")
     serve.add_argument("--log-level", default="info")
     add_engine_args(serve)
+    proxy = subparsers.add_parser("proxy", help="split each request between prefill and decode servers")
+    proxy.add_argument("--prefill", nargs="+", required=True, help="prefill server URLs, kv_role producer or both")
+    proxy.add_argument("--decode", nargs="+", required=True, help="decode server URLs, kv_role consumer or both")
+    proxy.add_argument("--host", default="127.0.0.1")
+    proxy.add_argument("--port", type=int, default=8000)
+    proxy.add_argument("--log-level", default="info")
     args = parser.parse_args(argv)
 
-    from lean_vllm.entrypoints.server import run    # imports fastapi, which is the `serve` extra
+    if args.command == "proxy":
+        import uvicorn
+
+        from lean_vllm.entrypoints.disagg_proxy import build_proxy_app
+
+        uvicorn.run(
+            build_proxy_app(args.prefill, args.decode), host=args.host, port=args.port, log_level=args.log_level
+        )
+        return
+
+    from lean_vllm.entrypoints.server import run  # imports fastapi, which is the `serve` extra
 
     engine_kwargs = {
         field.name: getattr(args, field.name)

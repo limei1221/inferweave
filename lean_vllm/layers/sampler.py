@@ -3,13 +3,12 @@ from torch import nn
 
 
 class Sampler(nn.Module):
-
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor | None):
         if temperatures is None:
             return logits.argmax(dim=-1)
         return self.sample(logits, temperatures)
 
-    @torch.compile
+    @torch.compile(dynamic=True)  # warmup's batch size is not serving's, so never recompile per size
     def sample(self, logits: torch.Tensor, temperatures: torch.Tensor):
         logits = logits.float()
         greedy_tokens = logits.argmax(dim=-1)

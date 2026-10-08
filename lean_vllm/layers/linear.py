@@ -1,7 +1,7 @@
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
 
 
 def divide(numerator, denominator):
@@ -10,7 +10,6 @@ def divide(numerator, denominator):
 
 
 class LinearBase(nn.Module):
-
     def __init__(
         self,
         input_size: int,
@@ -23,10 +22,10 @@ class LinearBase(nn.Module):
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
-        self.weight.weight_loader = self.weight_loader
+        self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
-            self.bias.weight_loader = self.weight_loader
+            self.bias.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         else:
             self.register_parameter("bias", None)
 
@@ -35,7 +34,6 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
     def __init__(
         self,
         input_size: int,
@@ -51,7 +49,23 @@ class ReplicatedLinear(LinearBase):
         return F.linear(x, self.weight, self.bias)
 
 
+class MergedReplicatedLinear(ReplicatedLinear):
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = False,
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(input_size, sum(output_sizes), bias)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):  # type: ignore[override]
+        shard_offset = sum(self.output_sizes[:loaded_shard_id])
+        param.data.narrow(0, shard_offset, self.output_sizes[loaded_shard_id]).copy_(loaded_weight)
+
+
 class ColumnParallelLinear(LinearBase):
+    tp_dim: int
 
     def __init__(
         self,
@@ -74,7 +88,6 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
-
     def __init__(
         self,
         input_size: int,
@@ -84,7 +97,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):  # type: ignore[override]
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -94,7 +107,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-
     def __init__(
         self,
         hidden_size: int,
@@ -111,7 +123,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):  # type: ignore[override]
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]
         if loaded_shard_id == "q":
@@ -129,6 +141,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
+    tp_dim: int
 
     def __init__(
         self,

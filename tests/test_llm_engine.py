@@ -14,7 +14,6 @@ def check(prompt: list[int], max_tokens: int = 1):
 
 
 class TestPromptValidation:
-
     @pytest.mark.parametrize("token_id", [VOCAB, VOCAB + 1, -1])
     def test_a_token_outside_the_vocabulary_is_refused(self, token_id):
         """Otherwise the embedding lookup raises, and that kills the engine thread."""
@@ -25,8 +24,8 @@ class TestPromptValidation:
         with pytest.raises(InvalidRequest, match="empty"):
             check([])
 
-    def test_a_prompt_over_the_context_is_refused(self):
-        with pytest.raises(InvalidRequest, match="over the 16-token context"):
+    def test_a_prompt_that_fills_the_context_is_refused(self):
+        with pytest.raises(InvalidRequest, match="no room in the 16-token context"):
             check(list(range(CONTEXT)))
 
     def test_max_tokens_that_overruns_the_context_is_refused(self):

@@ -51,11 +51,8 @@ def test_two_requests_finish_with_the_tokens_the_runner_sampled(make_engine):
 
 
 class TestAsyncScheduling:
-
     def test_the_flag_launches_before_the_last_step_is_reconciled(self, make_engine):
-        """Stopping on EOS costs one extra launched step, scheduled before the stop is known.
-
-        A pending count cannot show it, so count launched batches."""
+        """Stopping on EOS costs one extra launched step, scheduled before the stop is known."""
         runs = {}
         for async_scheduling in (False, True):
             engine = make_engine(eos_after={"r": 2}, async_scheduling=async_scheduling)
@@ -65,8 +62,8 @@ class TestAsyncScheduling:
 
         sync_batches, sync_tokens = runs[False]
         async_batches, async_tokens = runs[True]
-        assert async_tokens == sync_tokens          # the extra token is never emitted
-        assert async_batches == sync_batches + 1    # but it was computed
+        assert async_tokens == sync_tokens  # the extra token is never emitted
+        assert async_batches == sync_batches + 1  # but it was computed
 
     def test_the_flag_does_not_change_what_a_request_receives(self, make_engine):
         """The extra token is never emitted, so text and finish reasons match."""
@@ -109,7 +106,7 @@ class TestAsyncScheduling:
             for i in range(3):
                 engine.add(list(range(24)), params, request_id=f"r{i}")
                 engine.run_to_completion()
-            rates.append(engine.metrics.summary()["prefix_cache_hit_rate"])
+            rates.append((engine.metrics.prefix_cache_hits.total, engine.metrics.prefix_cache_queries.total))
         assert rates[0] == rates[1]
 
 
@@ -131,7 +128,7 @@ def test_a_capacity_drop_after_a_token_finishes_once(make_engine, async_scheduli
     while not engine.is_finished():
         finals += [output for output in engine.step() if output.finished]
     assert [output.finish_reason for output in finals] == ["capacity"]
-    assert engine.metrics.summary()["requests"]["finished"] == {"capacity": 1}
+    assert engine.metrics.requests_finished.values == {"capacity": 1}
     assert seq.num_completion_tokens == 2
 
 
@@ -140,6 +137,6 @@ def test_the_first_token_is_timed_when_it_is_read_back(make_engine, async_schedu
     engine = make_engine(async_scheduling=async_scheduling)
     seq = engine.add([10, 11, 12], FOREVER)
     engine.step()
-    assert seq.first_token_time is None    # sampled, not yet read back
+    assert seq.first_token_time is None  # sampled, not yet read back
     engine.step()
     assert seq.first_token_time is not None

@@ -2,11 +2,7 @@ import torch
 
 
 class SampledTokens:
-    """One launched step's sampled tokens, fetched without awaiting later steps.
-
-    tolist() would wait on the default stream, including the next launched step,
-    so the copy runs on its own stream and the wait is on its event.
-    """
+    """One launched step's sampled tokens, copied on a side stream so the fetch never waits on later steps."""
 
     _copy_stream: torch.cuda.Stream | None = None
 
@@ -17,7 +13,7 @@ class SampledTokens:
         return cls._copy_stream
 
     def __init__(self, tokens: torch.Tensor, device: torch.device):
-        self._tokens: list[int] | None = None
+        self._tokens: list | None = None
         if device.type != "cuda":
             self._device_tokens = tokens
             self._event = None
@@ -36,7 +32,8 @@ class SampledTokens:
         """The tensor itself, for filling the next step's inputs without a host round trip."""
         return self._device_tokens
 
-    def tolist(self) -> list[int]:
+    def tolist(self) -> list:
+        """One token per row, or, from a speculative step, one list per row (see spec_decode.split_sampled)."""
         if self._tokens is None:
             if self._event is None:
                 self._tokens = self._device_tokens.tolist()

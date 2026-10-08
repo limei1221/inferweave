@@ -4,6 +4,7 @@ from dataclasses import dataclass
 @dataclass(slots=True)
 class RequestMetrics:
     """Timestamps are perf_counter seconds. Anything not reached yet is None."""
+
     arrival_time: float
     num_prompt_tokens: int
     num_completion_tokens: int = 0
@@ -35,9 +36,11 @@ class RequestMetrics:
 @dataclass(slots=True)
 class RequestOutput:
     """What one request produced in one step."""
+
     request_id: str
     token_ids: list[int]
     text: str = ""
     finished: bool = False
     finish_reason: str | None = None
     metrics: RequestMetrics | None = None
+    kv_transfer_params: dict | None = None  # on a prefill instance's final output: where the decode pulls from

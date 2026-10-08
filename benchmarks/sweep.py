@@ -1,13 +1,9 @@
-r"""Runs `bench_serving` across arms and rates, restarting the server per run.
+r"""Runs `bench_serving` across arms and rates, with a fresh server per run.
 
     uv run python benchmarks/sweep.py --model ~/workspace/huggingface/Qwen3-8B \
         --suite rate --rates 1,2,4,8,16 --kvcache-tokens 131072 --out results/8b
 
-An arm is one server configuration. A fresh server per run keeps each run's
-`/metrics.json` and block pool its own. Runs go one at a time, since
-`init_process_group` binds a fixed port.
-
-Pin `--kvcache-tokens`: otherwise the profiled cache size moves with the token budget.
+Pin `--kvcache-tokens`, or the profiled cache size moves with the token budget.
 """
 
 import argparse
@@ -22,7 +18,7 @@ from pathlib import Path
 
 import httpx
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))    # scripts, not a package
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts, not a package
 
 import bench_serving as bench
 
@@ -41,10 +37,7 @@ def rate_suite(args) -> list[Arm]:
 
 
 def chunked_suite(args) -> list[Arm]:
-    """Chunking on and off, each eager and with graphs.
-
-    Chunking changes which steps graphs cover, so the eager pair isolates scheduling.
-    """
+    """Chunking on and off, each eager and with graphs; the eager pair isolates scheduling."""
     return [
         Arm(f"chunked={chunked}-eager={eager}", {"enable-chunked-prefill": chunked, "enforce-eager": eager})
         for chunked in (True, False)
@@ -105,8 +98,7 @@ def cache_flags(args) -> dict:
     lean = args.engine == "lean-vllm"
     flags = {"kvcache-block-size" if lean else "block-size": BLOCK_SIZE}
     if args.kvcache_tokens:
-        flags["num-kvcache-blocks" if lean else "num-gpu-blocks-override"] = \
-            args.kvcache_tokens // BLOCK_SIZE
+        flags["num-kvcache-blocks" if lean else "num-gpu-blocks-override"] = args.kvcache_tokens // BLOCK_SIZE
     return flags
 
 
@@ -170,17 +162,23 @@ class Server:
 
 def client_args(args, arm: Arm, rate: float):
     argv = [
-        "--base-url", f"http://{args.host}:{args.port}/v1",
-        "--model", args.model,
-        "--request-rate", str(rate),
-        "--num-requests", str(args.num_requests),
-        "--max-model-len", str(args.max_model_len),
-        "--seed", str(args.seed),
+        "--base-url",
+        f"http://{args.host}:{args.port}/v1",
+        "--model",
+        args.model,
+        "--request-rate",
+        str(rate),
+        "--num-requests",
+        str(args.num_requests),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--seed",
+        str(args.seed),
         "--quiet",
     ]
     for name, value in arm.client.items():
         argv += [f"--{name}", str(value)]
-    return bench.parse_args(argv + args.client_args)    # the operator's flags win
+    return bench.parse_args(argv + args.client_args)  # the operator's flags win
 
 
 def utc_now() -> str:
@@ -189,7 +187,7 @@ def utc_now() -> str:
 
 def row(arm: Arm, rate: float, result: dict) -> dict:
     summary = result["summary"]
-    server = result["server"]["after"] or {}
+    server = result["server"]["run"]
 
     def at(name, key):
         return (summary[name] or {}).get(key)
@@ -198,7 +196,6 @@ def row(arm: Arm, rate: float, result: dict) -> dict:
         "arm": arm.name,
         "request_rate": rate,
         "completed": summary["completed"],
-        "rejection_rate": summary["rejection_rate"],
         "failure_rate": summary["failure_rate"],
         "goodput": summary["goodput_requests_per_second"],
         "output_tok_s": summary["output_token_throughput"],
@@ -217,11 +214,17 @@ def row(arm: Arm, rate: float, result: dict) -> dict:
 
 # (key, heading, format)
 COLUMNS = [
-    ("arm", "arm", "s"), ("request_rate", "rate", ".1f"), ("completed", "done", "d"),
-    ("rejection_rate", "rejected", ".1%"), ("goodput", "goodput", ".2f"),
-    ("output_tok_s", "tok/s", ".0f"), ("ttft_p50", "ttft_p50", ".3f"),
-    ("ttft_p99", "ttft_p99", ".3f"), ("tpot_p50", "tpot_p50", ".4f"),
-    ("e2e_p99", "e2e_p99", ".3f"), ("model_busy_fraction", "busy", ".2f"),
+    ("arm", "arm", "s"),
+    ("request_rate", "rate", ".1f"),
+    ("completed", "done", "d"),
+    ("failure_rate", "failed", ".1%"),
+    ("goodput", "goodput", ".2f"),
+    ("output_tok_s", "tok/s", ".0f"),
+    ("ttft_p50", "ttft_p50", ".3f"),
+    ("ttft_p99", "ttft_p99", ".3f"),
+    ("tpot_p50", "tpot_p50", ".4f"),
+    ("e2e_p99", "e2e_p99", ".3f"),
+    ("model_busy_fraction", "busy", ".2f"),
     ("preemptions", "preempt", "d"),
 ]
 
@@ -257,8 +260,12 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--budgets", default="512,2048,8192", help="--suite budget: max_num_batched_tokens values")
     parser.add_argument("--num-requests", type=int, default=300)
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--kvcache-tokens", type=int, default=0,
-                        help="KV cache capacity in tokens, converted to each engine's blocks; 0 profiles")
+    parser.add_argument(
+        "--kvcache-tokens",
+        type=int,
+        default=0,
+        help="KV cache capacity in tokens, converted to each engine's blocks; 0 profiles",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -293,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         for rate in args.rates:
             stem = f"{arm.name}-rate{rate:g}"
             with Server(args, arm, out / f"{stem}.server.log"):
-                started_at = utc_now()    # the client run's wall-clock bounds, for the GPU log
+                started_at = utc_now()  # the client run's wall-clock bounds, for the GPU log
                 result = bench.run(client_args(args, arm, rate))
                 result["started_at"], result["finished_at"] = started_at, utc_now()
             (out / f"{stem}.json").write_text(json.dumps(result, indent=2))

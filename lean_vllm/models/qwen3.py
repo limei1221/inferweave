@@ -1,18 +1,17 @@
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 from transformers import Qwen3Config
 
 from lean_vllm.layers.activation import SiluAndMul
 from lean_vllm.layers.attention import Attention
+from lean_vllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from lean_vllm.layers.layernorm import RMSNorm
-from lean_vllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from lean_vllm.layers.rotary_embedding import get_rope
-from lean_vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from lean_vllm.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from lean_vllm.layers.rotary_embedding import get_rope, rope_config
 
 
 class Qwen3Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -36,7 +35,7 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
@@ -51,13 +50,12 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.attn = Attention(
             self.num_heads,
@@ -65,6 +63,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
+        # Qwen3 has q/k norms and no qkv bias, Qwen2 the reverse, so the one flag picks both.
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -85,13 +84,12 @@ class Qwen3Attention(nn.Module):
             k = self.k_norm(k)
         return self.rotary_emb(positions, q, k) + (v,)
 
-    def combine(self, o: torch.Tensor) -> torch.Tensor:
+    def combine(self, attn_output: torch.Tensor) -> torch.Tensor:
         """From attention's output back to the residual stream."""
-        return self.o_proj(o.flatten(1, -1))
+        return self.o_proj(attn_output.flatten(1))
 
 
 class Qwen3MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -120,22 +118,22 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        rope_theta, rope_scaling = rope_config(config)
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=config.num_key_value_heads,  # type: ignore[arg-type]
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            qkv_bias=getattr(config, "attention_bias", True),
+            head_dim=getattr(config, "head_dim", None),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -179,7 +177,6 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-
     def __init__(
         self,
         config: Qwen3Config,
@@ -203,6 +200,8 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    supports_cuda_graph = True
+    supports_expert_parallel = False  # dense: no experts to place
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -211,10 +210,7 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(
-        self,
-        config: Qwen3Config
-    ) -> None:
+    def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)

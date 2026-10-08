@@ -3,12 +3,8 @@ r"""Open-loop serving benchmark: Poisson arrivals against lean-vLLM or vLLM.
     uv run python benchmarks/bench_serving.py --model ~/workspace/huggingface/Qwen3-8B \
         --dataset lognormal --num-requests 500 --request-rate 8
 
-Open loop: requests go out on schedule whatever is outstanding. A 429 is never
-retried, and percentiles cover completed requests only, so every table shows the
-rejection rate beside them. Other failures are bugs and abort the run past a threshold.
-
+No request is retried, and percentiles cover completed requests only, so tables show the failure rate too.
 Prompts are token ids on `/v1/completions`, so no chat template skews the counts.
-Only `ignore_eos` and `priority` go outside the OpenAI schema; both engines accept them.
 """
 
 import argparse
@@ -21,10 +17,10 @@ from dataclasses import asdict, dataclass, field
 from time import perf_counter
 
 import httpx
-import openai
+import numpy as np
 from openai import AsyncOpenAI
 
-QUANTILES = (0.5, 0.9, 0.95, 0.99)
+PERCENTILES = (50, 90, 95, 99)
 
 
 @dataclass
@@ -46,8 +42,8 @@ class Result:
     priority: int
     prompt_len: int
     requested_output_len: int
-    arrival: float           # seconds after the first send
-    status: str              # ok | rejected | failed
+    arrival: float  # seconds after the first send
+    status: str  # ok | failed
     output_len: int = 0
     ttft: float | None = None
     latency: float | None = None
@@ -76,10 +72,7 @@ def _lognormal(rng: random.Random, median: int, sigma: float, low: int, high: in
 
 def fixed_trace(rng: random.Random, args) -> list[Request]:
     """Every request the same shape: the cleanest read on a scheduling change."""
-    return [
-        Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len)
-        for _ in range(args.num_requests)
-    ]
+    return [Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len) for _ in range(args.num_requests)]
 
 
 def lognormal_trace(rng: random.Random, args) -> list[Request]:
@@ -93,16 +86,15 @@ def lognormal_trace(rng: random.Random, args) -> list[Request]:
 
 
 def mixed_trace(rng: random.Random, args) -> list[Request]:
-    """Short prompts beside long ones; read the `short` label's TTFT.
-
-    `--long-priority 1` takes effect only under `--scheduling-policy priority`.
-    """
+    """Short prompts beside long ones; read the `short` label's TTFT."""
     trace = []
     for _ in range(args.num_requests):
         if rng.random() < args.long_fraction:
             request = Request(
                 _prompt(rng, args.long_input_len, args.vocab_size),
-                args.long_output_len, args.long_priority, "long",
+                args.long_output_len,
+                args.long_priority,
+                "long",
             )
         else:
             request = Request(_prompt(rng, args.input_len, args.vocab_size), args.output_len, 0, "short")
@@ -208,9 +200,13 @@ class Run:
 
 async def one_request(api: AsyncOpenAI, args, index: int, request: Request, t0: float, run: Run) -> Result:
     result = Result(
-        index=index, label=request.label, priority=request.priority,
-        prompt_len=request.prompt_len, requested_output_len=request.output_len,
-        arrival=perf_counter() - t0, status="failed",
+        index=index,
+        label=request.label,
+        priority=request.priority,
+        prompt_len=request.prompt_len,
+        requested_output_len=request.output_len,
+        arrival=perf_counter() - t0,
+        status="failed",
     )
     send = last = perf_counter()
     try:
@@ -237,10 +233,6 @@ async def one_request(api: AsyncOpenAI, args, index: int, request: Request, t0: 
                     result.itls.append(now - last)
                 last = now
                 result.latency = now - send
-    except openai.RateLimitError as error:
-        result.status = "rejected"
-        result.error = str(error)
-        return run.finish(result)
     except Exception as error:
         # Anything else fails, including an error sent in the stream after a 200.
         result.error = f"{type(error).__name__}: {error}"
@@ -254,7 +246,9 @@ async def one_request(api: AsyncOpenAI, args, index: int, request: Request, t0: 
     return run.finish(result)
 
 
-async def run_trace(api: AsyncOpenAI, args, trace: list[Request], offsets: list[float]) -> tuple[list[Result], Run, float]:
+async def run_trace(
+    api: AsyncOpenAI, args, trace: list[Request], offsets: list[float]
+) -> tuple[list[Result], Run, float]:
     run = Run(len(trace), args.max_failure_rate, args.quiet)
     tasks: list[asyncio.Task] = []
     t0 = perf_counter()
@@ -294,45 +288,62 @@ async def resolve_model_name(api: AsyncOpenAI, args) -> str:
     try:
         return (await api.models.list()).data[0].id
     except Exception as error:
-        raise SystemExit(f"could not read /v1/models ({error}); pass --model-name")
+        raise SystemExit(f"could not read /v1/models ({error}); pass --model-name") from None
 
 
-async def server_summary(http: httpx.AsyncClient, base_url: str) -> dict | None:
-    """lean-vLLM's `/metrics.json`, or None on vLLM, which has no such endpoint."""
-    url = base_url.rstrip("/").removesuffix("/v1") + "/metrics.json"
+async def server_metrics(http: httpx.AsyncClient, base_url: str) -> dict[str, float] | None:
+    """The server's Prometheus `/metrics`, as {"name{labels}": value}, or None if it has none."""
+    url = base_url.rstrip("/").removesuffix("/v1") + "/metrics"
     try:
         response = await http.get(url)
-        return response.json() if response.status_code == 200 else None
     except Exception:
         return None
+    if response.status_code != 200:
+        return None
+    samples = {}
+    for line in response.text.splitlines():
+        if line and not line.startswith("#"):
+            name, _, value = line.rpartition(" ")
+            samples[name] = float(value)
+    return samples
+
+
+def server_run_stats(before: dict | None, after: dict | None, duration: float) -> dict:
+    """What lean-vLLM's counters moved by during the run; None where a sample is missing, as on vLLM."""
+
+    def delta(name: str) -> float | None:
+        if before is None or after is None or name not in after:
+            return None
+        return after[name] - before.get(name, 0.0)
+
+    busy = delta("lean_vllm:model_busy_seconds_total")
+    tokens, steps = delta("lean_vllm:iteration_tokens_total_sum"), delta("lean_vllm:iteration_tokens_total_count")
+    preemptions = delta("lean_vllm:num_preemptions_total")
+    return {
+        # Fraction of the run's wall clock in a forward pass; nvidia-smi's figure reads higher.
+        "model_busy_fraction": busy / duration if busy is not None and duration else None,
+        "mean_batch_tokens": tokens / steps if tokens is not None and steps else None,
+        "preemptions": int(preemptions) if preemptions is not None else None,
+    }
 
 
 # ---------------------------------------------------------------- reporting
 
 
-def percentile(values: list[float], quantile: float) -> float:
-    position = (len(values) - 1) * quantile
-    low, high = math.floor(position), math.ceil(position)
-    if low == high:
-        return values[low]
-    return values[low] + (values[high] - values[low]) * (position - low)
-
-
 def distribution(values) -> dict | None:
-    values = sorted(value for value in values if value is not None)
+    values = [value for value in values if value is not None]
     if not values:
         return None
     return {
         "count": len(values),
-        "mean": sum(values) / len(values),
-        **{f"p{quantile * 100:g}": percentile(values, quantile) for quantile in QUANTILES},
-        "max": values[-1],
+        "mean": float(np.mean(values)),
+        **{f"p{p}": float(value) for p, value in zip(PERCENTILES, np.percentile(values, PERCENTILES))},
+        "max": max(values),
     }
 
 
 def summarize(results: list[Result], duration: float, split_labels: bool = True) -> dict:
     completed = [result for result in results if result.status == "ok"]
-    rejected = sum(result.status == "rejected" for result in results)
     failed = sum(result.status == "failed" for result in results)
     total = len(results)
     output_tokens = sum(result.output_len for result in completed)
@@ -340,10 +351,8 @@ def summarize(results: list[Result], duration: float, split_labels: bool = True)
     summary = {
         "num_requests": total,
         "completed": len(completed),
-        "rejected": rejected,
         "failed": failed,
-        # Percentiles cover completed requests only, so show these beside them.
-        "rejection_rate": rejected / total if total else None,
+        # Percentiles cover completed requests only, so show this beside them.
         "failure_rate": failed / total if total else None,
         "duration_seconds": duration,
         "goodput_requests_per_second": len(completed) / duration,
@@ -358,8 +367,7 @@ def summarize(results: list[Result], duration: float, split_labels: bool = True)
     labels = sorted({result.label for result in results})
     if split_labels and len(labels) > 1:
         summary["by_label"] = {
-            label: summarize([r for r in results if r.label == label], duration, split_labels=False)
-            for label in labels
+            label: summarize([r for r in results if r.label == label], duration, split_labels=False) for label in labels
         }
     return summary
 
@@ -373,15 +381,11 @@ def _row(name: str, summary: dict | None) -> str:
 
 def report(summary: dict, title: str = "") -> str:
     lines = [f"--- {title} ---" if title else "---"]
-    lines.append(
-        f"{summary['completed']} completed, {summary['rejected']} rejected, "
-        f"{summary['failed']} failed in {summary['duration_seconds']:.1f}s"
-    )
+    lines.append(f"{summary['completed']} completed, {summary['failed']} failed in {summary['duration_seconds']:.1f}s")
     lines.append(
         f"goodput {summary['goodput_requests_per_second']:.2f} req/s, "
         f"offered {summary['attempted_requests_per_second']:.2f} req/s, "
-        f"output {summary['output_token_throughput']:.0f} tok/s, "
-        f"rejected {(summary['rejection_rate'] or 0) * 100:.1f}%"
+        f"output {summary['output_token_throughput']:.0f} tok/s"
     )
     for name in ("ttft", "tpot", "itl", "e2e"):
         lines.append(_row(name, summary[f"{name}_seconds"]))
@@ -401,14 +405,14 @@ async def benchmark(args, api: AsyncOpenAI, http: httpx.AsyncClient) -> dict:
     args.model_name = await resolve_model_name(api, args)
     if args.warmup:
         await warmup(api, args)
-    before = await server_summary(http, args.base_url)
+    before = await server_metrics(http, args.base_url)
     results, run, duration = await run_trace(api, args, trace, offsets)
-    after = await server_summary(http, args.base_url)
+    after = await server_metrics(http, args.base_url)
     return {
         "config": vars(args) | {"num_requests": len(trace)},
         "aborted": run.aborted,
         "summary": summarize(results, duration),
-        "server": {"before": before, "after": after},
+        "server": {"before": before, "after": after, "run": server_run_stats(before, after, duration)},
         "requests": [asdict(result) for result in results],
     }
 
@@ -444,7 +448,7 @@ def parse_args(argv: list[str] | None = None):
     run.add_argument("--warmup", type=int, default=3)
     run.add_argument("--timeout", type=float, default=600.0, help="per-request, seconds")
     run.add_argument("--max-connections", type=int, default=8192, help="never let the client be the queue")
-    run.add_argument("--max-failure-rate", type=float, default=0.05, help="non-429 failures that abort the run")
+    run.add_argument("--max-failure-rate", type=float, default=0.05, help="failures that abort the run")
     run.add_argument("--output-json", default="")
     run.add_argument("--quiet", action="store_true")
     return parser.parse_args(argv)
@@ -461,7 +465,7 @@ def run(args) -> dict:
                 base_url=args.base_url,
                 api_key=args.api_key,
                 timeout=args.timeout,
-                # The SDK retries a 429 twice by default, hiding rejections as a queue.
+                # The SDK retries a 429 or 5xx twice by default, hiding failures as a queue.
                 max_retries=0,
                 http_client=http,
             )

@@ -1,31 +1,52 @@
 """Backends checked against dense_attention, an independent oracle using no SDPA or paging."""
 
+import numpy as np
 import pytest
 import torch
 
-from lean_vllm.attention import BACKENDS
-from lean_vllm.utils.context import Context
+from lean_vllm.attention import (
+    BACKENDS,
+    FlashAttention3Backend,
+    FlashInferBackend,
+    FlashMLABackend,
+    LayerSpec,
+    TorchAttention,
+    flash_backend,
+    flashinfer_backend,
+    get_attention_backend,
+    triton_merge,
+)
+from lean_vllm.attention.merge import merge_attention, merge_attention_
+from lean_vllm.layers.attention import Attention
+from lean_vllm.utils.context import Context, split_decodes_and_prefills
 
 torch.manual_seed(0)
 
 NUM_HEADS = 8
 NUM_KV_HEADS = 2  # exercises GQA head broadcasting
-HEAD_DIM = 32
-SCALE = 0.137    # not head_dim**-0.5, so a dropped scale argument is detectable
+HEAD_DIM = 64  # a size every backend takes; FlashInfer's are 64, 128 and 256
+SCALE = 0.137  # not head_dim**-0.5, so a dropped scale argument is detectable
 
-# The engine's default page size, which FA3 and torch both take.
+# The engine's default page size, which every backend takes.
 BLOCK_SIZE = 16
-DTYPE = {"torch": torch.float32, "flash_attn_3": torch.float16}    # flash kernels are fp16/bf16 only
+# Kernels are fp16/bf16 only.
+DTYPE = {
+    "torch": torch.float32,
+    "flash_attn_3": torch.float16,
+    "flashinfer": torch.float16,
+    "flashmla": torch.float16,
+}
 
 # Tolerances against the fp32 oracle; bf16 uses test_low_precision_no_worse_than_naive.
 TOLERANCE = {torch.float32: 2e-3, torch.float16: 6e-3}
 
 
 def _cases():
-    """Every (backend, device) pair runnable here."""
+    """Every (backend, device) pair runnable here that serves a plain layer of the tests' shape."""
     cases = []
     for backend_cls in BACKENDS:
-        if not backend_cls.is_available():
+        spec = LayerSpec(HEAD_DIM, NUM_HEADS, NUM_KV_HEADS, DTYPE[backend_cls.get_name()])
+        if not backend_cls.is_available() or backend_cls.validate(spec):
             continue
         if backend_cls.get_name() == "torch":
             devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
@@ -71,19 +92,29 @@ def tol(dtype):
     return TOLERANCE[dtype]
 
 
-def dense_attention(q, k, v, scale=SCALE, compute_dtype=torch.float32):
-    """Causal attention one head at a time. q is [lq, H, D], k/v [lk, Hkv, D] full sequence."""
+def dense_scores(q, k, scale=SCALE, compute_dtype=torch.float32, causal=True):
+    """Attention logits one head at a time, [H, lq, lk]. q is [lq, H, D], k [lk, Hkv, D] full sequence."""
     lq, num_heads, _ = q.shape
     lk, num_kv_heads, _ = k.shape
     k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
-    v = v.repeat_interleave(num_heads // num_kv_heads, dim=1)
+
+    scores = torch.empty(num_heads, lq, lk, dtype=compute_dtype, device=q.device)
+    for h in range(num_heads):
+        scores[h] = (q[:, h, :].to(compute_dtype) @ k[:, h, :].to(compute_dtype).T) * scale
+        for j in range(lq if causal else 0):
+            scores[h, j, lk - lq + j + 1 :] = float("-inf")
+    return scores
+
+
+def dense_attention(q, k, v, scale=SCALE, compute_dtype=torch.float32, causal=True):
+    """Attention one head at a time. q is [lq, H, D], k/v [lk, Hkv, D] full sequence."""
+    num_heads = q.size(1)
+    v = v.repeat_interleave(num_heads // v.size(1), dim=1)
+    scores = dense_scores(q, k, scale, compute_dtype, causal)
 
     out = torch.empty_like(q)
     for h in range(num_heads):
-        scores = (q[:, h, :].to(compute_dtype) @ k[:, h, :].to(compute_dtype).T) * scale
-        for j in range(lq):
-            scores[j, lk - lq + j + 1:] = float("-inf")
-        out[:, h, :] = (scores.softmax(dim=-1) @ v[:, h, :].to(compute_dtype)).to(q.dtype)
+        out[:, h, :] = (scores[h].softmax(dim=-1) @ v[:, h, :].to(compute_dtype)).to(q.dtype)
     return out
 
 
@@ -100,8 +131,7 @@ def slots_for(block_table, block_size, start, end):
 def write_prefix(k_cache, v_cache, k_full, v_full, block_table, block_size, num_cached):
     """Seed the cache as if computed on an earlier step."""
     # Explicit long dtype to avoid float indices from empty prefixes
-    slots = torch.tensor(slots_for(block_table, block_size, 0, num_cached),
-                         dtype=torch.long, device=k_cache.device)
+    slots = torch.tensor(slots_for(block_table, block_size, 0, num_cached), dtype=torch.long, device=k_cache.device)
     k_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots] = k_full[:num_cached]
     v_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots] = v_full[:num_cached]
 
@@ -111,17 +141,49 @@ def randn(*shape, device, dtype):
     return torch.randn(*shape, device=device).to(dtype)
 
 
+@pytest.mark.parametrize("mode", ["decode", "prefill", "mla_decode"])
+@pytest.mark.parametrize("poison", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_torch_attention_ignores_unwritten_cache_slots(mode, poison):
+    backend = TorchAttention(2, 4, 0.5, 1)
+    # The second row forces padding in prefill too. Neither unused slots nor
+    # block-table padding may contribute to the first row's attention.
+    cache = torch.full((3, 2, 1, 4), poison)
+    cache[1, 0] = 1
+    cache[2] = 1
+    cache[0, 0] = 1
+    context = Context(
+        is_prefill=mode == "prefill",
+        block_tables=torch.tensor([[1, -1], [2, 0]], dtype=torch.int32),
+        context_lens=torch.tensor([1, 3], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 1, 4], dtype=torch.int32),
+        max_seqlen_q=1,
+        max_seqlen_k=3,
+    )
+    q = torch.ones(2, 2, 4)
+    if mode == "mla_decode":
+        out = backend.mla_decode(q, cache.squeeze(2), 2, context)
+    elif mode == "prefill":
+        out = backend.prefill(q, torch.empty(0), torch.empty(0), cache, cache, context)
+    else:
+        out = backend.decode(q, cache, cache, context)
+    torch.testing.assert_close(out, torch.ones_like(out))
+
+
 def test_prefill_without_cache(backend, device, dtype, tol):
     """Varlen causal prefill with no cached tokens."""
-    seqlens = [5, 1, 12]    # no paging on this path
+    seqlens = [5, 1, 12]  # no paging on this path
     qs = [randn(n, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens]
     ks = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens]
     vs = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens]
 
     cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
     context = Context(
-        is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
-        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        is_prefill=True,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_k=max(seqlens),
     )
     empty = torch.tensor([], device=device, dtype=dtype)
     out = backend.prefill(torch.cat(qs), torch.cat(ks), torch.cat(vs), empty, empty, context)
@@ -130,12 +192,105 @@ def test_prefill_without_cache(backend, device, dtype, tol):
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
 
-def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):
-    """The shape a fresh prompt takes while serving: pages allocated, nothing cached in them.
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
+def test_varlen_with_lse(backend, device, dtype, tol, causal):
+    """Uncached attention and its log-sum-exp, by which MLA merges chunks of cached keys."""
+    if "mla" not in backend.supported_kinds:
+        pytest.skip(f"{backend.get_name()} serves no MLA layer")
+    seqlens_q = [5, 1, 12]
+    seqlens_k = seqlens_q if causal else [7, 4, 16]  # unmasked chunks hold more keys than queries
+    qs = [randn(n, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_q]
+    ks = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_k]
+    vs = [randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype) for n in seqlens_k]
 
-    Every key is in k and v, so a backend may answer from either place, and this
-    checks that both agree with the oracle.
+    def cumulative(seqlens):
+        return torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+
+    out, lse = backend.varlen_with_lse(
+        torch.cat(qs),
+        torch.cat(ks),
+        torch.cat(vs),
+        cumulative(seqlens_q),
+        cumulative(seqlens_k),
+        max(seqlens_q),
+        max(seqlens_k),
+        causal,
+    )
+
+    expected = torch.cat([dense_attention(q, k, v, causal=causal) for q, k, v in zip(qs, ks, vs)])
+    expected_lse = torch.cat([dense_scores(q, k, causal=causal).logsumexp(-1).T for q, k in zip(qs, ks)])
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+    torch.testing.assert_close(lse, expected_lse, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
+def test_narrow_values_match_padded_ones(backend, device, dtype, tol, causal):
+    """MLA prefill's shape, 192-wide keys and 128-wide values, taken as they are, as MLAAttention hands them over.
+
+    Padded values are what every backend is checked on above, so they are the reference.
     """
+    if "mla" not in backend.supported_kinds:
+        pytest.skip(f"{backend.get_name()} serves no MLA layer")
+    qk_dim, v_dim = 192, 128
+    mla = type(backend)(NUM_HEADS, qk_dim, SCALE, NUM_HEADS)  # expanded MLA: a key head per query head
+    seqlens_q = [5, 1, 12]
+    seqlens_k = seqlens_q if causal else [7, 4, 16]
+    q = randn(sum(seqlens_q), NUM_HEADS, qk_dim, device=device, dtype=dtype)
+    k = randn(sum(seqlens_k), NUM_HEADS, qk_dim, device=device, dtype=dtype)
+    # A view into a wider tensor, as MLA's split of kv_b_proj's output hands over.
+    v = randn(sum(seqlens_k), NUM_HEADS, qk_dim, device=device, dtype=dtype)[..., :v_dim]
+    padded_v = torch.nn.functional.pad(v, (0, qk_dim - v_dim))
+
+    def cumulative(seqlens):
+        return torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+
+    args = (cumulative(seqlens_q), cumulative(seqlens_k), max(seqlens_q), max(seqlens_k), causal)
+    out, lse = mla.varlen_with_lse(q, k, v, *args)
+    want, want_lse = mla.varlen_with_lse(q, k, padded_v, *args)
+    assert out.shape[-1] == v_dim
+    torch.testing.assert_close(out, want[..., :v_dim], atol=tol, rtol=tol)
+    torch.testing.assert_close(lse, want_lse, atol=tol, rtol=tol)
+    if causal:
+        context = Context(
+            is_prefill=True,
+            cu_seqlens_q=args[0],
+            cu_seqlens_k=args[1],
+            max_seqlen_q=args[2],
+            max_seqlen_k=args[3],
+        )
+        empty = torch.tensor([], device=device, dtype=dtype)
+        got = mla.prefill(q, k, v, empty, empty, context)
+        torch.testing.assert_close(
+            got, mla.prefill(q, k, padded_v, empty, empty, context)[..., :v_dim], atol=tol, rtol=tol
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or triton_merge._IMPORT_ERROR is not None,
+    reason="the Triton merge needs a CUDA device and a Triton build",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("into", [False, True], ids=["in_place", "into_out"])
+def test_the_triton_merge_matches_torch(dtype, into):
+    """In place or into an output strided as a split's rows, with lse in FA3's transposed layout."""
+    num_tokens, num_heads, head_dim = 37, 16, 128
+    o_a = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=dtype)
+    o_b = torch.randn(num_tokens, num_heads, head_dim, device="cuda", dtype=dtype)
+    lse_a = (torch.randn(num_heads, num_tokens, device="cuda") * 3).T
+    lse_b = (torch.randn(num_heads, num_tokens, device="cuda") * 3).T
+    lse_a[0] = float("-inf")  # a row with no cached keys
+    want_o, want_lse = merge_attention(o_a, lse_a, o_b, lse_b)
+    before = o_a.clone()
+    out = torch.empty(num_tokens + 3, num_heads, head_dim, device="cuda", dtype=dtype)[3:] if into else None
+    merge_attention_(o_a, lse_a, o_b, lse_b, out)
+    torch.testing.assert_close(o_a if out is None else out, want_o, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse_a, want_lse)
+    if into:
+        assert torch.equal(o_a, before)
+
+
+def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, tol):
+    """A fresh prompt while serving: pages allocated but empty, so k/v and the pages must agree."""
     seqlens = [5, block_size + 3]
     block_tables_list = [[0, 1, -1], [2, 3, 4]]
     k_cache, v_cache = make_cache(6, device, block_size, dtype)
@@ -149,15 +304,20 @@ def test_prefill_of_a_cold_batch_with_pages(backend, device, block_size, dtype, 
         slot_mapping += slots_for(table, block_size, 0, n)
     k_new, v_new = torch.cat(ks), torch.cat(vs)
     backend.store_kvcache(
-        k_new, v_new, k_cache, v_cache,
+        k_new,
+        v_new,
+        k_cache,
+        v_cache,
         torch.tensor(slot_mapping, dtype=torch.int32, device=device),
     )
 
     cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
     context = Context(
-        is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
-        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
-        keys_are_new=True,
+        is_prefill=True,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_k=max(seqlens),
         context_lens=torch.tensor(seqlens, dtype=torch.int32, device=device),
         block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
     )
@@ -188,7 +348,10 @@ def test_prefill_with_prefix_cache(backend, device, block_size, dtype, tol):
     k_new = torch.cat([k[c:] for k, c in zip(k_full, num_cached)])
     v_new = torch.cat([v[c:] for v, c in zip(v_full, num_cached)])
     backend.store_kvcache(
-        k_new, v_new, k_cache, v_cache,
+        k_new,
+        v_new,
+        k_cache,
+        v_cache,
         torch.tensor(slot_mapping, dtype=torch.int32, device=device),
     )
 
@@ -197,7 +360,8 @@ def test_prefill_with_prefix_cache(backend, device, block_size, dtype, tol):
         is_prefill=True,
         cu_seqlens_q=torch.tensor([0, *torch.tensor(num_new).cumsum(0).tolist()], dtype=torch.int32, device=device),
         cu_seqlens_k=torch.tensor([0, *torch.tensor(totals).cumsum(0).tolist()], dtype=torch.int32, device=device),
-        max_seqlen_q=max(num_new), max_seqlen_k=max(totals),
+        max_seqlen_q=max(num_new),
+        max_seqlen_k=max(totals),
         block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
     )
     out = backend.prefill(torch.cat(q_list), k_new, v_new, k_cache, v_cache, context)
@@ -206,9 +370,164 @@ def test_prefill_with_prefix_cache(backend, device, block_size, dtype, tol):
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
 
+# The only shapes FlashMLA's dense decode takes: a 512 + 64 latent, 512 of it the value, 64-token pages.
+LATENT_DIM, LATENT_V_DIM, MLA_BLOCK_SIZE = 576, 512, 64
+MLA_CASES = [b for b in BACKENDS if b.supports_mla_decode() and b.is_available()]
+# Each backend at the page sizes it reads: FlashMLA's one, or the engine's default and FlashMLA's for the rest.
+MLA_PAGE_CASES = [(b, size) for b in MLA_CASES for size in ([b.mla_block_size()] if b.mla_block_size() else [16, 64])]
+
+
+@pytest.mark.parametrize(
+    "backend_cls, block_size", MLA_PAGE_CASES, ids=[f"{b.get_name()}-{size}" for b, size in MLA_PAGE_CASES]
+)
+def test_mla_decode(backend_cls, block_size):
+    """Each row's query attends its cached latents as one shared key head, valued by their first v_dim entries."""
+    context_lens = [block_size + 3, 3, 2 * block_size]  # mid-page, part-page, full
+    check_mla_decode(backend_cls, block_size, context_lens, [[2, 0], [3, -1], [1, 4]])  # scattered
+
+
+@pytest.mark.parametrize(
+    "backend_cls, block_size", MLA_PAGE_CASES, ids=[f"{b.get_name()}-{size}" for b, size in MLA_PAGE_CASES]
+)
+def test_mla_decode_of_long_rows(backend_cls, block_size):
+    """Rows long enough that split-KV kernels split them, each part over many pages, beside a one-key row."""
+    context_lens = [21 * block_size - 5, 1, 9 * block_size + 1]
+    pages = torch.randperm(32).tolist()
+    check_mla_decode(
+        backend_cls, block_size, context_lens, [pages[:21], pages[21:22] + [-1] * 20, pages[22:] + [-1] * 11]
+    )
+
+
+@pytest.mark.parametrize(
+    "backend_cls, block_size", MLA_PAGE_CASES, ids=[f"{b.get_name()}-{size}" for b, size in MLA_PAGE_CASES]
+)
+def test_mla_decode_of_rows_verifying_drafts(backend_cls, block_size):
+    """Several queries per row, its last tokens, each attending the keys up to its own, as a verifying row's."""
+    context_lens = [block_size + 3, 4, 2 * block_size]
+    check_mla_decode(backend_cls, block_size, context_lens, [[2, 0], [3, -1], [1, 4]], queries=4)
+
+
+def check_mla_decode(backend_cls, block_size, context_lens, block_tables_list, queries=1):
+    name = backend_cls.get_name()
+    device, dtype = torch.device("cpu" if name == "torch" else "cuda"), DTYPE[name]
+    backend = backend_cls(NUM_HEADS, LATENT_DIM, SCALE, NUM_HEADS)
+    num_blocks = max(max(table) for table in block_tables_list) + 1
+    cache = torch.zeros(num_blocks, block_size, LATENT_DIM, device=device, dtype=dtype)
+    latents = [randn(n, LATENT_DIM, device=device, dtype=dtype) for n in context_lens]
+    for latent, table in zip(latents, block_tables_list):
+        slots = torch.tensor(slots_for(table, block_size, 0, latent.size(0)), device=device)
+        cache.view(-1, LATENT_DIM)[slots] = latent
+
+    q = randn(len(context_lens) * queries, NUM_HEADS, LATENT_DIM, device=device, dtype=dtype)
+    context = Context(
+        context_lens=torch.tensor(context_lens, dtype=torch.int32, device=device),
+        block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
+    )
+    out = backend.mla_decode(q, cache, LATENT_V_DIM, context)
+
+    expected = torch.cat(
+        [
+            (
+                dense_scores(q[i * queries : (i + 1) * queries], latent.unsqueeze(1)).softmax(-1)
+                @ latent[:, :LATENT_V_DIM].float()
+            ).transpose(0, 1)
+            for i, latent in enumerate(latents)
+        ]
+    ).to(dtype)
+    tol = TOLERANCE[dtype]
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("backend_cls", MLA_CASES, ids=[b.get_name() for b in MLA_CASES])
+def test_store_latents_skips_negative_slots(backend_cls):
+    """A full graph pads its batch, so slot -1 must leave that cache row untouched."""
+    name = backend_cls.get_name()
+    device, dtype = torch.device("cpu" if name == "torch" else "cuda"), DTYPE[name]
+    backend = backend_cls(NUM_HEADS, LATENT_DIM, SCALE, NUM_HEADS)
+    cache = torch.full((2, MLA_BLOCK_SIZE, LATENT_DIM), 7.0, device=device, dtype=dtype)
+    latent = randn(3, LATENT_DIM, device=device, dtype=dtype)
+    written = [0, MLA_BLOCK_SIZE + 5]
+
+    backend.store_latents(latent, cache, torch.tensor([written[0], -1, written[1]], dtype=torch.int32, device=device))
+
+    flat = cache.flatten(0, 1)
+    torch.testing.assert_close(flat[written[0]], latent[0], atol=0, rtol=0)
+    torch.testing.assert_close(flat[written[1]], latent[2], atol=0, rtol=0)
+    untouched = [i for i in range(2 * MLA_BLOCK_SIZE) if i not in written]
+    assert (flat[untouched] == 7.0).all(), "untouched slots were overwritten"
+
+
+# What a layer asks for, by its kind: DeepSeek-V2-Lite's MLA and a Qwen3-8B-like plain layer.
+MLA_SPEC = LayerSpec(192, 16, 16, torch.bfloat16, latent_dim=576)
+PLAIN_SPEC = LayerSpec(128, 32, 8, torch.bfloat16)
+
+
+@pytest.fixture
+def all_available(monkeypatch):
+    """Every backend reports itself available, so selection runs on any machine; nothing is executed."""
+    monkeypatch.delenv("LEAN_VLLM_ATTENTION_BACKEND", raising=False)
+    for backend in BACKENDS:
+        monkeypatch.setattr(backend, "is_available", staticmethod(lambda: True))
+
+
+def test_flashmla_is_preferred_for_mla_layers_only(all_available):
+    assert get_attention_backend(MLA_SPEC) is FlashMLABackend
+    assert get_attention_backend(PLAIN_SPEC) is FlashAttention3Backend
+
+
+def test_each_layer_takes_the_first_backend_that_serves_it(all_available, monkeypatch):
+    """By head size, dtype and kind, in priority order; torch takes whatever no kernel does."""
+    assert get_attention_backend(LayerSpec(128, 32, 8, torch.float32)) is TorchAttention  # dtype
+    assert get_attention_backend(LayerSpec(512, 8, 8, torch.bfloat16)) is TorchAttention  # head size
+    assert get_attention_backend(LayerSpec(192, 16, 16, torch.bfloat16, latent_dim=512)) is FlashAttention3Backend
+    for hopper_only in (FlashAttention3Backend, FlashMLABackend):  # an A100
+        monkeypatch.setattr(hopper_only, "is_available", staticmethod(lambda: False))
+    assert get_attention_backend(PLAIN_SPEC) is FlashInferBackend
+    assert get_attention_backend(LayerSpec(96, 32, 8, torch.bfloat16)) is TorchAttention  # not 64, 128 or 256
+    assert get_attention_backend(MLA_SPEC) is TorchAttention  # FlashInfer serves plain layers only
+
+
+@pytest.mark.parametrize(
+    "spec, reason",
+    [
+        (LayerSpec(128, 6, 4, torch.bfloat16), "6 query heads do not group over 4 key heads"),
+        (MLA_SPEC, "mla layers are not supported"),
+        (LayerSpec(128, 32, 8, torch.float32), "dtype torch.float32"),
+    ],
+    ids=["head_count", "kind", "dtype"],
+)
+def test_a_named_backend_that_cannot_serve_the_layer_says_why(all_available, monkeypatch, spec, reason):
+    """Rather than fall back: a silent switch to a slower backend mid-benchmark is worse than a crash."""
+    monkeypatch.setenv("LEAN_VLLM_ATTENTION_BACKEND", "flashinfer")
+    with pytest.raises(RuntimeError, match=reason):
+        get_attention_backend(spec)
+
+
+def test_layers_of_one_model_can_take_different_backends(all_available):
+    """Chosen at init from each layer's own shape, under the dtype the runner sets while building the model."""
+    default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        wide, odd = Attention(32, 128, 0.1, 8), Attention(32, 96, 0.1, 8)
+        torch.set_default_dtype(torch.float32)
+        full = Attention(32, 128, 0.1, 8)
+    finally:
+        torch.set_default_dtype(default)
+    assert [type(layer.backend) for layer in (wide, odd, full)] == [
+        FlashAttention3Backend,
+        FlashAttention3Backend,
+        TorchAttention,
+    ]
+
+
+def test_mla_layers_take_fa3_where_flashmla_is_missing(all_available, monkeypatch):
+    monkeypatch.setattr(FlashMLABackend, "is_available", staticmethod(lambda: False))
+    assert get_attention_backend(MLA_SPEC) is FlashAttention3Backend
+
+
 def test_decode(backend, device, block_size, dtype, tol):
     """One query per sequence against differing cached context lengths."""
-    context_lens = [block_size + 3, 3, 4 * block_size]    # mid-page, part-page, full
+    context_lens = [block_size + 3, 3, 4 * block_size]  # mid-page, part-page, full
     block_tables_list = [[0, 1, 2, 3], [4, 5, -1, -1], [6, 7, 8, 9]]
     k_cache, v_cache = make_cache(10, device, block_size, dtype)
 
@@ -226,7 +545,7 @@ def test_decode(backend, device, block_size, dtype, tol):
     )
     out = backend.decode(q, k_cache, v_cache, context)
 
-    expected = torch.cat([dense_attention(q[i:i + 1], k_full[i], v_full[i]) for i in range(len(context_lens))])
+    expected = torch.cat([dense_attention(q[i : i + 1], k_full[i], v_full[i]) for i in range(len(context_lens))])
     torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
 
 
@@ -241,7 +560,7 @@ def test_store_kvcache_skips_negative_slots(backend, device, block_size, dtype):
     slot_mapping = torch.tensor([0, -1, 5], dtype=torch.int32, device=device)
     backend.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
 
-    flat_k = k_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)
+    flat_k = k_cache.flatten(0, 1)
     torch.testing.assert_close(flat_k[0], key[0])
     torch.testing.assert_close(flat_k[5], key[2])
     assert (flat_k[1:5] == 7.0).all(), "untouched slots were overwritten"
@@ -259,18 +578,31 @@ def test_decode_matches_equivalent_prefill(backend, device, block_size, dtype, t
     q = randn(1, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
     bt = torch.tensor([block_table], dtype=torch.int32, device=device)
 
-    decoded = backend.decode(q, k_cache, v_cache, Context(
-        is_prefill=False,
-        context_lens=torch.tensor([seqlen], dtype=torch.int32, device=device),
-        block_tables=bt,
-    ))
-    prefilled = backend.prefill(q, k_full[-1:], v_full[-1:], k_cache, v_cache, Context(
-        is_prefill=True,
-        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, seqlen], dtype=torch.int32, device=device),
-        max_seqlen_q=1, max_seqlen_k=seqlen,
-        block_tables=bt,
-    ))
+    decoded = backend.decode(
+        q,
+        k_cache,
+        v_cache,
+        Context(
+            is_prefill=False,
+            context_lens=torch.tensor([seqlen], dtype=torch.int32, device=device),
+            block_tables=bt,
+        ),
+    )
+    prefilled = backend.prefill(
+        q,
+        k_full[-1:],
+        v_full[-1:],
+        k_cache,
+        v_cache,
+        Context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, seqlen], dtype=torch.int32, device=device),
+            max_seqlen_q=1,
+            max_seqlen_k=seqlen,
+            block_tables=bt,
+        ),
+    )
     torch.testing.assert_close(decoded, prefilled, atol=tol, rtol=tol)
 
 
@@ -284,59 +616,41 @@ def test_top_left_causal_alignment_would_be_wrong(backend, device, block_size, d
     write_prefix(k_cache, v_cache, k_full, v_full, block_table, block_size, lk)
 
     q = randn(lq, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    out = backend.prefill(q, k_full[-lq:], v_full[-lq:], k_cache, v_cache, Context(
-        is_prefill=True,
-        cu_seqlens_q=torch.tensor([0, lq], dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, lk], dtype=torch.int32, device=device),
-        max_seqlen_q=lq, max_seqlen_k=lk,
-        block_tables=torch.tensor([block_table], dtype=torch.int32, device=device),
-    ))
+    out = backend.prefill(
+        q,
+        k_full[-lq:],
+        v_full[-lq:],
+        k_cache,
+        v_cache,
+        Context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, lq], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, lk], dtype=torch.int32, device=device),
+            max_seqlen_q=lq,
+            max_seqlen_k=lk,
+            block_tables=torch.tensor([block_table], dtype=torch.int32, device=device),
+        ),
+    )
 
     torch.testing.assert_close(out, dense_attention(q, k_full, v_full), atol=tol, rtol=tol)
 
     top_left = torch.nn.functional.scaled_dot_product_attention(
-        q.transpose(0, 1).unsqueeze(0),
-        k_full.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1).transpose(0, 1).unsqueeze(0),
-        v_full.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1).transpose(0, 1).unsqueeze(0),
-        is_causal=True, scale=SCALE,
-    ).squeeze(0).transpose(0, 1)
-    # well clear of the noise floor the assert_close above already allows
-    assert not torch.allclose(out, top_left, atol=5 * tol), \
-        "top-left and bottom-right masks agree; test is not discriminating"
-
-
-def test_gqa_fallback_matches_broadcast(backend, device, block_size, dtype, tol, monkeypatch):
-    """Force the torch<2.5 path that materializes KV heads instead of broadcasting."""
-    if backend.get_name() != "torch":
-        pytest.skip("fallback is specific to the torch backend")
-
-    from lean_vllm.attention import torch_backend
-
-    seqlen = 2 * block_size + 3
-    block_table = [0, 1, 2]
-    k_cache, v_cache = make_cache(3, device, block_size, dtype)
-    k_full = randn(seqlen, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    v_full = randn(seqlen, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    write_prefix(k_cache, v_cache, k_full, v_full, block_table, block_size, seqlen)
-
-    q = randn(4, NUM_HEADS, HEAD_DIM, device=device, dtype=dtype)
-    context = Context(
-        is_prefill=False,
-        context_lens=torch.tensor([seqlen] * 4, dtype=torch.int32, device=device),
-        block_tables=torch.tensor([block_table] * 4, dtype=torch.int32, device=device),
+        q.transpose(0, 1),
+        k_full.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1).transpose(0, 1),
+        v_full.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=1).transpose(0, 1),
+        is_causal=True,
+        scale=SCALE,
     )
-    expected = torch.cat([dense_attention(q[i:i + 1], k_full, v_full) for i in range(4)])
-
-    monkeypatch.setattr(torch_backend, "_SDPA_ENABLE_GQA", False)
-    torch.testing.assert_close(backend.decode(q, k_cache, v_cache, context), expected, atol=tol, rtol=tol)
+    top_left = top_left.transpose(0, 1)
+    # well clear of the noise floor the assert_close above already allows
+    assert not torch.allclose(out, top_left, atol=5 * tol), (
+        "top-left and bottom-right masks agree; test is not discriminating"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 def test_low_precision_no_worse_than_naive(backend, device, block_size, dtype):
-    """Backend error against fp32 oracle must not exceed naive arithmetic in the same dtype.
-
-    A fixed atol means nothing at bf16, so compare against naive precision loss instead.
-    """
+    """Backend error against the fp32 oracle must not exceed naive arithmetic's in the same dtype."""
     num_cached, num_new = 2 * block_size + 2, 6
     total = num_cached + num_new
     block_table = [0, 1, 2, 3]
@@ -348,16 +662,27 @@ def test_low_precision_no_worse_than_naive(backend, device, block_size, dtype):
 
     write_prefix(k_cache, v_cache, k_full, v_full, block_table, block_size, num_cached)
     backend.store_kvcache(
-        k_full[num_cached:], v_full[num_cached:], k_cache, v_cache,
+        k_full[num_cached:],
+        v_full[num_cached:],
+        k_cache,
+        v_cache,
         torch.tensor(slots_for(block_table, block_size, num_cached, total), dtype=torch.int32, device=device),
     )
-    out = backend.prefill(q, k_full[num_cached:], v_full[num_cached:], k_cache, v_cache, Context(
-        is_prefill=True,
-        cu_seqlens_q=torch.tensor([0, num_new], dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, total], dtype=torch.int32, device=device),
-        max_seqlen_q=num_new, max_seqlen_k=total,
-        block_tables=torch.tensor([block_table], dtype=torch.int32, device=device),
-    ))
+    out = backend.prefill(
+        q,
+        k_full[num_cached:],
+        v_full[num_cached:],
+        k_cache,
+        v_cache,
+        Context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, num_new], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, total], dtype=torch.int32, device=device),
+            max_seqlen_q=num_new,
+            max_seqlen_k=total,
+            block_tables=torch.tensor([block_table], dtype=torch.int32, device=device),
+        ),
+    )
 
     # identical inputs, so the only difference is the precision of the arithmetic
     ref = dense_attention(q.float(), k_full.float(), v_full.float())
@@ -365,10 +690,13 @@ def test_low_precision_no_worse_than_naive(backend, device, block_size, dtype):
 
     backend_err = (out.float() - ref).abs().max().item()
     naive_err = (naive - ref).abs().max().item()
-    print(f"\n{dtype} backend_err={backend_err:.3e} naive_err={naive_err:.3e} "
-          f"ratio={backend_err / max(naive_err, 1e-12):.2f}")
+    print(
+        f"\n{dtype} backend_err={backend_err:.3e} naive_err={naive_err:.3e} "
+        f"ratio={backend_err / max(naive_err, 1e-12):.2f}"
+    )
     assert backend_err <= 2 * naive_err + 1e-6, (
-        f"backend error {backend_err:.3e} exceeds twice naive {dtype} error {naive_err:.3e}")
+        f"backend error {backend_err:.3e} exceeds twice naive {dtype} error {naive_err:.3e}"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
@@ -381,11 +709,10 @@ def test_low_precision_cache_roundtrip_is_exact(backend, device, block_size, dty
     value = randn(n, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=dtype)
 
     slots = slots_for(block_table, block_size, 0, n)
-    backend.store_kvcache(key, value, k_cache, v_cache,
-                          torch.tensor(slots, dtype=torch.int32, device=device))
+    backend.store_kvcache(key, value, k_cache, v_cache, torch.tensor(slots, dtype=torch.int32, device=device))
 
-    torch.testing.assert_close(k_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots], key, atol=0, rtol=0)
-    torch.testing.assert_close(v_cache.view(-1, NUM_KV_HEADS, HEAD_DIM)[slots], value, atol=0, rtol=0)
+    torch.testing.assert_close(k_cache.flatten(0, 1)[slots], key, atol=0, rtol=0)
+    torch.testing.assert_close(v_cache.flatten(0, 1)[slots], value, atol=0, rtol=0)
 
 
 def _mixed_batch(device, block_size, dtype, num_cached, num_new, block_tables_list, num_blocks):
@@ -410,7 +737,8 @@ def _mixed_context(device, num_cached, num_new, block_tables_list):
         is_prefill=True,
         cu_seqlens_q=torch.tensor([0, *torch.tensor(num_new).cumsum(0).tolist()], dtype=torch.int32, device=device),
         cu_seqlens_k=torch.tensor([0, *torch.tensor(totals).cumsum(0).tolist()], dtype=torch.int32, device=device),
-        max_seqlen_q=max(num_new), max_seqlen_k=max(totals),
+        max_seqlen_q=max(num_new),
+        max_seqlen_k=max(totals),
         block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
     )
 
@@ -418,14 +746,13 @@ def _mixed_context(device, num_cached, num_new, block_tables_list):
 def test_mixed_batch_of_chunks_and_decodes(backend, device, block_size, dtype, tol):
     """One batch holding a decode row, a resumed chunk and a cold prefill."""
     num_cached = [2 * block_size + 5, block_size + 1, 0]
-    num_new = [1, 7, 4]    # decode, resumed chunk, cold
+    num_new = [1, 7, 4]  # decode, resumed chunk, cold
     block_tables_list = [[0, 1, 2], [3, 4, -1], [5, -1, -1]]
 
     q_list, k_new, v_new, k_cache, v_cache, k_full, v_full, slots = _mixed_batch(
         device, block_size, dtype, num_cached, num_new, block_tables_list, 6
     )
-    backend.store_kvcache(k_new, v_new, k_cache, v_cache,
-                          torch.tensor(slots, dtype=torch.int32, device=device))
+    backend.store_kvcache(k_new, v_new, k_cache, v_cache, torch.tensor(slots, dtype=torch.int32, device=device))
     context = _mixed_context(device, num_cached, num_new, block_tables_list)
     out = backend.prefill(torch.cat(q_list), k_new, v_new, k_cache, v_cache, context)
 
@@ -436,28 +763,400 @@ def test_mixed_batch_of_chunks_and_decodes(backend, device, block_size, dtype, t
 def test_mixed_batch_matches_running_the_rows_separately(backend, device, block_size, dtype, tol):
     """One mixed call must equal the prefill call plus the decode call it replaces."""
     num_cached = [block_size + 1, 3 * block_size]
-    num_new = [6, 1]    # a chunk, then a decode row; order must not matter
+    num_new = [6, 1]  # a chunk, then a decode row; order must not matter
     block_tables_list = [[0, 1, -1, -1], [2, 3, 4, 5]]
 
     q_list, k_new, v_new, k_cache, v_cache, _, _, slots = _mixed_batch(
         device, block_size, dtype, num_cached, num_new, block_tables_list, 6
     )
-    backend.store_kvcache(k_new, v_new, k_cache, v_cache,
-                          torch.tensor(slots, dtype=torch.int32, device=device))
+    backend.store_kvcache(k_new, v_new, k_cache, v_cache, torch.tensor(slots, dtype=torch.int32, device=device))
 
-    merged = backend.prefill(torch.cat(q_list), k_new, v_new, k_cache, v_cache,
-                             _mixed_context(device, num_cached, num_new, block_tables_list))
+    merged = backend.prefill(
+        torch.cat(q_list),
+        k_new,
+        v_new,
+        k_cache,
+        v_cache,
+        _mixed_context(device, num_cached, num_new, block_tables_list),
+    )
 
-    chunk = backend.prefill(q_list[0], k_new[:num_new[0]], v_new[:num_new[0]], k_cache, v_cache, Context(
-        is_prefill=True,
-        cu_seqlens_q=torch.tensor([0, num_new[0]], dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.tensor([0, num_cached[0] + num_new[0]], dtype=torch.int32, device=device),
-        max_seqlen_q=num_new[0], max_seqlen_k=num_cached[0] + num_new[0],
-        block_tables=torch.tensor([block_tables_list[0]], dtype=torch.int32, device=device),
-    ))
-    decoded = backend.decode(q_list[1], k_cache, v_cache, Context(
-        is_prefill=False,
-        context_lens=torch.tensor([num_cached[1] + num_new[1]], dtype=torch.int32, device=device),
-        block_tables=torch.tensor([block_tables_list[1]], dtype=torch.int32, device=device),
-    ))
+    chunk = backend.prefill(
+        q_list[0],
+        k_new[: num_new[0]],
+        v_new[: num_new[0]],
+        k_cache,
+        v_cache,
+        Context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, num_new[0]], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, num_cached[0] + num_new[0]], dtype=torch.int32, device=device),
+            max_seqlen_q=num_new[0],
+            max_seqlen_k=num_cached[0] + num_new[0],
+            block_tables=torch.tensor([block_tables_list[0]], dtype=torch.int32, device=device),
+        ),
+    )
+    decoded = backend.decode(
+        q_list[1],
+        k_cache,
+        v_cache,
+        Context(
+            is_prefill=False,
+            context_lens=torch.tensor([num_cached[1] + num_new[1]], dtype=torch.int32, device=device),
+            block_tables=torch.tensor([block_tables_list[1]], dtype=torch.int32, device=device),
+        ),
+    )
     torch.testing.assert_close(merged, torch.cat([chunk, decoded]), atol=tol, rtol=tol)
+
+
+def _host_context(device, num_cached, num_new, block_tables_list):
+    """A mixed step as the runner builds it, host lengths included, so a splitting backend can split it."""
+    context = _mixed_context(device, num_cached, num_new, block_tables_list)
+    context.cu_seqlens_q_host = context.cu_seqlens_q.tolist()
+    context.cu_seqlens_k_host = context.cu_seqlens_k.tolist()
+    context.context_lens = context.cu_seqlens_k.diff()
+    return context
+
+
+def test_the_split_slices_the_leading_one_query_rows(device):
+    """Decode rows lead, as the runner orders them; the rest keep their lengths, offset to start at zero."""
+    num_cached, num_new = [9, 0, 4, 2 * BLOCK_SIZE], [1, 1, 5, 3]  # the second row is a one-token prompt
+    tables = [[0, -1, -1], [1, -1, -1], [2, -1, -1], [3, 4, 5]]
+    context = _host_context(device, num_cached, num_new, tables)
+
+    n, decodes, prefills = split_decodes_and_prefills(context)
+
+    assert n == 2
+    assert decodes.context_lens.tolist() == [10, 1]
+    assert decodes.block_tables.tolist() == [[0, -1, -1], [1, -1, -1]]
+    assert prefills.cu_seqlens_q.tolist() == prefills.cu_seqlens_q_host == [0, 5, 8]
+    assert prefills.cu_seqlens_k.tolist() == prefills.cu_seqlens_k_host == [0, 9, 12 + 2 * BLOCK_SIZE]
+    assert (prefills.max_seqlen_q, prefills.max_seqlen_k) == (5, 3 + 2 * BLOCK_SIZE)
+    assert prefills.block_tables.tolist() == [[2, -1, -1], [3, 4, 5]]
+    assert split_decodes_and_prefills(context)[1] is decodes  # built once, for every layer
+
+
+def test_a_step_split_at_no_row_is_left_whole(device):
+    context = _host_context(device, [0, 3], [4, 1], [[0], [1]])  # the one-query row trails the prompt
+    assert split_decodes_and_prefills(context) == (0, None, context)
+
+
+def test_forward_splits_a_mixed_step_into_decode_and_prefill(backend, device, block_size, dtype, tol, monkeypatch):
+    """Rows of one query run through decode when the backend splits, each half writing into the step's output;
+    together they match the reference."""
+    num_cached = [2 * block_size + 5, 3, block_size + 1, 0]
+    num_new = [1, 1, 7, 4]  # two decode rows lead, then a resumed chunk and a cold prompt
+    block_tables_list = [[0, 1, 2], [3, -1, -1], [4, 5, -1], [6, -1, -1]]
+    q_list, k_new, v_new, k_cache, v_cache, k_full, v_full, slots = _mixed_batch(
+        device, block_size, dtype, num_cached, num_new, block_tables_list, 7
+    )
+    backend.store_kvcache(k_new, v_new, k_cache, v_cache, torch.tensor(slots, dtype=torch.int32, device=device))
+    decoded, outs = [], []
+    decode, prefill = backend.decode, backend.prefill
+
+    def record_decode(q, *args, out=None):
+        decoded.append(q.size(0))
+        outs.append(out)
+        return decode(q, *args, out=out)
+
+    monkeypatch.setattr(backend, "decode", record_decode)
+    monkeypatch.setattr(backend, "prefill", lambda *args, out=None: outs.append(out) or prefill(*args, out=out))
+
+    out = backend.forward(
+        torch.cat(q_list), k_new, v_new, k_cache, v_cache, _host_context(device, num_cached, num_new, block_tables_list)
+    )
+
+    expected = torch.cat([dense_attention(q, k, v) for q, k, v in zip(q_list, k_full, v_full)])
+    torch.testing.assert_close(out, expected, atol=tol, rtol=tol)
+    assert decoded == ([2] if backend.split_decodes() else [])
+    if backend.split_decodes():
+        assert all(o._base is out for o in outs)  # views of the step's output, so no copy joins the halves
+
+
+def test_flashinfer_pages_list_each_rows_used_pages():
+    """Its CSR page table: the pages a row's keys fill, not the padded table, and how full the last one is."""
+    context = Context(
+        cu_seqlens_k_host=[0, 5, 5 + 2 * BLOCK_SIZE, 6 + 2 * BLOCK_SIZE],
+        block_tables=torch.tensor([[4, 9, -1], [7, 2, -1], [3, -1, -1]], dtype=torch.int32),
+    )
+    indptr, indices, last_page_len = FlashInferBackend._pages(context, BLOCK_SIZE)
+    assert indptr.tolist() == [0, 1, 3, 4]
+    assert indices.tolist() == [4, 7, 2, 3]
+    assert last_page_len.tolist() == [5, BLOCK_SIZE, 1]
+
+
+def test_flashinfer_pages_pad_a_graphs_rows_with_empty_ones():
+    context = Context(
+        cu_seqlens_k_host=[0, 5, 5 + BLOCK_SIZE], block_tables=torch.tensor([[4, -1], [7, -1]], dtype=torch.int32)
+    )
+    indptr, indices, last_page_len = FlashInferBackend._pages(context, BLOCK_SIZE, num_rows=4)
+    assert indptr.tolist() == [0, 1, 2, 2, 2]
+    assert indices.tolist() == [4, 7]
+    assert last_page_len.tolist() == [5, BLOCK_SIZE, 1, 1]
+
+
+class FakeDecodeWrapper:
+    """Records what FlashInfer's decode wrapper is built with and planned with, and copies plans into its buffers
+    under use_cuda_graph, as the real one does."""
+
+    def __init__(
+        self,
+        workspace,
+        layout,
+        use_cuda_graph=False,
+        use_tensor_cores=False,
+        paged_kv_indptr_buffer=None,
+        paged_kv_indices_buffer=None,
+        paged_kv_last_page_len_buffer=None,
+    ):
+        self.use_cuda_graph = use_cuda_graph
+        self.buffers = (paged_kv_indptr_buffer, paged_kv_indices_buffer, paged_kv_last_page_len_buffer)
+        self.plans = []
+
+    def plan(self, indptr, indices, last_page_len, num_heads, num_kv_heads, head_dim, page_size, **options):
+        self.plans.append((indptr.tolist(), indices.tolist(), last_page_len.tolist()))
+        if self.use_cuda_graph:
+            assert len(last_page_len) == len(self.buffers[2]), "a graph's wrapper plans its own batch size only"
+            self.buffers[0].copy_(indptr)
+            self.buffers[1][: len(indices)].copy_(indices)
+            self.buffers[2].copy_(last_page_len)
+
+    def run(self, q, kv_cache, out=None):
+        return torch.zeros_like(q) if out is None else out.zero_()
+
+
+@pytest.fixture
+def fake_flashinfer(monkeypatch):
+    from lean_vllm.attention import flashinfer_backend
+
+    monkeypatch.setattr(flashinfer_backend, "BatchDecodeWithPagedKVCacheWrapper", FakeDecodeWrapper, raising=False)
+    monkeypatch.setattr(FlashInferBackend, "_wrappers", {})
+    monkeypatch.setattr(FlashInferBackend, "_graph_pages", None)
+    monkeypatch.setattr(FlashInferBackend, "_workspace", torch.zeros(1, dtype=torch.uint8))
+    return FlashInferBackend(NUM_HEADS, HEAD_DIM, SCALE, NUM_KV_HEADS)
+
+
+def test_flashinfer_full_graphs_get_a_wrapper_per_batch_size_replanned_before_replay(fake_flashinfer):
+    """Captured as the runner captures, largest first with worst-case lengths, then re-planned for a real step."""
+    backend, width = fake_flashinfer, 3
+    k_cache = v_cache = torch.zeros(8, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
+    for bs in (4, 2):
+        context = Context(
+            context_lens=torch.full((bs,), width * BLOCK_SIZE, dtype=torch.int32),
+            block_tables=torch.zeros(bs, width, dtype=torch.int32),
+            full_graph_size=bs,
+        )
+        backend.decode(torch.zeros(bs, NUM_HEADS, HEAD_DIM), k_cache, v_cache, context)
+    graphs = {key[-1]: wrapper for key, wrapper in FlashInferBackend._wrappers.items()}
+    assert set(graphs) == {4, 2} and all(wrapper.use_cuda_graph for wrapper in graphs.values())
+    indptr, indices, _ = FlashInferBackend._graph_pages
+    assert graphs[2].buffers[1] is indices and graphs[2].buffers[0].data_ptr() == indptr.data_ptr()
+
+    step = Context(
+        cu_seqlens_k_host=[0, 5, 5 + BLOCK_SIZE, 6 + BLOCK_SIZE],
+        block_tables=torch.tensor([[4, -1], [7, 2], [3, -1]], dtype=torch.int32),
+    )
+    FlashInferBackend.before_full_graph_replay(step, 4)
+
+    assert graphs[4].plans[-1] == ([0, 1, 2, 3, 3], [4, 7, 3], [5, BLOCK_SIZE, 1, 1])
+    assert len(graphs[2].plans) == 1  # another graph's wrapper is left alone
+    assert indptr[:5].tolist() == [0, 1, 2, 3, 3] and indices[:3].tolist() == [4, 7, 3]
+
+    backend.decode(torch.zeros(3, NUM_HEADS, HEAD_DIM), k_cache, v_cache, step)  # an eager step
+    eager = [w for key, w in FlashInferBackend._wrappers.items() if key[-1] is None]
+    assert len(eager) == 1 and not eager[0].use_cuda_graph
+
+
+class FakeRaggedWrapper:
+    """Records what FlashInfer's ragged prefill wrapper is planned with; runs to zeros."""
+
+    def __init__(self, workspace, layout):
+        self.plans = []
+
+    def plan(self, qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, causal, **options):
+        self.plans.append((qo_indptr.tolist(), kv_indptr.tolist(), causal))
+
+    def run(self, q, k, v, out=None):
+        return q.new_zeros(q.shape) if out is None else out.zero_()
+
+
+def test_flashinfer_plans_a_pageless_prefill_once_per_lengths(monkeypatch):
+    """Every layer of a warmup step poses the same problem: planned once, and again only when the lengths change."""
+    monkeypatch.setattr(flashinfer_backend, "BatchPrefillWithRaggedKVCacheWrapper", FakeRaggedWrapper, raising=False)
+    monkeypatch.setattr(FlashInferBackend, "_ragged", {})
+    monkeypatch.setattr(FlashInferBackend, "_workspace", torch.zeros(1, dtype=torch.uint8))
+    backend = FlashInferBackend(NUM_HEADS, HEAD_DIM, SCALE, NUM_KV_HEADS)
+    q, kv = torch.zeros(6, NUM_HEADS, HEAD_DIM), torch.zeros(6, NUM_KV_HEADS, HEAD_DIM)
+    for lengths in ([0, 2, 6], [0, 2, 6], [0, 6]):  # steps
+        context = Context(is_prefill=True, cu_seqlens_q_host=lengths, cu_seqlens_k_host=lengths)
+        for _ in range(3):  # layers
+            out = backend.prefill(q, kv, kv, None, None, context)
+    ((wrapper, _),) = FlashInferBackend._ragged.values()
+    assert wrapper.plans == [([0, 2, 6], [0, 2, 6], True), ([0, 6], [0, 6], True)]
+    assert out.shape == q.shape
+
+
+def _paged_attention_with_lse(q, k_cache, v_cache, n: int, pages, causal: bool):
+    """One row against its first n cached keys: output [lq, H, D] and log-sum-exp [H, lq]."""
+    page_size = k_cache.size(1)
+    pages = pages[: -(-n // page_size)].long()
+    k, v = (cache[pages].flatten(0, 1)[:n].float() for cache in (k_cache, v_cache))
+    group = q.size(1) // k.size(1)
+    k, v = k.repeat_interleave(group, dim=1), v.repeat_interleave(group, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k) * SCALE
+    if causal:  # bottom-right aligned
+        lq = q.size(0)
+        visible = torch.arange(n) <= (n - lq + torch.arange(lq)).unsqueeze(1)
+        scores = scores.masked_fill(~visible, float("-inf"))
+    return torch.einsum("hqk,khd->qhd", scores.softmax(-1), v).to(q.dtype), scores.logsumexp(-1)
+
+
+class FakeFA3:
+    """flash_attn_with_kvcache and get_scheduler_metadata on the CPU: the real arithmetic, and a schedule that
+    records its problem, so a kernel call can be matched to the schedule it was handed."""
+
+    def __init__(self):
+        self.schedules, self.calls = [], []
+
+    def get_scheduler_metadata(self, cache_seqlens, **problem):
+        self.schedules.append(problem)
+        return torch.tensor([problem["batch_size"], *cache_seqlens.tolist()], dtype=torch.int32)
+
+    def flash_attn_with_kvcache(
+        self,
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens,
+        page_table,
+        cu_seqlens_q=None,
+        max_seqlen_q=None,
+        softmax_scale=None,
+        causal=False,
+        scheduler_metadata=None,
+        return_softmax_lse=False,
+    ):
+        assert softmax_scale == SCALE
+        self.calls.append(scheduler_metadata)
+        bounds = None if cu_seqlens_q is None else cu_seqlens_q.tolist()
+        rows = list(q) if bounds is None else [q[a:b] for a, b in zip(bounds, bounds[1:])]
+        results = [
+            _paged_attention_with_lse(row, k_cache, v_cache, int(n), pages, causal)
+            for row, n, pages in zip(rows, cache_seqlens, page_table)
+        ]
+        if bounds is None:  # batched: out [B, lq, H, D], lse [B, H, lq]
+            out, lse = torch.stack([o for o, _ in results]), torch.stack([lse for _, lse in results])
+        else:  # packed: out [N, H, D], lse [H, N]
+            out, lse = torch.cat([o for o, _ in results]), torch.cat([lse for _, lse in results], dim=1)
+        return (out, lse) if return_softmax_lse else out
+
+
+@pytest.fixture
+def fake_fa3(monkeypatch):
+    from lean_vllm.attention import flash_backend
+
+    fake = FakeFA3()
+    monkeypatch.setattr(flash_backend, "flash_attn_with_kvcache", fake.flash_attn_with_kvcache, raising=False)
+    monkeypatch.setattr(flash_backend, "get_scheduler_metadata", fake.get_scheduler_metadata, raising=False)
+    monkeypatch.setattr(FlashAttention3Backend, "_graph_problems", {})
+    monkeypatch.setattr(FlashAttention3Backend, "_graph_schedules", {})
+    return FlashAttention3Backend(NUM_HEADS, HEAD_DIM, SCALE, NUM_KV_HEADS), fake
+
+
+def _shared_prefix_step(decode: bool):
+    """Three rows whose first two pages are the same blocks, then pages of their own, as a prefix-cache hit leaves
+    them; each has cached keys past the shared pages, so the prefix covers no query."""
+    torch.manual_seed(1)
+    k_cache, v_cache = (torch.randn(12, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM) for _ in range(2))
+    tables = torch.tensor([[0, 1, 2, 3], [0, 1, 4, 5], [0, 1, 6, 7]], dtype=torch.int32)
+    starts, lens = [2 * BLOCK_SIZE + 3, 2 * BLOCK_SIZE + 9, 3 * BLOCK_SIZE], [1, 1, 1] if decode else [4, 1, 6]
+    ends = [s + n for s, n in zip(starts, lens)]
+    cu_q = [0, *torch.tensor(lens).cumsum(0).tolist()]
+    context = Context(
+        is_prefill=not decode,
+        cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, *torch.tensor(ends).cumsum(0).tolist()], dtype=torch.int32),
+        max_seqlen_q=max(lens),
+        context_lens=torch.tensor(ends, dtype=torch.int32),
+        block_tables=tables,
+    )
+    q = torch.randn(cu_q[-1], NUM_HEADS, HEAD_DIM)
+    expected = torch.cat(
+        [
+            _paged_attention_with_lse(q[a:b], k_cache, v_cache, n, pages, causal=True)[0]
+            for a, b, n, pages in zip(cu_q, cu_q[1:], ends, tables)
+        ]
+    )
+    return q, k_cache, v_cache, context, expected
+
+
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "prefill"])
+def test_fa3_cascade_matches_attending_each_row_whole(fake_fa3, decode):
+    """The shared pages read once for every query, unmasked, merged with each row's own keys past them."""
+    backend, fake = fake_fa3
+    q, k_cache, v_cache, context, expected = _shared_prefix_step(decode)
+    context.common_prefix_len = 2 * BLOCK_SIZE
+    attend = backend.decode if decode else lambda *args, **kw: backend.prefill(q, None, None, *args[1:], **kw)
+    out = torch.full_like(q, float("nan"))
+
+    got = attend(q, k_cache, v_cache, context, out=out)
+
+    assert got is out
+    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+    prefix, suffix = fake.schedules
+    assert (prefix["batch_size"], prefix["max_seqlen_q"], prefix["max_seqlen_k"]) == (1, q.size(0), 2 * BLOCK_SIZE)
+    assert not prefix["causal"] and prefix["cu_seqlens_q"] is None
+    assert (suffix["batch_size"], suffix["max_seqlen_k"], suffix["causal"]) == (3, 2 * BLOCK_SIZE, True)
+    suffix_lens = (context.context_lens - 2 * BLOCK_SIZE).tolist()
+    assert fake.calls[1].tolist() == [3, *suffix_lens]  # the suffix call ran on its schedule: each row's keys past it
+
+
+def test_fa3_makes_one_schedule_per_problem_per_step(fake_fa3):
+    """As vLLM's AOT schedule: the first layer to pose a problem makes it, and the rest are handed the same one."""
+    backend, fake = fake_fa3
+    q, k_cache, v_cache, context, expected = _shared_prefix_step(decode=True)
+    for _ in range(3):  # layers
+        torch.testing.assert_close(backend.decode(q, k_cache, v_cache, context), expected, atol=1e-5, rtol=1e-5)
+    assert len(fake.schedules) == 1
+    assert fake.schedules[0]["max_seqlen_k"] == 4 * BLOCK_SIZE  # the page table's width, as the kernel reads it
+    assert all(schedule is fake.calls[0] for schedule in fake.calls)
+
+
+def test_fa3_full_graphs_read_a_schedule_refilled_before_replay(fake_fa3):
+    """Captured largest first; each graph bakes the shared buffer, which a replay refills for its step's lengths."""
+    backend, fake = fake_fa3
+    k_cache, v_cache = make_cache(4, "cpu", BLOCK_SIZE, torch.float32)
+    width = 2
+    for bs in (4, 2):
+        context = Context(
+            context_lens=torch.full((bs,), width * BLOCK_SIZE, dtype=torch.int32),
+            block_tables=torch.zeros(bs, width, dtype=torch.int32),
+            full_graph_size=bs,
+        )
+        for _ in range(2):  # layers
+            backend.decode(torch.zeros(bs, NUM_HEADS, HEAD_DIM), k_cache, v_cache, context)
+    (buffer,) = FlashAttention3Backend._graph_schedules.values()
+    assert len(fake.schedules) == 2 and buffer.numel() == 5
+    assert fake.calls[-1].data_ptr() == buffer.data_ptr()
+
+    step = Context(context_lens=torch.tensor([5, 9], dtype=torch.int32))
+    FlashAttention3Backend.before_full_graph_replay(step, 4)
+
+    assert buffer.tolist() == [4, 5, 9, 0, 0]  # the graph's padding rows hold no keys
+    assert fake.schedules[-1]["batch_size"] == 4 and fake.schedules[-1]["max_seqlen_k"] == width * BLOCK_SIZE
+    FlashAttention3Backend.before_full_graph_replay(step, 2)
+    assert buffer.tolist() == [2, 5, 9, 0, 0]  # a smaller graph's schedule, its stale tail zeroed
+
+
+@pytest.mark.parametrize(
+    "prefix, query_lens, want",
+    [
+        (255, [5] * 8, False),  # too short a prefix
+        (1024, [5] * 7, False),  # too few rows
+        (256, [5] * 8, True),  # prefill: no flash decoding to compete with
+        (4096, [1] * 256, True),  # a wide decode batch: cascade reads the prefix in fewer waves
+        (256, [1] * 8, False),  # a narrow one: flash decoding fills the SMs
+    ],
+)
+def test_fa3_cascades_as_vllms_heuristic_decides(prefix, query_lens, want):
+    """Qwen3-8B's 32 query heads over 8 key heads, on an H100's 132 SMs."""
+    assert flash_backend.use_cascade_attention(prefix, np.array(query_lens), 32, 8, 132) is want

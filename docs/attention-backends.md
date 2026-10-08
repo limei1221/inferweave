@@ -1,200 +1,338 @@
-# Attention Backend Abstraction
+# Attention backends
 
-Status: interface + `TorchAttention` + `FlashAttention3Backend` landed, and
-CUDA-graph capture is gated on `supports_cuda_graph()`.
-Not yet done: FlashInfer / FlashMLA.
-
-## Problem
-
-`layers/attention.py` imported `flash_attn` and Triton at module scope and
-called them directly. Three consequences:
-
-1. The package could not be imported at all without CUDA, so nothing could be
-   developed or tested off a GPU — including the scheduler and block manager,
-   which contain no device code.
-2. There was no reference implementation to check kernels against, although the
-   portfolio quality bar requires differential correctness testing.
-3. Adding FlashInfer or FlashMLA later would have meant `if use_flashinfer:`
-   branches inside model code, which is what this project exists to avoid.
-
-## Design
-
-Models declare attention *semantics*; a backend owns *execution*.
+Models say *what* attention to compute, and an attention backend decides *how*.
+Model code never imports a kernel, so the same model runs on a laptop with plain
+PyTorch and on an H100 with FlashAttention-3, and each backend is tested against
+the same reference. Each layer picks its own backend when it is built.
 
 ```
-Qwen3Attention
+Qwen3Attention / MLAAttention
       |
       v
 layers.attention.Attention        # owns the layer's KV cache slice
       |
       v
-AttentionBackend                  # store_kvcache / prefill / decode
+AttentionBackend                  # the interface
       |
-      +-- TorchAttention          # SDPA, any device, reference oracle
+      +-- TorchAttention          # PyTorch SDPA, any device, the reference
       |
-      +-- FlashAttention3Backend  # flash-attn 3 + Triton scatter, Hopper only
+      +-- FlashInferBackend       # FlashInfer's paged kernels + the Triton scatter, Ampere and newer
+      |
+      +-- FlashAttention3Backend  # FlashAttention-3 + a Triton cache scatter, Hopper only
+            |
+            +-- FlashMLABackend   # FA3, plus FlashMLA's decode for MLA models
 ```
 
-`Attention.__init__` resolves a backend class once and instantiates it per
-layer. `qwen3.py` did not change.
+## What is supported
 
-The interface is deliberately three methods, not one. `store_kvcache` belongs
-to the backend because the *cache layout* is a backend concern — FlashInfer and
-FlashMLA want different layouts, which is why `get_kv_cache_shape` is on the
-interface too, ready for the model runner to consult once the device layer
-lands.
+### Backends
 
-### Tensor contract
+| Backend (name) | Runs on | Serves | KV page size | CUDA graphs | Splits decode from prefill |
+|---|---|---|---|---|---|
+| `torch` | Anything: CPU or any CUDA GPU | Any layer; fp32, fp16 or bf16 | Any multiple of 16 | No, always eager | Yes |
+| `flashinfer` | sm80 and newer (A100, H100, ...), Linux | Plain layers; fp16/bf16; head size 64, 128 or 256 | Any multiple of 16 | Full + piecewise | Yes |
+| `flash_attn_3` | H100 / H200 (sm90), Linux x86_64 | Plain and MLA layers; fp16/bf16; head size a multiple of 8, up to 256 | Any multiple of 16 | Full + piecewise | No |
+| `flashmla` | H100 / H200, with FlashMLA built from source | MLA layers with 512 + 64 latents; as FA3 otherwise | 64 | Full + piecewise | MLA layers split themselves |
 
-Identical across backends; sequences are packed, not padded.
+`torch` is written to be obviously correct, not fast. It is the backend for
+development and tests, not for benchmarks. `torch` and `flashmla` decode MLA
+latents directly (`mla_decode`); `flash_attn_3` expands them.
 
-| | shape |
+An A100 has a fast backend for plain layers, `flashinfer`; its MLA layers fall
+back to `torch`. FlashAttention-2 is not supported.
+
+### Selection
+
+Each layer chooses its backend in `__init__`, as vLLM's `Attention` does. It
+describes itself as a `LayerSpec`: head size, query and key head counts, dtype
+(the model's, which the runner sets as the default while building it), and kind:
+a plain `decoder` layer, or `mla` when it caches latents. Then:
+
+1. the name passed to `get_attention_backend()`, if any;
+2. otherwise `LEAN_VLLM_ATTENTION_BACKEND`;
+3. otherwise the first backend, in the order `flashmla`, `flash_attn_3`,
+   `flashinfer`, `torch`, that is available and whose `validate(spec)` returns
+   no reason against the layer.
+
+`validate` is vLLM's `validate_configuration`: it checks `supported_dtypes`,
+`supports_head_size`, that query heads group evenly over key heads, and
+`supported_kinds`, and a backend can add its own checks (`flashmla` requires
+576-wide latents). So an fp32 layer takes `torch` even on an H100, an MLA layer
+never takes `flashinfer`, and `flashmla` never serves a plain layer. Layers of
+one model may end up on different backends; the runner logs the count per
+backend.
+
+`torch` serves every layer, so automatic selection never fails. Naming a backend
+that is unavailable, or that cannot serve a layer, raises an error listing the
+reasons rather than falling back, because a silent switch to a much slower
+backend in the middle of a benchmark is worse than a crash.
+
+```bash
+LEAN_VLLM_ATTENTION_BACKEND=torch uv run python example.py
+```
+
+When an MLA model's layers would take `flashmla`, `Config` switches the KV cache
+to 64-token pages and logs a warning. It resolves the backend from the spec the
+layers will build, before any layer exists.
+
+Graphs depend on every layer: the runner stays eager if any layer's backend
+reports `supports_cuda_graph()` false, and drops full graphs for piecewise if
+any layer's decode cannot be captured (`Attention.supports_full_cudagraph()`).
+
+### Installing the kernels
+
+- **FlashAttention-3**: `uv sync --extra cuda`. Dao-AILab publishes no wheel,
+  so this installs a third-party build pinned by URL and hash in
+  `pyproject.toml`, for Linux on x86_64 against the pinned torch.
+- **FlashInfer**: also in the `cuda` extra, as `flashinfer-python` on Linux.
+  That wheel compiles its kernels on first use, so the machine needs `nvcc`.
+- **FlashMLA**: build it from source; see
+  [deepseek-v2.md](deepseek-v2.md#running-it).
+- **Triton**: in the `cuda` extra. Its kernels compile on first use.
+
+## What has been verified
+
+| Check | Where | Result |
+|---|---|---|
+| Every available backend against a dense reference: prefill, paged prefill, prefix-cache hits, decode, mixed batches, `varlen_with_lse` | Every machine the suite runs on | Pass |
+| `mla_decode` against the reference at FlashMLA's shapes | CPU (`torch`); H100 (`flashmla`) | Pass on CPU; H100 result not recorded |
+| The CUDA backend against the reference | A100, back when that backend was FlashAttention-2 | Pass |
+| FlashAttention-3 suite | H100 | Not recorded, though both FA3 backends have served benchmarks there |
+| FlashInfer suite | Any sm80+ GPU | **Never run.** The backend was written against the `flashinfer-python` 0.7.0 API and has not executed a kernel |
+| Per-layer selection by dtype, head size, head count and kind; a forced backend that cannot serve a layer | Every machine | Pass |
+| The decode/prefill split: its slices, and a split step against the reference | Every machine (`torch` splits) | Pass |
+| FlashInfer's page table built from host lengths | CPU | Pass |
+| FlashInfer's full-graph wrappers: one per batch size over shared buffers, padded rows, re-planned before replay | CPU, with a fake wrapper | Pass; never captured on a GPU |
+| FlashInfer's ragged plan: one per lengths, shared by a step's layers and reused across steps | CPU, with a fake wrapper | Pass |
+| MLA backend order | Every machine | Pass |
+| FA3's cascade against attending each row whole; one schedule per problem per step; full-graph schedules refilled before replay; vLLM's cascade heuristic | CPU, with a fake kernel that does the arithmetic | Pass; never run on an H100 |
+| The runner's cascade prefix: shared pages, cut to the fewest cached tokens; no full graph on a cascade step | Every machine | Pass |
+
+The reference is `dense_attention` in `tests/test_attention_backends.py`: the
+textbook formula, looped over heads, with no SDPA and no paging, so agreeing with
+it means something. Tests are parametrized over the backends available on the
+machine, so the same file runs on a laptop and on a GPU box.
+
+The suite was mutation-tested: each backend was broken on purpose and the tests
+were run again.
+
+| Mutation | Outcome |
+|---|---|
+| Top-left causal alignment | Caught |
+| Ignore `-1` slots in `store_kvcache` | Caught |
+| Off-by-one in the page gather | Caught |
+| Swap the k and v caches in the gather | Caught |
+| Decode reads the wrong query row | Caught |
+| Drop the `scale` argument | Survived at first, since the tests used SDPA's default scale; fixed with a non-default scale |
+| `repeat` instead of `repeat_interleave` for GQA | Survived at first, since that path is dead on torch ≥ 2.5; fixed by forcing it in the test |
+| Offset the prefill side's key lengths by the query count | Caught |
+| Stop putting one-query rows first | Caught |
+| Run the prefill side over the whole step's context | Caught |
+
+## How it works
+
+### The interface
+
+| Method | Required | What it does |
+|---|---|---|
+| `store_kvcache` | Yes | Scatters this step's keys and values into their cache slots |
+| `prefill` | Yes | Attends packed variable-length rows, reading cached keys when a row resumes |
+| `decode` | Yes | One query per row against the paged cache; the path CUDA graphs capture |
+| `forward` | Has a default | One step: decode for a pure-decode step, else prefill, or both halves when the backend splits |
+| `validate` | Has a default | Why the backend cannot serve a `LayerSpec`; empty if it can |
+| `get_kv_cache_shape` | Has a default | The cache layout, which is the backend's choice |
+| `varlen_with_lse` | For MLA layers | Attention over given keys, no cache, also returning the log-sum-exp |
+| `mla_decode`, `store_latents` | Optional | MLA decode over latents, and the latent cache's scatter |
+
+The KV cache layout belongs to the backend, which is why `store_kvcache` and
+`get_kv_cache_shape` live here. The runner asks each layer for its cache shape
+and allocates each layer's cache on its own, so layers on different backends
+may use different layouts: a plain `Attention` layer answers from its backend,
+and `MLAAttention` answers with its own latent layout
+([deepseek-v2.md](deepseek-v2.md)).
+
+Capability flags tell the runner what a backend can do: `supports_cuda_graph()`,
+`supports_full_cudagraph()`, `split_decodes()`, `supports_mla_decode()`,
+`supports_full_cudagraph_mla_decode()` and `mla_block_size()`. One hook,
+`before_full_graph_replay(context, batch_size)`, runs on each layer's backend
+class before a full graph replays, to refresh state the graph reads but the
+host computes; it does nothing by default.
+
+### Tensor shapes
+
+Sequences are packed, not padded, and every backend takes and returns the same
+shapes.
+
+| | Shape |
 |---|---|
 | `prefill` q | `[num_tokens, num_heads, head_dim]` |
 | `prefill` k, v | `[num_tokens, num_kv_heads, head_dim]`, new tokens only |
 | `prefill` returns | `[num_tokens, num_heads, head_dim]` |
 | `decode` q | `[batch_size, num_heads, head_dim]` |
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
+| `varlen_with_lse` k, v | `[num_keys, num_kv_heads, head_dim]`, no cache |
+| `varlen_with_lse` returns | output as `prefill`, and lse `[num_tokens, num_heads]` |
+| `mla_decode` q | `[batch_size * queries, num_heads, latent_dim]`, the same number of causal queries per row |
+| `mla_decode` returns | `[batch_size * queries, num_heads, v_dim]` |
+| `store_latents` latent | `[num_tokens, latent_dim]`, slot `-1` skips |
 
-`flash_attn_with_kvcache` returns a singleton query axis in the decode shape;
-the flash backend squeezes it so both backends return the same rank. An
-abstraction whose implementations return different shapes is not an
-abstraction.
-
-### Which FlashAttention-3 entry point runs a prefill
-
-FA3 has two, and serving reaches both. The question each step asks is where its
-keys are, not whether it is a prefill:
-
-| step | call |
-|---|---|
-| no row carries cached keys | `flash_attn_varlen_func` on this step's k/v |
-| some row resumes | `flash_attn_with_kvcache` with `page_table` |
-
-FA2's varlen entry point took a `block_table`, so one call covered both. FA3's
-does not, so a step that has to read keys back goes through the kvcache entry
-point instead, which accepts packed queries through `cu_seqlens_q` and one key
-length per row through `cache_seqlens`.
-
-`keys_are_new` on the context is that question answered on the host, where the
-runner already knows it: cumulative query and key lengths are equal exactly when
-no row started from cached tokens. Reading it off the tensors instead would cost
-a sync per layer. Cold prompts and the first chunk of a long one take the varlen
-path and read k and v straight, with no page walk; a prefix-cache hit, a resumed
-chunk, or a decode row mixed into the batch sends the whole step through the
-pages.
-
-Which one a run actually exercises is worth knowing before reading any number
-from it. Chunked prefill admits new prompts into the same step as the running
-decodes, so a loaded server reaches the varlen path rarely: it belongs to steps
-with nothing running, to `bench_offline.py`, and to the chunked-prefill-off arm,
-whose steps are whole prompts and nothing else. Whether it is faster there is
-unmeasured.
-
-The move to FA3 is also what makes the 16-token page the default. FA2 rejected
-any paged block size that was not a multiple of 256, which forced a 256-token
-block and made the KV-cache comparison against vLLM a comparison at vLLM's
-non-default setting. FA3 walks a page table of any size.
-
-`is_available()` requires compute capability 9 rather than any CUDA device:
-FA3's kernels are Hopper's. On anything else selection falls through to
-`TorchAttention`, or raises if FA3 was named explicitly. Dao-AILab publishes no
-FA3 wheel, so `uv sync --extra cuda` installs a third-party build of it, pinned
-by URL and hash in `pyproject.toml`.
+A slot of `-1` marks a row that a CUDA graph padded, and both store methods skip
+it. FA3 returns its lse as `[num_heads, num_tokens]` and a singleton query axis
+in decode, so the flash backend transposes and squeezes to match.
 
 ### Causal masking is bottom-right aligned
 
-The one design decision worth stating loudly. Under prefix caching or chunked
-prefill a sequence has `num_query_tokens < num_key_tokens`, and the queries are
-the **final** `lq` positions of the `lk`-long key sequence. Query `j` attends to
-key positions `0 ..= lk - lq + j`.
+Under chunked prefill or prefix caching a row has fewer queries than keys, and
+its queries are the *last* `lq` of its `lk` keys. Query `j` (0-indexed) attends
+keys `0, …, lk - lq + j`.
 
-`torch.nn.functional.scaled_dot_product_attention(is_causal=True)` implements
-the opposite, **top-left** alignment, and does not raise when `lq != lk` — it
-silently returns a plausible but wrong answer, on exactly the code paths this
-repo has been fixing recently (`fix chunked prefill bugs`, `fix cache hit`).
-`TorchAttention` therefore builds the mask from absolute positions and never
-passes `is_causal`. FlashAttention has used bottom-right alignment since 2.1, so
-the two agree.
+`scaled_dot_product_attention(is_causal=True)` aligns top-left instead, and
+when `lq != lk` it silently returns a plausible but wrong answer. So
+`TorchAttention` builds the mask from absolute positions and never passes
+`is_causal`. FlashAttention has aligned bottom-right since 2.1, so the two
+agree. `test_top_left_causal_alignment_would_be_wrong` checks both that the
+backend matches the reference and that the top-left answer differs, so the test
+cannot quietly stop telling them apart.
 
-`test_top_left_causal_alignment_would_be_wrong` asserts both that the backend
-matches the oracle *and* that the top-left result differs, so the test fails if
-it ever stops discriminating.
+### Mixed batches, and the split into decode and prefill
 
-## Mixed batches
+A step can hold prompt chunks and decode rows together. `prefill` already takes
+packed rows with fewer queries than keys, so a decode row is simply a row with
+one query, and the bottom-right mask already fits it. FA3 runs a mixed step that
+way, in one call, as vLLM's FlashAttention backend does.
 
-A step may hold prompt chunks and decode rows together. No backend change was
-needed for that: `prefill` already takes packed varlen sequences with
-`num_query_tokens < num_key_tokens` per row, so a decode row is simply a row
-whose query length is 1, and the bottom-right mask is already the right one.
-`test_mixed_batch_of_chunks_and_decodes` checks a batch of all three shapes —
-decode row, resumed chunk, cold prefill — against the dense oracle, and
-`test_mixed_batch_matches_running_the_rows_separately` checks that one mixed
-call equals the separate `prefill` and `decode` calls it replaces.
+A backend whose `split_decodes()` is true instead runs the step's one-query rows
+through `decode` and the rest through `prefill`, as vLLM's FlashInfer and MLA
+backends do (their `reorder_batch_threshold` is 1). The pieces:
 
-`decode` survives as the pure-decode fast path, because it is the only shape a
-CUDA graph can capture. The runner selects it only when **no** row is a prompt
-chunk. "Every query length is 1" would be the wrong test: a prompt whose last
-chunk happens to be one token long also has query length 1, and it must take the
-varlen path so that `logits_indices` decides whether it samples.
+1. **Reorder.** `ModelRunner.decodes_first` puts one-query rows first, stably,
+   like vLLM's `reorder_batch`. Only the token layout moves: `logits_indices`
+   still lists sampling rows in the scheduler's order, which is the order it
+   reads tokens back in.
+2. **Split.** `split_decodes_and_prefills(context)` counts the leading
+   one-query rows and slices the step into a decode context and a prefill
+   context, from the host lengths, without a sync. It is built on the first
+   layer's call and cached on the step's context, as are any plans made on it.
+3. **Run.** `AttentionBackend.forward` calls `decode` on the first `n` rows
+   and `prefill` on the rest, and writes both into one output.
 
-## Backend selection
+`MLAAttention` splits the same way and with the same helper, since it plays the
+part of vLLM's `MLACommonImpl`: its decode attends latents and its prefill
+expands them.
 
-`get_attention_backend()` resolves in order: explicit argument,
-`$LEAN_VLLM_ATTENTION_BACKEND`, then the first available entry of `BACKENDS`.
-`TorchAttention.is_available()` is unconditionally true and sits last, so
-resolution cannot fail. Requesting an unavailable backend by name raises rather
-than silently falling back — a silent downgrade to a 50x slower backend during a
-benchmark is worse than a crash.
+A row decodes by its shape, so a one-token prompt chunk joins the decode side:
+attention cannot tell it from a decode. Sampling is decided separately, so it
+still does not sample unless it ends the prompt.
 
-Selection is currently one global choice. Per-layer dispatch on head count,
-dtype, sequence length or prefill-vs-decode belongs behind the same call.
+`decode` on its own remains the pure-decode path, because that is the only shape
+a full CUDA graph can capture. The runner takes it only when **no** row is a
+prompt chunk. Checking that every query length is 1 would be wrong there: a
+prompt chunk can be one token long when the budget runs down to one, and unless
+it ends the prompt it must not sample.
 
-## Testing
+### FlashAttention-3's prefill reads the pages
 
-The oracle in `tests/test_attention_backends.py` is `dense_attention`: a direct
-transcription of the definition, looping over heads, with no SDPA and no paging.
-Agreement with it is evidence rather than tautology.
+As vLLM's V1, a prefill reads every key from the pages, cold rows included:
+`attend` stores the step's keys first, then prefill calls
+`flash_attn_with_kvcache` with `page_table`. FA3's `flash_attn_varlen_func`
+takes no page table, so it serves only calls with no pages: warmup, before the
+cache exists, and MLA's new tokens.
 
-Tests are parametrized over `(backend, device)` pairs filtered by
-`is_available()`, so the same file runs on a CPU-only laptop and, on a GPU box,
-additionally compares `TorchAttention` and `FlashAttention3Backend` on
-identical hardware.
+V0 skipped the pages when no row resumed from cached keys; V1 dropped that
+second path, and so does this backend.
 
-The suite was validated by mutation testing — deliberately breaking the backend
-and confirming tests fail. Two mutations initially survived and both indicated
-real gaps:
+FA3 reads pages of any size, which is what made 16 tokens the default block
+size. FA2 required multiples of 256.
 
-| mutation | outcome |
+### FlashAttention-3: one tile schedule per step, and cascade attention
+
+Without a schedule, every paged FA3 call first runs a pass that splits the
+work across SMs. As vLLM does on FA3, the step's first layer to pose a
+problem builds that schedule with `get_scheduler_metadata`, and every later
+layer is handed it. The schedule and the kernel must be given the same
+arguments. Both take the longest key length from the page table's width, as
+`flash_attn_with_kvcache` does. A full graph reads its decode schedule from a
+buffer that `before_full_graph_replay` refills for the step's lengths, with
+the tail zeroed, as vLLM's `_store_scheduler_metadata` does.
+
+When the step's rows share cached pages, as a common system prompt leaves
+them under prefix caching, the runner offers that prefix for cascade
+attention. As vLLM's `_compute_cascade_attn_prefix_len`, it is cut to the
+fewest cached tokens of any row, so it holds no query, then to whole pages.
+vLLM counts blocks held by every request; the runner compares the step's own
+block tables, so a request that was not scheduled cannot hide the prefix.
+The backend's `use_cascade_attention` is vLLM's heuristic: at least 256
+tokens and 8 rows, and for an all-decode GQA step, fewer waves than flash
+decoding. If every kind of layer agrees, FA3 attends the prefix once for all
+queries, unmasked, then each row's own keys causally, and merges the two into
+the output. A cascade step takes no full graph, as in vLLM. Other backends
+have no cascade path and decline.
+
+### FlashInfer: planned once per step
+
+FlashInfer splits each call into a host-side `plan()`, which builds the work
+schedule from the step's lengths, and a `run()` per layer. Like vLLM's metadata
+builder, the backend plans on the step's first layer and every later layer with
+the same shape reuses the plan. The planned wrappers live in
+`context.attn_metadata`, keyed by kernel and layer shape, so the next step's
+fresh context plans again.
+
+| Rows | Wrapper |
 |---|---|
-| top-left causal alignment | caught |
-| ignore `-1` slots in `store_kvcache` | caught |
-| off-by-one in page gather | caught |
-| swap k/v cache in gather | caught |
-| decode reads wrong query row | caught |
-| drop `scale` argument | **survived** — tests used `head_dim**-0.5`, SDPA's default. Fixed by choosing a non-default scale. |
-| `repeat` instead of `repeat_interleave` for GQA | **survived** — the fallback path is dead on torch >= 2.5. Fixed by forcing it under monkeypatch. |
+| Decode rows | `BatchDecodeWithPagedKVCacheWrapper`, on tensor cores when a key head serves more than 4 query heads, as vLLM chose |
+| Prompt rows | `BatchPrefillWithPagedKVCacheWrapper`, causal (bottom-right aligned), cold rows too, as vLLM's V1 |
+| No pages (warmup) | `BatchPrefillWithRaggedKVCacheWrapper` on this step's k and v |
 
-## Trade-offs
+FlashInfer wants each row's pages packed (a CSR table), not the padded
+`block_tables`. The index pointers and last-page lengths come from the host
+lengths the runner already keeps, and the page gather runs on the device, so
+planning costs no sync. All wrappers share one zeroed 256 MiB workspace.
 
-`TorchAttention` is optimized for being obviously correct, not fast. It walks
-sequences in a Python loop and gathers each one's pages into a contiguous
-tensor before calling SDPA. That costs a host sync per forward pass
-(`.tolist()` on the sequence-length tensors) and memory traffic proportional to
-context length that FlashAttention's on-the-fly page walk avoids. It also makes
-decode data-dependent, so the backend reports
-`supports_cuda_graph() == False`.
+The ragged wrapper is kept per layer shape and re-planned only when a step's
+host lengths differ from its plan's, so every layer of a warmup step shares one
+plan.
 
-This is the right trade for an oracle and for laptop development. It is the
-wrong trade for the Torch-vs-Flash crossover benchmarks, which will otherwise
-measure the Python loop rather than the attention. Batching the loop into padded
-tensors is the obvious next optimization, and should happen before those numbers
-are published.
+The KV cache keeps the layout every backend uses (`[blocks, block_size, heads,
+dim]`, FlashInfer's `NHD`), and keys are stored by the same Triton scatter as
+FA3's.
 
-## Next
+Full graphs capture FlashInfer's decode as vLLM does. A replay runs no
+Python inside the graph, so nothing would plan it; instead:
 
-1. Have `allocate_kv_cache` call `get_kv_cache_shape`; the hook exists but the
-   model runner still hardcodes the FlashAttention layout.
-2. Batch the per-sequence loop in `TorchAttention` before publishing any
-   Torch-vs-Flash crossover numbers.
-3. FlashInfer / FlashMLA backends, then per-layer dispatch.
+1. **Fixed buffers.** One page table (indptr, indices, last-page lengths) sized
+   for the largest captured batch, allocated on the first capture, which is the
+   largest. Each graph's wrapper is built with `use_cuda_graph=True` over slices
+   of it, so the captured kernel reads those addresses.
+2. **A wrapper per batch size.** Under CUDA graphs a wrapper's batch size is
+   fixed, so each captured size gets its own, keyed by `full_graph_size` in the
+   context. It is planned on the capture's warmup pass, with the capture's
+   worst-case lengths, and the capture reuses that plan.
+3. **Re-plan before replay.** `_replay_full` calls `before_full_graph_replay`,
+   which plans that size's wrappers from the step's host lengths, padded to the
+   graph's batch size with empty rows (last-page length 1, as vLLM pads). The
+   plan copies into the fixed buffers, so the replay reads the new step.
+
+This is safe because, in CUDA-graph mode, FlashInfer 0.7.0 decides split-KV
+from the batch size alone (`scheduler.cuh`), so a re-plan never asks for kernels
+the graph did not capture. Each wrapper also allocates its own int workspace,
+so roughly 36 captured sizes cost a few hundred MiB on top of the KV cache.
+
+### Trade-offs of the torch backend
+
+`TorchAttention` pads every row to the step's longest, gathers all rows' pages
+into one contiguous tensor, and makes one masked SDPA call, with no host sync.
+Decode gathers the block table's full width, so it reads no lengths back either.
+The padding and the gathered copy cost memory traffic that grows with batch
+size and context length, and a step that mixes long chunks with decode rows
+spends compute on padding. Each key head's query heads fold into its query axis
+rather than going through `enable_gqa`. The backend still reports no CUDA graph support. That is the right
+trade for a reference and for laptop development, and the wrong one for speed.
+
+## Next steps
+
+1. Run the suite with `flashinfer` on an H100, then serve a Qwen3 model on
+   `flashinfer` with FA3 disabled and compare against vLLM's FlashInfer backend.
+2. Capture a FlashInfer model's full graphs on a GPU and check its decode
+   against eager, then compare decode throughput with piecewise only.
+3. Run FA3's schedule and cascade on an H100: the suite, then Qwen3-8B with a
+   shared system prompt, cascade on and off, against vLLM.

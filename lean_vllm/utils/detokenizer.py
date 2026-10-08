@@ -1,31 +1,34 @@
-# Already-decoded tokens kept as context for the next piece. vLLM uses 5.
-INITIAL_OFFSET = 5
+import logging
+
+from tokenizers.decoders import DecodeStream
+from transformers import PreTrainedTokenizerFast
+
+logger = logging.getLogger(__name__)
+
+INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
 
 
-class IncrementalDetokenizer:
-    """Decodes one token at a time without re-decoding the prefix.
+class FastIncrementalDetokenizer:
+    """Decodes one token at a time with DecodeStream, which holds back a split character rather than emit U+FFFD."""
 
-    Holds back output ending mid-character, so a split character never emits U+FFFD.
-    """
-
-    def __init__(self, tokenizer, prompt_token_ids: list[int], skip_special_tokens: bool = True):
-        self.tokenizer = tokenizer
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerFast, prompt_token_ids: list[int], skip_special_tokens: bool = True
+    ):
+        self.tokenizer = tokenizer._tokenizer
         self.skip_special_tokens = skip_special_tokens
-        self.tokens = tokenizer.convert_ids_to_tokens(prompt_token_ids)
-        self.prefix_offset = max(len(self.tokens) - INITIAL_OFFSET, 0)
-        self.read_offset = len(self.tokens)
-        self.text = ""
+        self.stream = DecodeStream(ids=prompt_token_ids, skip_special_tokens=skip_special_tokens)
 
     def decode(self, token_id: int) -> str:
         """Append one token and return the text it completes, possibly empty."""
-        self.tokens.extend(
-            self.tokenizer.convert_ids_to_tokens([token_id], skip_special_tokens=self.skip_special_tokens)
-        )
-        prefix = self.tokenizer.convert_tokens_to_string(self.tokens[self.prefix_offset:self.read_offset])
-        whole = self.tokenizer.convert_tokens_to_string(self.tokens[self.prefix_offset:])
-        if len(whole) <= len(prefix) or whole.endswith("�"):
-            return ""    # incomplete character; wait for the next token
-        delta = whole[len(prefix):]
-        self.prefix_offset, self.read_offset = self.read_offset, len(self.tokens)
-        self.text += delta
-        return delta
+        try:
+            return self.stream.step(self.tokenizer, token_id) or ""
+        except (OverflowError, TypeError):
+            logger.exception("invalid token id %r", token_id)
+            return ""
+        except Exception as e:
+            if not str(e).startswith(INVALID_PREFIX_ERR_MSG):
+                raise
+            # non-monotonic UTF-8 output breaks the stream; start a fresh one
+            logger.warning("invalid prefix while detokenizing, resetting the decode stream")
+            self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
+            return self.stream.step(self.tokenizer, token_id) or ""

@@ -12,14 +12,22 @@ readme = "README.md"
 description = "a lightweight vLLM implementation for prototyping inference techniques and benchmarking them against vLLM"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch>=2.4.0",
-    "transformers>=4.51.0",
+    "einops",
+    "numpy",    # the runner's batch preparation
+    "safetensors",
+    "tokenizers>=0.22",    # DecodeStream(ids=), for the fast detokenizer
+    "torch>=2.10",    # F.grouped_mm, which the routed experts fall back on, is public from 2.10
+    "tqdm",
+    "transformers>=4.56.0",    # the first release that allows tokenizers 0.22
     "xxhash",
 ]
 
 [project.optional-dependencies]
 serve = [
     "fastapi>=0.115",
+    "httpx",    # the disaggregated proxy's client
+    "pydantic>=2",
+    "pyzmq>=25",    # the engine core process's sockets, as vLLM's
     "uvicorn>=0.30",
 ]
 cuda = [
@@ -31,6 +39,9 @@ cuda = [
     # A prebuilt wheel, pinned by URL below. Scoped to the one platform that
     # wheel is built for, so nothing else can resolve the squatted PyPI name.
     "flash-attn-3; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # The flashinfer backend, for Ampere and newer. It compiles its kernels on
+    # first use, so the machine needs nvcc.
+    "flashinfer-python; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -42,12 +53,15 @@ dev = [
     "pytest",
     "httpx",       # what the openai SDK speaks: the benchmark client and the ASGI tests
     "httpx2",      # starlette's testclient prefers it and warns when it falls back to httpx
+    "numpy",       # bench_serving's percentiles; only transformers pulled it in before
     # the server itself, so `uv run pytest tests/` runs the whole suite rather than
     # skipping the two modules that importorskip fastapi
     "lean-vllm[serve]",
     # example_serving.py. Pinned below 3: openai 3.x streams over httpx2, which
     # prints a cosmetic teardown traceback that makes a working example look broken.
     "openai>=2.0.0,<3",
+    "ruff",
+    "mypy",
 ]
 
 [project.urls]
@@ -63,6 +77,23 @@ filterwarnings = [
     'ignore:`torch\.jit\.script_method` is deprecated:DeprecationWarning',
 ]
 
+[tool.ruff]
+line-length = 120    # what the code is written to
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+    "E501",    # the formatter owns line length; what it cannot wrap is long strings and comments
+    "B905",    # zip(strict=) on every call is noise where lengths match by construction
+    "B027",    # optional hooks on an ABC are empty on purpose
+]
+
+[tool.mypy]
+files = ["lean_vllm"]
+python_version = "3.10"
+ignore_missing_imports = true    # triton, flash_attn, flashinfer and xxhash ship no stubs
+
 [tool.uv]
 required-version = ">=0.12"    # what wrote the committed lock
 
@@ -76,3 +107,6 @@ flash-attn-3 = { url = "https://github.com/mjun0812/flash-attention-prebuild-whe
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lean_vllm*"]
+
+[tool.setuptools.package-data]
+"lean_vllm.layers" = ["moe_configs/*.json"]    # tuned MoE launch configs, written by benchmarks/tune_moe.py

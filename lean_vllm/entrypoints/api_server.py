@@ -1,19 +1,21 @@
-"""OpenAI-compatible HTTP server over `AsyncLLMEngine`."""
+"""OpenAI-compatible HTTP server over `AsyncLLM`, whichever core client it runs."""
 
 import asyncio
 import json
 from contextlib import aclosing, asynccontextmanager
 from time import time
-from typing import AsyncIterator, Awaitable
+from typing import AsyncGenerator, Awaitable, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
-from lean_vllm.engine.async_engine import AsyncLLMEngine, EngineDeadError
+from lean_vllm.engine.async_llm import AsyncLLM
+from lean_vllm.engine.exceptions import EngineDeadError
 from lean_vllm.engine.output import RequestOutput
-from lean_vllm.engine.scheduler import InvalidRequest, QueueFull
+from lean_vllm.engine.scheduler import InvalidRequest
 from lean_vllm.entrypoints import protocol
 from lean_vllm.entrypoints.protocol import (
     BaseRequest,
@@ -27,15 +29,14 @@ from lean_vllm.sampling_params import SamplingParams
 
 DONE = "data: [DONE]\n\n"
 
-# The engine's own reasons; the drops below are not completions and never appear here.
+# The engine's own reasons; a drop, such as "capacity", is not a completion and never appears here.
 FINISH_REASONS = {"stop": "stop", "length": "length", "abort": "stop"}
-DROP_STATUS = {"capacity": 503, "timeout": 504}
 
 
 class _RequestStreamingResponse(StreamingResponse):
     """Own admission cleanup even if sending headers or the first chunk fails."""
 
-    def __init__(self, stream, engine: AsyncLLMEngine, request_id: str):
+    def __init__(self, stream, engine: AsyncLLM, request_id: str):
         super().__init__(stream, media_type="text/event-stream")
         self.engine = engine
         self.request_id = request_id
@@ -49,7 +50,7 @@ class _RequestStreamingResponse(StreamingResponse):
             await self.body_iterator.aclose()
 
 
-def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
+def build_app(engine: AsyncLLM, model: str) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -68,19 +69,24 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
         kind = "server_error" if exc.status_code >= 500 else "invalid_request_error"
         return JSONResponse(status_code=exc.status_code, content=_error(kind, exc.detail))
 
+    # What admission and a dead engine raise, answered once here rather than in every route.
+    @app.exception_handler(InvalidRequest)
+    async def _invalid_request(request: Request, exc: InvalidRequest):
+        return JSONResponse(status_code=400, content=_error("invalid_request_error", str(exc)))
+
+    @app.exception_handler(EngineDeadError)
+    async def _engine_dead(request: Request, exc: EngineDeadError):
+        return JSONResponse(status_code=503, content=_error("server_error", str(exc)))
+
     @app.get("/health")
     async def health():
         if engine.is_dead:
-            raise HTTPException(503, f"the engine thread died: {engine.error!r}")
+            raise HTTPException(503, f"the engine died: {engine.error!r}")
         return {"status": "ok"}
 
     @app.get("/metrics")
     async def metrics():
-        return PlainTextResponse(engine.metrics.render(), media_type="text/plain; version=0.0.4")
-
-    @app.get("/metrics.json")
-    async def metrics_json():
-        return engine.metrics.summary()
+        return PlainTextResponse(await engine.render_metrics(), media_type="text/plain; version=0.0.4")
 
     @app.get("/v1/models")
     async def models():
@@ -104,7 +110,7 @@ def build_app(engine: AsyncLLMEngine, model: str) -> FastAPI:
 
 
 async def _serve(
-    engine: AsyncLLMEngine,
+    engine: AsyncLLM,
     model: str,
     body: BaseRequest,
     prompt_token_ids: list[int],
@@ -115,35 +121,29 @@ async def _serve(
         # As in OpenAI and vLLM, an unserved model name is a 404, not a field to ignore.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
-        raise HTTPException(503, f"the engine thread died: {engine.error!r}")
-    _check_length(engine, body, len(prompt_token_ids))
+        raise HTTPException(503, f"the engine died: {engine.error!r}")
+    kv_transfer_params = body.kv_transfer_params
+    if body.stream and kv_transfer_params and kv_transfer_params.get("do_remote_decode"):
+        # A stream has nowhere to return the params, so the blocks would sit held until they expire.
+        raise HTTPException(400, "do_remote_decode needs a non-streaming request")
     request_id = f"{'chatcmpl' if chat else 'cmpl'}-{uuid4().hex}"
     sampling_params = SamplingParams(
         temperature=body.temperature,
         max_tokens=body.max_tokens,
         ignore_eos=body.ignore_eos,
         priority=body.priority,
+        kv_transfer_params=kv_transfer_params,
     )
-    try:
-        outputs = await engine.add_request(prompt_token_ids, sampling_params, request_id)
-    except InvalidRequest as invalid:
-        raise HTTPException(400, str(invalid))
-    except QueueFull as full:
-        raise HTTPException(429, f"the engine is at capacity: {full}")
-    except EngineDeadError as dead:
-        raise HTTPException(503, str(dead))
+    outputs = await engine.add_request(prompt_token_ids, sampling_params, request_id)
 
     deltas = _deltas(outputs, StopChecker(body.stop_strings), engine, request_id)
     if body.stream:
         stream = _stream(deltas, request_id, model, body, len(prompt_token_ids), chat)
         return _RequestStreamingResponse(stream, engine, request_id)
-    try:
-        reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
-    except EngineDeadError as dead:
-        raise HTTPException(503, str(dead))
+    reply = await _unless_disconnected(request, _collect(deltas, request_id, model, len(prompt_token_ids), chat))
     if reply is None:
-        engine.abort(request_id)    # the generators may never have started, so no finally ran
-        return Response(status_code=499)    # nobody is left to read it
+        engine.abort(request_id)  # the generators may never have started, so no finally ran
+        return Response(status_code=499)  # nobody is left to read it
     return reply
 
 
@@ -157,7 +157,7 @@ async def _unless_disconnected(request: Request | None, work: Awaitable):
         await asyncio.wait((task, listener), return_when=asyncio.FIRST_COMPLETED)
     finally:
         listener.cancel()
-        task.cancel()    # a no-op once done
+        task.cancel()  # a no-op once done
         await asyncio.wait((task,))
     return None if task.cancelled() else task.result()
 
@@ -167,80 +167,98 @@ async def _disconnected(request: Request):
         pass
 
 
-def _check_length(engine: AsyncLLMEngine, body: BaseRequest, num_prompt_tokens: int):
-    """Refused here rather than asserted deep in the runner."""
-    limit = engine.max_model_len
-    if num_prompt_tokens >= limit:
-        raise HTTPException(400, f"prompt is {num_prompt_tokens} tokens, over the {limit}-token context")
-    if num_prompt_tokens + body.max_tokens > limit:
-        raise HTTPException(
-            400,
-            f"prompt ({num_prompt_tokens}) plus max_tokens ({body.max_tokens}) is over the {limit}-token context",
-        )
-
-
 async def _deltas(
-    outputs: AsyncIterator[RequestOutput], checker: StopChecker, engine: AsyncLLMEngine, request_id: str,
+    outputs: AsyncGenerator[RequestOutput, None],
+    checker: StopChecker,
+    engine: AsyncLLM,
+    request_id: str,
 ):
-    """Yields (text, finish_reason, num_completion_tokens); the last has a reason."""
+    """Yields (text, finish_reason, num_completion_tokens, kv_transfer_params); the last has a reason."""
     num_tokens = 0
     try:
         async for output in outputs:
             num_tokens += len(output.token_ids)
             text = checker.push(output.text)
             if checker.matched:
-                engine.abort(request_id, "stop")    # frees the blocks, counted as a finish rather than a cancel
-                yield text, "stop", num_tokens
+                engine.abort(request_id, "stop")  # frees the blocks, counted as a finish rather than a cancel
+                yield text, "stop", num_tokens, None
                 return
             if output.finished:
                 if output.finish_reason not in FINISH_REASONS:
-                    status = DROP_STATUS.get(output.finish_reason, 503)
-                    raise HTTPException(status, f"the engine dropped the request: {output.finish_reason}")
-                yield text + checker.flush(), FINISH_REASONS[output.finish_reason], num_tokens
+                    raise HTTPException(503, f"the engine dropped the request: {output.finish_reason}")
+                reason = FINISH_REASONS[output.finish_reason]
+                yield text + checker.flush(), reason, num_tokens, output.kv_transfer_params
                 return
             if text:
-                yield text, None, num_tokens
+                yield text, None, num_tokens, None
     finally:
         await outputs.aclose()
 
 
 async def _collect(deltas, request_id: str, model: str, num_prompt_tokens: int, chat: bool):
-    text, finish_reason, num_tokens = "", "stop", 0
-    async for delta, reason, num_tokens in deltas:
+    text, finish_reason, num_tokens, kv_transfer_params = "", "stop", 0, None
+    async for delta, reason, num_tokens, kv_transfer_params in deltas:  # noqa: B007 - the last values are kept
         text += delta
         finish_reason = reason or finish_reason
-    build = protocol.chat_body if chat else protocol.completion_body
-    return build(request_id, model, text, finish_reason, protocol.usage(num_prompt_tokens, num_tokens))
+    usage = protocol.usage(num_prompt_tokens, num_tokens)
+    if chat:
+        message = protocol.ChatMessage(role="assistant", content=text)
+        choice = protocol.ChatCompletionResponseChoice(index=0, message=message, finish_reason=finish_reason)
+        return protocol.ChatCompletionResponse(
+            id=request_id,
+            model=model,
+            choices=[choice],
+            usage=usage,
+            kv_transfer_params=kv_transfer_params,
+        )
+    text_choice = protocol.CompletionResponseChoice(index=0, text=text, finish_reason=finish_reason, logprobs=None)
+    return protocol.CompletionResponse(
+        id=request_id,
+        model=model,
+        choices=[text_choice],
+        usage=usage,
+        kv_transfer_params=kv_transfer_params,
+    )
 
 
 async def _stream(deltas, request_id: str, model: str, body: BaseRequest, num_prompt_tokens: int, chat: bool):
+    created = int(time())
+    response: type[BaseModel]
+    if chat:
+        response, kind = protocol.ChatCompletionStreamResponse, "chat.completion.chunk"
+    else:
+        response, kind = protocol.CompletionStreamResponse, "text_completion"
+
+    def chunk(choices: list, **extra) -> str:
+        # kind is the literal its response class asks for, a pairing mypy cannot follow
+        return _event(response(id=request_id, object=kind, created=created, model=model, choices=choices, **extra))  # type: ignore[arg-type]
+
+    def choice(text: str, reason: str | None, role: Literal["assistant"] | None = None):
+        if not chat:
+            return protocol.CompletionResponseChoice(index=0, text=text, finish_reason=reason, logprobs=None)
+        delta = protocol.DeltaMessage(role=role, content=text) if role else protocol.DeltaMessage(content=text)
+        return protocol.ChatCompletionResponseStreamChoice(index=0, delta=delta, finish_reason=reason)
+
     async with aclosing(deltas):
-        created = int(time())
         num_tokens = 0
         if chat:
-            yield _event(protocol.chat_chunk(request_id, model, created, {"role": "assistant", "content": ""}, None))
+            yield chunk([choice("", None, role="assistant")])
         try:
-            async for delta, reason, num_tokens in deltas:
-                if chat:
-                    yield _event(protocol.chat_chunk(request_id, model, created, {"content": delta}, reason))
-                else:
-                    yield _event(protocol.completion_chunk(request_id, model, created, delta, reason))
+            async for delta, reason, num_tokens, _ in deltas:  # noqa: B007 - the last count is kept
+                yield chunk([choice(delta, reason)])
         except (EngineDeadError, HTTPException) as error:
             # The 200 is already sent, so the error rides in the stream.
             yield _event(_error("server_error", str(getattr(error, "detail", error))))
             yield DONE
             return
         if body.include_usage:
-            chunk = protocol.chat_chunk if chat else protocol.completion_chunk
-            body_dict = chunk(request_id, model, created, {} if chat else "", None)
-            body_dict["choices"] = []
-            body_dict["usage"] = protocol.usage(num_prompt_tokens, num_tokens).model_dump()
-            yield _event(body_dict)
+            yield chunk([], usage=protocol.usage(num_prompt_tokens, num_tokens))
         yield DONE
 
 
-def _event(payload: dict) -> str:
-    return f"data: {json.dumps(payload)}\n\n"
+def _event(payload: BaseModel | dict) -> str:
+    data = payload.model_dump_json(exclude_unset=True) if isinstance(payload, BaseModel) else json.dumps(payload)
+    return f"data: {data}\n\n"
 
 
 def _error(kind: str, message: str) -> dict:
