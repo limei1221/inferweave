@@ -5,7 +5,9 @@ from typing import Callable
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch import nn
 
+from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
 from lean_vllm.engine.input_buffers import InputBuffers
 from lean_vllm.models.deepseek_mtp import DeepSeekMTP
 from lean_vllm.utils.context import Context, set_context
@@ -25,6 +27,18 @@ class DraftInputs:
     block_table: np.ndarray | None  # None in warmup, which has no cache
 
 
+class FirstPass(nn.Module):
+    """The drafter's first pass, from token ids. A module of its own, so its compile holds step 0's layer alone,
+    and the later passes, which may run other MTP layers, stay eager or in their full graphs."""
+
+    def __init__(self, drafter: DeepSeekMTP, embed_tokens: Callable[[torch.Tensor], torch.Tensor]):
+        super().__init__()
+        self.drafter, self.embed_tokens = drafter, embed_tokens
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.drafter(self.embed_tokens(input_ids), positions, hidden_states)
+
+
 class MTPProposer:
     """Drafts num_speculative_tokens tokens per sampling row with the checkpoint's MTP layers, as vLLM's proposer.
 
@@ -33,10 +47,13 @@ class MTPProposer:
     is one token per row: the draft before it, at the next position. As vLLM's padded drafter batch, the kept-draft
     counts stay on the device: rejected drafts' rows run in the first pass as padding, and the later passes find
     their positions there, so the host never waits on verification. Those single-token passes replay full CUDA
-    graphs when the target captures its own.
+    graphs when the target captures its own. The first pass is compiled piecewise when the target is, and replays
+    the target's buckets, as vLLM compiles its drafter.
     """
 
     graph_bs: list[int] = []  # captured batch sizes; none until capture_cudagraphs
+    piecewise_bs: list[int] = []  # the first pass's captured token counts; none until capture_piecewise
+    compile_backend: PiecewiseBackend | None = None  # the first pass's pieces, once compiled
 
     def __init__(
         self,
@@ -57,6 +74,8 @@ class MTPProposer:
         self.block_size = block_size
         self.max_model_len = max_model_len
         self.rank, self.world_size = rank, world_size
+        self.device = device
+        self.first_pass = FirstPass(drafter, embed_tokens)
         self.buffers = InputBuffers(device)  # its own, so a draft pass never rewrites the target's inputs
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}  # by MTP layer and batch size
 
@@ -108,8 +127,8 @@ class MTPProposer:
         sample_index += num_accepted
         input_ids[sample_index] = next_token_ids
         positions = inputs.positions
-        with set_context(**{**context, "logits_indices": None}):
-            hidden_states = self.drafter(self.embed_tokens(input_ids), positions, target_hidden_states)
+        with set_context(**{**context, "logits_indices": None}) as first_ctx:
+            hidden_states = self._run_first_pass(input_ids, positions, target_hidden_states, first_ctx)
             hidden_states = hidden_states[sample_index]
             drafts = [self._draft(hidden_states)]
         if not num_rows:
@@ -129,6 +148,51 @@ class MTPProposer:
                     hidden_states = self._replay(layer, graph_bs, drafts[-1], step_positions, hidden_states, step_ctx)
                 drafts.append(self._draft(hidden_states))
         return torch.stack(drafts, dim=1)
+
+    def _run_first_pass(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor, context: Context
+    ) -> torch.Tensor:
+        """The first pass, padded to the smallest captured bucket that holds it, as the target's _replay_piecewise.
+        The target's hidden states are copied in before any replay, which may reuse the pool they sit in."""
+        n = input_ids.size(0)
+        bucket = next((size for size in self.piecewise_bs if size >= n), None)
+        if bucket is not None:
+            graph_vars = self.piecewise_vars
+            graph_vars["input_ids"][:n] = input_ids
+            graph_vars["positions"][:n] = positions
+            graph_vars["hidden_states"][:n] = hidden_states
+            context.piecewise_size, context.num_actual_tokens = bucket, n
+            input_ids, positions = graph_vars["input_ids"][:bucket], graph_vars["positions"][:bucket]
+            hidden_states = graph_vars["hidden_states"][:bucket]
+        return self._first_pass(input_ids, positions, hidden_states)[:n]
+
+    def _first_pass(
+        self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        if self.compile_backend is not None and not self.compile_backend.pieces:  # this call traces
+            mark_dynamic_tokens(input_ids, positions, hidden_states)
+        return self.first_pass(input_ids, positions, hidden_states)
+
+    def compile(self, pool) -> None:
+        """Compile the first pass piecewise, into the target's graph pool; its next call traces."""
+        self.compile_backend = compile_piecewise(self.first_pass, pool)
+
+    @torch.inference_mode()
+    def capture_piecewise(self, size: int) -> None:
+        """Run the compiled first pass over size rows of its buffers, in the runner's capture context for that
+        bucket, so each piece captures its graph. The largest size comes first and sizes the buffers."""
+        if not self.piecewise_bs:
+            weight = next(self.drafter.parameters())
+            self.piecewise_vars = dict(
+                input_ids=torch.zeros(size, dtype=torch.int64, device=self.device),
+                positions=torch.zeros(size, dtype=torch.int64, device=self.device),
+                hidden_states=torch.zeros(size, self.drafter.hidden_size, dtype=weight.dtype, device=self.device),
+            )
+        graph_vars = self.piecewise_vars
+        self._first_pass(
+            graph_vars["input_ids"][:size], graph_vars["positions"][:size], graph_vars["hidden_states"][:size]
+        )
+        self.piecewise_bs = sorted({*self.piecewise_bs, size})
 
     @torch.inference_mode()
     def capture_cudagraphs(self, sizes: list[int], max_num_blocks: int, pool, backends: list) -> None:

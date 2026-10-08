@@ -106,7 +106,7 @@ class ModelRunner:
         register_layers(self.model)  # before warmup_model, which runs the op
         drafter = None
         if config.speculative is not None:
-            # Its own module, so the target's compile and graphs never hold it; it runs eager.
+            # Its own module, so the target's compile and graphs never hold it; it compiles and captures its own.
             drafter = get_drafter_class(hf_config)(hf_config, config.enable_expert_parallel)
             register_layers(drafter)
         # Binds the MoE layers' maps, which every forward reads, and holds a layer's worth of buffer before warmup.
@@ -165,6 +165,8 @@ class ModelRunner:
                 self.world_size,
                 self.device,
             )
+            if self.cudagraph_mode != "none":
+                self.proposer.compile(self.graph_pool)
         self.warmup_model()
         self.allocate_kv_cache()
         self.kv_connector = None
@@ -198,6 +200,9 @@ class ModelRunner:
                 piece.graphs.clear()
             if self.proposer is not None:
                 self.proposer.graphs.clear()
+                if self.proposer.compile_backend is not None:
+                    for piece in self.proposer.compile_backend.pieces:
+                        piece.graphs.clear()
             del self.graphs, self.graph_pool
         dev.synchronize(self.device)  # drain the device
         dist.destroy_process_group()  # drop the comms
@@ -646,6 +651,8 @@ class ModelRunner:
             context["slot_mapping"] = torch.full((size,), -1, dtype=torch.int32)
             with set_context(**context, piecewise_size=size):
                 self.model(input_ids[:size], positions[:size])
+                if self.proposer is not None:  # its first pass runs over the target's batch, so the same buckets
+                    self.proposer.capture_piecewise(size)
             torch.cuda.synchronize()
 
     def _max_num_blocks(self) -> int:

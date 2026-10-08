@@ -17,10 +17,11 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import DeepseekV3Config, PreTrainedTokenizerFast
 from transformers import DeepseekV3ForCausalLM as HFDeepseekV3ForCausalLM
 
+from lean_vllm.engine.compilation import Piece
 from lean_vllm.layers.attention import MLAAttention
 from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.spec_decode.mtp_proposer import MTPProposer
-from lean_vllm.utils.context import set_context
+from lean_vllm.utils.context import get_context, set_context
 
 VOCAB = 128
 NUM_LAYERS = 2
@@ -292,6 +293,45 @@ def test_the_drafts_are_those_of_one_pass_over_the_sequence(
         assert drafts == reference_drafts(engine, token_ids, k), f"after {len(token_ids)} tokens"
     assert sorted(graphs) == [(0, size) for size in graph_sizes or []]
     assert all(graph.replays for graph in graphs.values())
+
+
+def test_the_compiled_first_pass_drafts_as_the_eager_one(make_engine, monkeypatch):
+    """The first pass compiled piecewise, as the runner compiles it on CUDA: steps of up to 8 tokens pad to 8, up to
+    32 to 32, and longer ones run compiled with no bucket. A piece runs its compiled code where CUDA would replay."""
+    k = 2
+    engine = make_engine(k, async_scheduling=True)
+    runner = engine.model_runner
+    monkeypatch.setattr(runner, "rejection_sampler", keep_drafts_at_random)
+    sizes = []
+
+    def run_piece(piece, *args):
+        sizes.append(get_context().piecewise_size)
+        return piece.compiled(*args)
+
+    monkeypatch.setattr(Piece, "__call__", run_piece)
+    proposer = runner.proposer
+    proposer.compile(None)
+    for size in (32, 8):
+        with set_context(**no_cache_context(size), piecewise_size=size):
+            proposer.capture_piecewise(size)
+    capture_draft_passes(engine, monkeypatch, [4])
+    proposed = []
+    reconcile = engine.scheduler.reconcile
+
+    def recording_reconcile(rows, token_ids, draft_token_ids=None):
+        stepped = reconcile(rows, token_ids, draft_token_ids)
+        for row, drafts in zip(rows, draft_token_ids or []):
+            if row.seq in stepped and not row.seq.is_finished:
+                proposed.append((list(row.seq.token_ids), list(drafts)))
+        return stepped
+
+    monkeypatch.setattr(engine.scheduler, "reconcile", recording_reconcile)
+    generate(engine, max_tokens=12)
+
+    assert proposer.piecewise_bs == [8, 32] and len(proposer.compile_backend.pieces) == 2
+    assert set(sizes) == {8, 32, None}
+    for token_ids, drafts in proposed:
+        assert drafts == reference_drafts(engine, token_ids, k), f"after {len(token_ids)} tokens"
 
 
 def test_sampled_decoding_runs_to_its_length(make_engine):

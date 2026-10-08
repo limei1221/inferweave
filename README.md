@@ -16,7 +16,7 @@ hardware.
 | 0 | Attention backend abstraction | interface, per-layer selection, decode/prefill split; Torch, FlashAttention-3 and FlashInfer backends done, plus Triton and FlashInfer MLA decode (FlashInfer and both MLA backends not yet run on a GPU) |
 | 1 | Online serving + advanced scheduler | scheduler, async engine, OpenAI server, metrics and benchmark scripts done; [H100 numbers against vLLM](docs/benchmark-2026-10-03-Qwen3-8B.md) |
 | 2 | DeepSeek-style model support: MLA + MoE + YaRN | DeepSeek-V2-Lite checked against transformers; served on an H100 with FlashMLA decode, the Triton MoE and both graph modes ([numbers](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md)); GPU reference checks still to record |
-| 3 | Speculative decoding | DeepSeek-V3's MTP layers draft, verified by rejection sampling, as vLLM's MTP method; checked on CPU against plain decoding and a one-pass drafter on a tiny checkpoint; drafter's first pass eager and scheduling synchronous; not yet run on a GPU |
+| 3 | Speculative decoding | DeepSeek-V3's MTP layers draft, verified by rejection sampling, as vLLM's MTP method; checked on CPU against plain decoding and a one-pass drafter on a tiny checkpoint; not yet run on a GPU |
 | 4 | Disaggregated prefill / decode | vLLM's connector interface with NixlConnector's pull protocol over TCP, and a proxy; checked end to end on CPU against a single engine ([docs](docs/disaggregated-prefill.md)); not yet run on a GPU |
 
 ## Install
@@ -87,7 +87,8 @@ device, so the host never waits between the two. With `async_scheduling`, as
 vLLM's, the next step is placed as if every draft is kept, verifying
 placeholders the device fills, and the device moves it back past those
 rejected; only a row that expands latents (FA3) waits for the counts. Its
-first pass, over the step's batch, runs eager; the single-token passes after it
+first pass, over the step's batch, is compiled piecewise and replays the
+target's piecewise buckets, as vLLM's drafter; the single-token passes after it
 replay full CUDA graphs whenever the target captures its own.
 `/metrics` reports drafts, draft tokens and accepted tokens, by position too.
 
