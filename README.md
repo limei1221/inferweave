@@ -82,8 +82,9 @@ uv run lean-vllm serve /path/to/deepseek-v3-bf16 --tensor-parallel-size 8 \
 ```
 
 The drafter shares the target's embedding and head, and runs after each step's
-sampling; the kept-draft counts come back to the host between the two, as
-vLLM's `disable_padded_drafter_batch`, so `async_scheduling` turns off. Its
+sampling. As vLLM's padded drafter batch, the kept-draft counts stay on the
+device, so the host never waits between the two; `async_scheduling` still
+turns off, as the scheduler needs those counts for the next step. Its
 first pass, over the step's batch, runs eager; the single-token passes after it
 replay full CUDA graphs whenever the target captures its own.
 `/metrics` reports drafts, draft tokens and accepted tokens, by position too.

@@ -17,6 +17,7 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import DeepseekV3Config, PreTrainedTokenizerFast
 from transformers import DeepseekV3ForCausalLM as HFDeepseekV3ForCausalLM
 
+from lean_vllm.layers.attention import MLAAttention
 from lean_vllm.sampling_params import SamplingParams
 from lean_vllm.spec_decode.mtp_proposer import MTPProposer
 from lean_vllm.utils.context import set_context
@@ -246,14 +247,22 @@ def capture_draft_passes(engine, monkeypatch, sizes: list[int]) -> dict:
     return runner.proposer.graphs
 
 
-# Graphs of 4 rows pad every smaller step; graphs of up to 2 leave larger steps eager.
-@pytest.mark.parametrize("graph_sizes", [None, [4], [1, 2]], ids=["eager", "padded_graphs", "graphs_and_eager"])
-def test_the_drafts_are_those_of_one_pass_over_the_sequence(make_engine, monkeypatch, graph_sizes):
+# Graphs of 4 rows pad every smaller step; graphs of up to 2 leave larger steps eager. A backend with no MLA decode
+# expands latents, planned on the host from key lengths a draft step reads back.
+@pytest.mark.parametrize(
+    "graph_sizes, decode_latents",
+    [(None, True), ([4], True), ([1, 2], True), (None, False)],
+    ids=["eager", "padded_graphs", "graphs_and_eager", "expanded"],
+)
+def test_the_drafts_are_those_of_one_pass_over_the_sequence(make_engine, monkeypatch, graph_sizes, decode_latents):
     """Chunked prompts, kept and rejected drafts' slots, and the later draft positions all feed the drafter's cache,
     whether its single-token passes run eager or replay graphs."""
     k = 2
     engine = make_engine(k)
     monkeypatch.setattr(engine.model_runner, "rejection_sampler", keep_drafts_at_random)
+    for module in engine.model_runner.proposer.drafter.modules():
+        if isinstance(module, MLAAttention) and not decode_latents:
+            monkeypatch.setattr(module.backend, "supports_mla_decode", lambda: False)
     graphs = capture_draft_passes(engine, monkeypatch, graph_sizes) if graph_sizes else {}
     proposed = []
     reconcile = engine.scheduler.reconcile

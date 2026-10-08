@@ -156,7 +156,10 @@ def context_chunks(context: Context, block_size: int, budget: int) -> list[Conte
     """The step's cached keys in chunks, planned on the host once per step."""
     if context.context_chunks is None:
         cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
-        assert cu_q is not None and cu_k is not None and context.block_tables is not None
+        if cu_k is None:  # a draft step's, whose kept drafts only the device knows: read back, a sync
+            assert context.cu_seqlens_k is not None
+            cu_k = context.cu_seqlens_k.tolist()
+        assert cu_q is not None and context.block_tables is not None
         context_lens = [(cu_k[i + 1] - cu_k[i]) - (cu_q[i + 1] - cu_q[i]) for i in range(len(cu_q) - 1)]
         device = context.block_tables.device
         context.context_chunks = []

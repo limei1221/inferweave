@@ -537,8 +537,7 @@ class ModelRunner:
                     tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
         if self.proposer is not None:
             with record_function("propose"):
-                sampled = verified.tolist()  # the drafter's batch depends on the kept drafts; vLLM's unpadded drafter
-                drafts = self.proposer.propose(self._draft_inputs, context, self._hidden_states, sampled)
+                drafts = self.proposer.propose(self._draft_inputs, context, self._hidden_states, verified)
             tokens = torch.cat([verified, drafts], dim=1) if self.rank == 0 else None
         if self.eplb is not None:
             self.eplb.step()  # every rank runs every step, so they rearrange together

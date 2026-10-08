@@ -29,9 +29,10 @@ class MTPProposer:
 
     The first pass runs over the target's whole batch, each token beside the one after it, so the drafter's cache
     follows the target's; its rows end at the last kept token, beside the token sampled after it. Every further pass
-    is one token per row: the draft before it, at the next position. The kept-draft counts are read on the host
-    between the two, as vLLM's drafter does with disable_padded_drafter_batch. Those single-token passes replay
-    full CUDA graphs when the target captures its own.
+    is one token per row: the draft before it, at the next position. As vLLM's padded drafter batch, the kept-draft
+    counts stay on the device: rejected drafts' rows run in the first pass as padding, and the later passes find
+    their positions there, so the host never waits on verification. Those single-token passes replay full CUDA
+    graphs when the target captures its own.
     """
 
     graph_bs: list[int] = []  # captured batch sizes; none until capture_cudagraphs
@@ -75,33 +76,45 @@ class MTPProposer:
 
     @torch.inference_mode()
     def propose(
-        self, inputs: DraftInputs, context: dict, target_hidden_states: torch.Tensor, sampled: list[list[int]]
+        self, inputs: DraftInputs, context: dict, target_hidden_states: torch.Tensor, sampled: torch.Tensor
     ) -> torch.Tensor:
         """Drafts [sampling rows, num_speculative_tokens] after the target's step. sampled is each sampling row's
-        tokens, -1 past its last, as the rejection sampler returns them; context is the target's step."""
-        num_rows = len(sampled)
-        num_accepted = np.array([sum(t >= 0 for t in row) - 1 for row in sampled], np.int64)
+        tokens, -1 past its last, on the device as the rejection sampler returns them; context is the target's step."""
+        num_rows = sampled.size(0)
         token_ids = np.roll(inputs.token_ids, -1)
         not_sampling = inputs.next_token_ids >= 0
         token_ids[inputs.last_index[not_sampling]] = inputs.next_token_ids[not_sampling]
-        # Each sampling row's first draft comes from its last kept token, beside the token sampled after it.
-        sample_index = inputs.last_index[inputs.sampling_rows] - inputs.num_draft_tokens + num_accepted
-        token_ids[sample_index] = [row[n] for row, n in zip(sampled, num_accepted.tolist())]
+        first_draft_index = inputs.last_index[inputs.sampling_rows] - inputs.num_draft_tokens
 
         buffers = self.buffers
         buffers.begin()
         input_ids = buffers.put("input_ids", token_ids, torch.int64)
-        sample_index_t = buffers.put("sample_index", sample_index, torch.int64)
         positions = buffers.put("positions", inputs.positions, torch.int64)
-        steps = [self._step_context(inputs, sample_index, step) for step in range(1, self.num_speculative_tokens)]
+        sample_index = buffers.put("first_draft_index", first_draft_index, torch.int64)
+        cu_seqlens_q = buffers.put("cu_seqlens_q", np.arange(num_rows + 1), torch.int32)
+        table = None
+        if inputs.block_table is not None:  # None in warmup
+            table = buffers.put("block_table", inputs.block_table[inputs.sampling_rows], torch.int32)
         buffers.end()
 
+        # Each sampling row's first draft comes from its last kept token, beside the token sampled after it, as
+        # vLLM's eagle_prepare_inputs_padded_kernel; the rows after it are padding.
+        num_accepted = (sampled >= 0).sum(dim=1) - 1
+        sample_index += num_accepted
+        input_ids[sample_index] = sampled.gather(1, num_accepted.unsqueeze(1)).squeeze(1)
         with set_context(**{**context, "logits_indices": None}):
             hidden_states = self.drafter(self.embed_tokens(input_ids), positions, target_hidden_states)
-            hidden_states = hidden_states[sample_index_t]
+            hidden_states = hidden_states[sample_index]
             drafts = [self._draft(hidden_states)]
         if not num_rows:
             return torch.empty(0, self.num_speculative_tokens, dtype=torch.int64, device=input_ids.device)
+        # Bounded on the host by a row keeping every draft, as vLLM's max_seq_len.
+        max_position = int(inputs.positions[inputs.last_index[inputs.sampling_rows]].max())
+        sample_positions = positions[sample_index]
+        steps = [
+            self._step_context(sample_positions, table, cu_seqlens_q, max_position, step)
+            for step in range(1, self.num_speculative_tokens)
+        ]
         graph_bs = next((size for size in self.graph_bs if size >= num_rows), None)
         for step, (step_positions, step_context) in enumerate(steps, 1):
             with set_context(**step_context) as step_ctx:
@@ -191,34 +204,30 @@ class MTPProposer:
         self.graphs[(layer, bs)].replay()
         return graph_vars["outputs"][:n]
 
-    def _step_context(self, inputs: DraftInputs, sample_index: np.ndarray, step: int) -> tuple[torch.Tensor, dict]:
-        """One token per sampling row, step positions past its last kept one; as a decode step's context."""
-        put = self.buffers.put
-        num_rows = len(sample_index)
+    def _step_context(
+        self,
+        sample_positions: torch.Tensor,
+        table: torch.Tensor | None,
+        cu_seqlens_q: torch.Tensor,
+        max_position: int,
+        step: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """One token per sampling row, step positions past its last kept one; as a decode step's context, built on
+        the device, as vLLM's eagle_step_update_slot_mapping_and_metadata. Key lengths have only a bound on the host."""
+        cu_q = list(range(cu_seqlens_q.numel()))
         # Past max_model_len only for drafts no step would schedule; clamped so the rope cache covers them.
-        positions = np.minimum(inputs.positions[sample_index] + step, self.max_model_len - 1)
-        cu_q = np.arange(num_rows + 1)
-        context: dict = dict(
-            is_prefill=False, max_seqlen_q=1, cu_seqlens_q=put(f"cu_seqlens_q_{step}", cu_q, torch.int32)
-        )
-        if inputs.block_table is None:  # warmup: no cache, so each token attends itself alone
-            context.update(cu_seqlens_k=context["cu_seqlens_q"], max_seqlen_k=1)
-            context.update(cu_seqlens_q_host=cu_q.tolist(), cu_seqlens_k_host=cu_q.tolist())
+        positions = (sample_positions + step).clamp_(max=self.max_model_len - 1)
+        context: dict = dict(is_prefill=False, max_seqlen_q=1, cu_seqlens_q=cu_seqlens_q, cu_seqlens_q_host=cu_q)
+        if table is None:  # warmup: no cache, so each token attends itself alone
+            context.update(cu_seqlens_k=cu_seqlens_q, max_seqlen_k=1, cu_seqlens_k_host=cu_q)
         else:
-            table = inputs.block_table[inputs.sampling_rows]
             lens = positions + 1
-            cu_k = np.zeros(num_rows + 1, np.int64)
-            np.cumsum(lens, out=cu_k[1:])
-            blocks = table[np.arange(num_rows), positions // self.block_size].astype(np.int64)
+            blocks = table.gather(1, (positions // self.block_size).unsqueeze(1)).squeeze(1).long()
             context.update(
-                cu_seqlens_k=put(f"cu_seqlens_k_{step}", cu_k, torch.int32),
-                max_seqlen_k=int(lens.max()) if num_rows else 0,
-                cu_seqlens_q_host=cu_q.tolist(),
-                cu_seqlens_k_host=cu_k.tolist(),
-                slot_mapping=put(
-                    f"slot_mapping_{step}", blocks * self.block_size + positions % self.block_size, torch.int32
-                ),
-                context_lens=put(f"context_lens_{step}", lens, torch.int32),
-                block_tables=put(f"block_tables_{step}", table, torch.int32),
+                cu_seqlens_k=torch.nn.functional.pad(lens.cumsum(0), (1, 0)).int(),
+                max_seqlen_k=min(max_position + step, self.max_model_len - 1) + 1,
+                slot_mapping=(blocks * self.block_size + positions % self.block_size).int(),
+                context_lens=lens.int(),
+                block_tables=table,
             )
-        return put(f"positions_{step}", positions, torch.int64), context
+        return positions, context
