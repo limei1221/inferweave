@@ -8,13 +8,13 @@ from lean_vllm.layers.layernorm import RMSNorm
 from lean_vllm.layers.linear import ReplicatedLinear
 from lean_vllm.models.deepseek_v2 import DeepseekV2DecoderLayer, packed_modules_mapping
 
-# Only the first MTP layer's copies would load in vLLM, and it shares the target's anyway.
+# Copies of the target's weights. vLLM swaps in the target's embed_tokens but keeps each layer's own head.
 SHARED_WEIGHTS = ("embed_tokens.", "shared_head.head.")
 OWN_WEIGHTS = ("enorm.", "hnorm.", "eh_proj.", "shared_head.")
 
 
 class SharedHead(nn.Module):
-    """The checkpoint's shared_head: its norm. Its head is the target's lm_head, as vLLM shares it."""
+    """The checkpoint's shared_head: its norm. Its head is the target's lm_head, the same weights in V3."""
 
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()

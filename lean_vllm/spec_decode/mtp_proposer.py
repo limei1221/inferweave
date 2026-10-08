@@ -132,8 +132,9 @@ class MTPProposer:
 
     @torch.inference_mode()
     def capture_cudagraphs(self, sizes: list[int], max_num_blocks: int, pool, backends: list) -> None:
-        """A full graph of one single-token pass per batch size and MTP layer, as vLLM captures its drafter's;
-        the logits stay eager. backends are the attention backends whose replay hooks run before each replay."""
+        """A full graph of one single-token pass per batch size and MTP layer, where vLLM's drafter takes
+        piecewise graphs only; the logits stay eager. backends are the attention backends whose replay hooks run
+        before each replay."""
         layers = sorted({step % self.drafter.num_mtp_layers for step in range(1, self.num_speculative_tokens)})
         if not layers:
             return  # one draft per row, which the first pass makes
