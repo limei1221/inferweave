@@ -45,6 +45,13 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
     return sorted(set(sizes))
 
 
+def decode_query_len(lens: np.ndarray, num_speculative_tokens: int) -> int:
+    """The query length of the rows MLA decode takes this step: 1, or with drafts the commonest one up to 1 + drafts,
+    as FlashMLA takes one per call. vLLM's FlashMLA likewise needs its decode rows uniform."""
+    short = lens[lens <= 1 + num_speculative_tokens]
+    return int(np.argmax(np.bincount(short))) if short.size else 1
+
+
 class ModelRunner:
     cascade_layers: list[Attention] = []  # one layer per kind, backend and head count; each must agree to cascade
     eplb: EplbState | None = None  # with enable_eplb
@@ -283,7 +290,8 @@ class ModelRunner:
         num_drafts = np.fromiter(
             (0 if seq.is_prefill else seq.num_scheduled_tokens - 1 for seq in seqs), np.int64, num_rows
         )
-        order = np.argsort(lens > 1, kind="stable")  # decodes_first, as indices
+        query_len = decode_query_len(lens, self.num_speculative_tokens)
+        order = np.argsort(lens != query_len, kind="stable")  # decodes_first, as indices
         batch = [seqs[i] for i in order]
         row_of = np.empty(num_rows, np.int64)
         row_of[order] = np.arange(num_rows)  # each scheduled sequence's row in the batch
@@ -354,6 +362,7 @@ class ModelRunner:
             # A pure-decode batch samples on every row, so the gather is skipped.
             logits_indices=buffers.put("logits_indices", logits_indices, torch.int64) if is_prefill else None,
             common_prefix_len=common_prefix_len,
+            decode_query_len=query_len,
         )
         input_ids = buffers.put("input_ids", np.array(token_ids, np.int64), torch.int64)
         positions_t = buffers.put("positions", positions, torch.int64)
@@ -418,10 +427,13 @@ class ModelRunner:
         return 0
 
     @staticmethod
-    def decodes_first(seqs: list[Sequence]) -> list[Sequence]:
-        """The batch's row order: one-query rows first, so a backend that splits a step slices them off, as vLLM's
-        reorder_batch. Stable, and a no-op on a pure-decode step."""
-        return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens > 1)
+    def decodes_first(seqs: list[Sequence], num_speculative_tokens: int = 0) -> list[Sequence]:
+        """The batch's row order: decode rows first, one query each or, verifying drafts, decode_query_len, so a
+        backend that splits a step slices them off, as vLLM's reorder_batch. Stable, and a no-op on a pure-decode
+        step."""
+        lens = np.array([seq.num_scheduled_tokens for seq in seqs], np.int64)
+        query_len = decode_query_len(lens, num_speculative_tokens)
+        return sorted(seqs, key=lambda seq: seq.num_scheduled_tokens != query_len)
 
     def _prev_row(self, seq: Sequence) -> int:
         """Where this sequence sampled in the step still in flight."""

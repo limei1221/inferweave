@@ -246,7 +246,8 @@ class MLAAttention(Attention):
             return self._prefill(q, latent, context, out)  # decode rows expand like prompt rows
         if not context.is_prefill:
             return self._decode_latents(q, context, out)  # pure decode
-        n, decodes, prefills = split_decodes_and_prefills(context)
+        # Rows verifying drafts decode too, several queries each, as vLLM's reorder_batch_threshold of 1 + drafts.
+        n, decodes, prefills = split_decodes_and_prefills(context, context.decode_query_len)
         if decodes is None:
             assert prefills is not None
             return self._prefill(q, latent, prefills, out)
@@ -254,8 +255,9 @@ class MLAAttention(Attention):
             return self._decode_latents(q, decodes, out)
         if out is None:
             out = q.new_empty(self.output_shape(q.size(0)))
-        self._decode_latents(q[:n], decodes, out[:n])
-        self._prefill(q[n:], latent[n:], prefills, out[n:])
+        num_decode_tokens = n * decodes.max_seqlen_q
+        self._decode_latents(q[:num_decode_tokens], decodes, out[:num_decode_tokens])
+        self._prefill(q[num_decode_tokens:], latent[num_decode_tokens:], prefills, out[num_decode_tokens:])
         return out
 
     def _prefill(

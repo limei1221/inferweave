@@ -19,7 +19,8 @@ class Context:
     cu_seqlens_k_host: list[int] | None = None
     context_chunks: list | None = None  # filled on first use by layers.attention.context_chunks
     mla_decode_metadata: object | None = None  # FlashMLA's schedule holder, made by the step's first layer
-    decode_split: tuple | None = None  # filled on first use by split_decodes_and_prefills
+    decode_splits: dict | None = None  # by query length, filled on first use by split_decodes_and_prefills
+    decode_query_len: int = 1  # the leading rows' query length, which MLA decode takes: 1 + drafts when verifying
     attn_metadata: dict | None = None  # what a backend plans on the step's first layer, e.g. FlashInfer's wrappers
     piecewise_size: int | None = None  # the bucket whose piecewise graphs this pass captures or replays
     full_graph_size: int | None = None  # the batch size whose full graph this pass captures
@@ -27,21 +28,25 @@ class Context:
     common_prefix_len: int = 0  # cached tokens every row shares, for a backend to attend once (cascade); 0 is none
 
 
-def split_decodes_and_prefills(context: Context) -> tuple[int, Context | None, Context | None]:
-    """A prefill step's leading one-query rows, as (their count, a decode context, a context for the rest).
+def split_decodes_and_prefills(context: Context, query_len: int = 1) -> tuple[int, Context | None, Context | None]:
+    """A prefill step's leading rows of query_len queries each, as (their count, a decode context, a context for
+    the rest).
 
-    Each context is None when its group has no rows. The runner puts one-query rows first, so the split is a
-    slice, built on the host once per step and shared by every layer, as vLLM's split_decodes_and_prefills.
-    A one-token prompt chunk decodes too: attention can't tell it from a decode, as the query shape is the same.
+    Each context is None when its group has no rows. The runner puts such rows first, so the split is a slice,
+    built on the host once per step and shared by every layer, as vLLM's split_decodes_and_prefills with
+    require_uniform. A prompt chunk of that length decodes too: attention can't tell it from a decode, as the
+    query shape is the same.
     """
     if context.block_tables is None or context.cu_seqlens_q_host is None:
         return 0, None, context  # nothing cached to decode against, or no host lengths to split by
-    if context.decode_split is None:
+    if context.decode_splits is None:
+        context.decode_splits = {}
+    if query_len not in context.decode_splits:
         cu_q, cu_k = context.cu_seqlens_q_host, context.cu_seqlens_k_host
         assert cu_k is not None and context.cu_seqlens_q is not None and context.cu_seqlens_k is not None
         assert context.context_lens is not None
         num_rows = len(cu_q) - 1
-        n = next((i for i in range(num_rows) if cu_q[i + 1] - cu_q[i] > 1), num_rows)
+        n = next((i for i in range(num_rows) if cu_q[i + 1] - cu_q[i] != query_len), num_rows)
         decodes = prefills = None
         if n:
             decodes = Context(
@@ -49,7 +54,7 @@ def split_decodes_and_prefills(context: Context) -> tuple[int, Context | None, C
                 cu_seqlens_k=context.cu_seqlens_k[: n + 1],
                 cu_seqlens_q_host=cu_q[: n + 1],
                 cu_seqlens_k_host=cu_k[: n + 1],
-                max_seqlen_q=1,
+                max_seqlen_q=query_len,
                 max_seqlen_k=max(cu_k[i + 1] - cu_k[i] for i in range(n)),
                 context_lens=context.context_lens[:n],
                 block_tables=context.block_tables[:n],
@@ -69,8 +74,8 @@ def split_decodes_and_prefills(context: Context) -> tuple[int, Context | None, C
                 context_lens=context.context_lens[n:],
                 block_tables=context.block_tables[n:],
             )
-        context.decode_split = (n, decodes, prefills)
-    return context.decode_split
+        context.decode_splits[query_len] = (n, decodes, prefills)
+    return context.decode_splits[query_len]
 
 
 _CONTEXT = Context()

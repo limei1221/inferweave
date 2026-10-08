@@ -221,9 +221,10 @@ class AttentionBackend(ABC):
         v_dim: int,
         context: Context,
     ) -> torch.Tensor:
-        """Single-query attention over a paged MLA latent cache, read as one key head shared by all.
+        """Attention over a paged MLA latent cache, read as one key head shared by all.
 
-        q is [batch_size, num_heads, latent_dim] and latent_cache [num_blocks, block_size, latent_dim].
-        Values are each latent's first v_dim entries, so this returns [batch_size, num_heads, v_dim].
+        Each row has the same number of queries, its last ones, causal: one in decode, 1 + drafts when verifying.
+        q is [batch_size * queries, num_heads, latent_dim] and latent_cache [num_blocks, block_size, latent_dim].
+        Values are each latent's first v_dim entries, so this returns [batch_size * queries, num_heads, v_dim].
         """
         raise NotImplementedError(f"the {self.get_name()} backend has no MLA decode")

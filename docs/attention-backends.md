@@ -172,8 +172,8 @@ shapes.
 | `decode` returns | `[batch_size, num_heads, head_dim]` |
 | `varlen_with_lse` k, v | `[num_keys, num_kv_heads, head_dim]`, no cache |
 | `varlen_with_lse` returns | output as `prefill`, and lse `[num_tokens, num_heads]` |
-| `mla_decode` q | `[batch_size, num_heads, latent_dim]` |
-| `mla_decode` returns | `[batch_size, num_heads, v_dim]` |
+| `mla_decode` q | `[batch_size * queries, num_heads, latent_dim]`, the same number of causal queries per row |
+| `mla_decode` returns | `[batch_size * queries, num_heads, v_dim]` |
 | `store_latents` latent | `[num_tokens, latent_dim]`, slot `-1` skips |
 
 A slot of `-1` marks a row that a CUDA graph padded, and both store methods skip

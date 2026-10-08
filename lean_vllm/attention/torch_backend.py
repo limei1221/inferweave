@@ -102,17 +102,20 @@ class TorchAttention(AttentionBackend):
         return write_into(out, rearrange(o, "b 1 h d -> b h d"))
 
     def mla_decode(self, q, latent_cache, v_dim, context: Context) -> torch.Tensor:
-        # q: [B, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
+        # q: [B * Lq, H, D], D = kv_lora_rank + rope_dim, and v_dim = kv_lora_rank
         block_tables, context_lens = context.block_tables, context.context_lens
         assert block_tables is not None and context_lens is not None
+        lq = q.size(0) // context_lens.size(0)  # queries per row, from the shapes, so no length is read back
         max_seqlen_k = block_tables.size(1) * latent_cache.size(1)
         latent = self._gather_pages(latent_cache, block_tables, max_seqlen_k, context_lens)  # [B, Lk, D]
         kv = repeat(latent, "b lk d -> b h lk d", h=q.size(1))  # [B, H, Lk, D]
-        mask = self._key_mask(context_lens, max_seqlen_k)
+        # Each row's queries are its last Lq tokens, so query j sees keys up to Lk - Lq + j.
+        q_pos = (context_lens - lq).view(-1, 1, 1, 1) + torch.arange(lq, device=q.device).view(-1, 1)  # [B, 1, Lq, 1]
+        mask = self._key_mask(context_lens, max_seqlen_k) & (torch.arange(max_seqlen_k, device=q.device) <= q_pos)
         o = F.scaled_dot_product_attention(
-            rearrange(q, "b h d -> b h 1 d"), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale
+            rearrange(q, "(b lq) h d -> b h lq d", lq=lq), kv, kv[..., :v_dim], attn_mask=mask, scale=self.scale
         )
-        return rearrange(o, "b h 1 d -> b h d")  # [B, H, v_dim]
+        return rearrange(o, "b h lq d -> (b lq) h d")  # [B * Lq, H, v_dim]
 
     @staticmethod
     def _pad_rows(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:

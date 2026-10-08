@@ -53,9 +53,11 @@ class FlashMLABackend(FlashAttention3Backend):
         if context.mla_decode_metadata is None:
             # A holder the kernel fills with the schedule on the first layer's call; the rest reuse it.
             context.mla_decode_metadata, _ = get_mla_metadata()
+        assert context.context_lens is not None
+        batch_size = context.context_lens.size(0)
         o, _ = flash_mla_with_kvcache(
-            q.unsqueeze(1),
-            latent_cache.unsqueeze(-2),  # add a query length and a head dim of 1
+            q.view(batch_size, -1, *q.shape[1:]),  # [B, Lq, H, D]: Lq queries per row, causal, as vLLM's
+            latent_cache.unsqueeze(-2),  # add a head dim of 1
             context.block_tables,
             context.context_lens,
             v_dim,
@@ -63,4 +65,4 @@ class FlashMLABackend(FlashAttention3Backend):
             softmax_scale=self.scale,
             causal=True,
         )
-        return o.squeeze(1)  # match the [batch, heads, v_dim] contract
+        return o.flatten(0, 1)  # match the [batch * queries, heads, v_dim] contract

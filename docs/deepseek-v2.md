@@ -155,8 +155,11 @@ as `mla_decode`. On `flash_attn_3`, decode rows are expanded like prefill.
 **Mixed batches** split into decode rows, which use `mla_decode`, and the rest,
 which expand. The runner puts one-query rows first, so the split is a slice, as
 in vLLM's MLA backends; a one-token prompt chunk decodes too, which attention
-cannot tell apart. The split and the chunk plan are computed once per step and
-reused by every layer.
+cannot tell apart. With MTP drafts, rows verifying 1 + k tokens decode too, k
+up to `num_speculative_tokens`, as vLLM raises `reorder_batch_threshold` by the
+drafts. Like vLLM's FlashMLA, one call takes one query length, so the commonest
+length goes first and decodes; a row of another length expands. The split and
+the chunk plan are computed once per step and reused by every layer.
 
 ### MoE
 

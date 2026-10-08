@@ -137,7 +137,7 @@ def step(runner, model, seqs: list[Sequence]) -> list[torch.Tensor]:
     context["logits_indices"] = None
     with torch.inference_mode(), set_context(**context):
         logits = model.compute_logits(model(input_ids, positions))
-    batch = ModelRunner.decodes_first(seqs)  # the batch's row order, decode rows first
+    batch = ModelRunner.decodes_first(seqs, runner.num_speculative_tokens)  # the batch's row order, decodes first
     by_row = dict(zip(map(id, batch), logits.split([seq.num_scheduled_tokens for seq in batch])))
     return [by_row[id(seq)] for seq in seqs]
 
@@ -238,6 +238,47 @@ def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkey
     if latent_decode:
         # c's two new tokens and six cached ones, per layer.
         assert sum(expanded) == 8 * len(layers)
+
+
+def test_rows_verifying_drafts_decode_their_latents(models, runner, monkeypatch):
+    """Rows of 1 + drafts queries attend the latents through mla_decode, as vLLM's MLA backends with
+    reorder_batch_threshold raised by the drafts; a row of another length, and a prompt, expand beside them."""
+    reference, model = models
+    runner.num_speculative_tokens = 2
+    layers = [module for module in model.modules() if isinstance(module, MLAAttention)]
+    for layer in layers:
+        layer.bind_kv_cache(torch.zeros(*layer.kv_cache_shape(NUM_BLOCKS, BLOCK_SIZE)))
+    a, b, c, d = (torch.randint(0, 128, (n,)).tolist() for n in (12, 9, 10, 6))
+    tables = [[5, 2, 9], [7, 0, 11], [3, 8, 12], [6, 13]]
+    step(runner, model, [row(a, 0, 9, tables[0]), row(b, 0, 6, tables[1]), row(c, 0, 8, tables[2])])
+    decoded = []
+    original = TorchAttention.mla_decode
+
+    def record_decode(self, q, cache, v_dim, context):
+        decoded.append((q.size(0), context.context_lens.tolist()))
+        return original(self, q, cache, v_dim, context)
+
+    monkeypatch.setattr(TorchAttention, "mla_decode", record_decode)
+    seqs = [
+        verify_row(c, 8, 2, tables[2]),  # a draft short, so it expands
+        verify_row(a, 9, 3, tables[0]),
+        row(d, 0, 6, tables[3]),
+        verify_row(b, 6, 3, tables[1]),
+    ]
+    for seq, tokens, got in zip(seqs, [c, a, d, b], step(runner, model, seqs)):
+        want = reference_logits(reference, tokens)[
+            seq.num_cached_tokens : seq.num_cached_tokens + seq.num_scheduled_tokens
+        ]
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    assert decoded == [(6, [12, 9])] * len(layers)
+
+
+def verify_row(tokens: list[int], num_cached: int, num_new: int, block_table: list[int]) -> Sequence:
+    """A decoding sequence whose next num_new - 1 tokens come in as drafts beside its last one."""
+    seq = row(tokens, num_cached, 1, block_table, decode=True)
+    seq.spec_token_ids = tokens[num_cached + 1 : num_cached + num_new]
+    seq.num_scheduled_tokens = num_new
+    return seq
 
 
 class FakeAttention(torch.nn.Module):

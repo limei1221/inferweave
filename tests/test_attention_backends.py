@@ -398,7 +398,16 @@ def test_mla_decode_of_long_rows(backend_cls, block_size):
     )
 
 
-def check_mla_decode(backend_cls, block_size, context_lens, block_tables_list):
+@pytest.mark.parametrize(
+    "backend_cls, block_size", MLA_PAGE_CASES, ids=[f"{b.get_name()}-{size}" for b, size in MLA_PAGE_CASES]
+)
+def test_mla_decode_of_rows_verifying_drafts(backend_cls, block_size):
+    """Several queries per row, its last tokens, each attending the keys up to its own, as a verifying row's."""
+    context_lens = [block_size + 3, 4, 2 * block_size]
+    check_mla_decode(backend_cls, block_size, context_lens, [[2, 0], [3, -1], [1, 4]], queries=4)
+
+
+def check_mla_decode(backend_cls, block_size, context_lens, block_tables_list, queries=1):
     name = backend_cls.get_name()
     device, dtype = torch.device("cpu" if name == "torch" else "cuda"), DTYPE[name]
     backend = backend_cls(NUM_HEADS, LATENT_DIM, SCALE, NUM_HEADS)
@@ -409,7 +418,7 @@ def check_mla_decode(backend_cls, block_size, context_lens, block_tables_list):
         slots = torch.tensor(slots_for(table, block_size, 0, latent.size(0)), device=device)
         cache.view(-1, LATENT_DIM)[slots] = latent
 
-    q = randn(len(context_lens), NUM_HEADS, LATENT_DIM, device=device, dtype=dtype)
+    q = randn(len(context_lens) * queries, NUM_HEADS, LATENT_DIM, device=device, dtype=dtype)
     context = Context(
         context_lens=torch.tensor(context_lens, dtype=torch.int32, device=device),
         block_tables=torch.tensor(block_tables_list, dtype=torch.int32, device=device),
@@ -418,9 +427,10 @@ def check_mla_decode(backend_cls, block_size, context_lens, block_tables_list):
 
     expected = torch.cat(
         [
-            (dense_scores(q[i : i + 1], latent.unsqueeze(1)).softmax(-1) @ latent[:, :LATENT_V_DIM].float()).transpose(
-                0, 1
-            )
+            (
+                dense_scores(q[i * queries : (i + 1) * queries], latent.unsqueeze(1)).softmax(-1)
+                @ latent[:, :LATENT_V_DIM].float()
+            ).transpose(0, 1)
             for i, latent in enumerate(latents)
         ]
     ).to(dtype)
