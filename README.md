@@ -2,7 +2,8 @@
 
 A small inference engine for learning [vLLM](https://github.com/vllm-project/vllm)
 and the concepts behind LLM inference by implementing them. Built on nano-vLLM,
-with selected vLLM features and benchmarks against vLLM.
+with selected vLLM features and benchmarks against vLLM. Runs on CPU or NVIDIA
+GPUs with CUDA.
 
 ## Beyond nano-vLLM
 
@@ -39,9 +40,6 @@ flowchart TD
     Runner --> Spec["spec_decode/<br/>MTP drafts and verification"]
     Engine -.-> KV["kv_transfer/<br/>Prefill/decode cache transfer"]
 ```
-
-[Tests](tests/) check correctness; [benchmarks](benchmarks/) measure performance;
-[docs](docs/) explain the implementations.
 
 ## Quick start
 
@@ -83,10 +81,10 @@ Latest recorded results: 3 October 2026, one H100 80 GB, vLLM 0.26.0,
 
 ![DeepSeek-V2-Lite-Chat: completed requests per second and median time per output token versus offered load](assets/benchmarks/deepseek-v2-lite.png)
 
-Details: [Qwen3-8B](docs/benchmark-2026-10-03-Qwen3-8B.md) ·
-[DeepSeek-V2-Lite](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md) ·
-[Results table](docs/benchmark-results-2026-10-03.md) ·
-[Benchmark scripts](benchmarks/) · [Runbook](docs/benchmark-runbook.md).
+The figures use numbers from the [results table](docs/benchmark-results-2026-10-03.md).
+For detailed analysis, see the 3 October reports for
+[Qwen3-8B](docs/benchmark-2026-10-03-Qwen3-8B.md) and
+[DeepSeek-V2-Lite](docs/benchmark-2026-10-03-DeepSeek-V2-Lite.md).
 
 ## Credit
 
