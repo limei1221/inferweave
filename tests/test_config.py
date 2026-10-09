@@ -22,11 +22,9 @@ def test_async_scheduling_is_on_by_default(make_config):
     assert make_config().async_scheduling
 
 
-def test_tensor_parallelism_turns_async_scheduling_off(make_config, caplog):
-    """Ranks above zero never see the sampled tokens."""
-    config = make_config(tensor_parallel_size=2)
-    assert not config.async_scheduling
-    assert "async_scheduling is off" in caplog.text
+def test_tensor_parallelism_keeps_async_scheduling_on(make_config):
+    """Every rank samples, so each fills its next step's inputs itself."""
+    assert make_config(tensor_parallel_size=2).async_scheduling
 
 
 @pytest.mark.parametrize("architecture, supported", [("DeepseekV2ForCausalLM", True), ("Qwen3ForCausalLM", False)])

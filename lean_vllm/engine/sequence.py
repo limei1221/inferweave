@@ -161,6 +161,10 @@ class Sequence:
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (
+            self.seq_id,
+            self.temperature,
+            self.top_k,
+            self.top_p,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
@@ -174,6 +178,10 @@ class Sequence:
 
     def __setstate__(self, state):
         (
+            self.seq_id,
+            self.temperature,
+            self.top_k,
+            self.top_p,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,

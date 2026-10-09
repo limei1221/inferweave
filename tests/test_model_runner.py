@@ -48,10 +48,7 @@ def test_batch_preparation_on_tensor_parallel_ranks(runner, rank, decode):
         assert context["logits_indices"] is None
     else:
         assert context["logits_indices"].tolist() == [2]
-    if rank:
-        assert temperatures is None
-    else:
-        assert temperatures.tolist() == [0.5]
+    assert temperatures.tolist() == [0.5]  # every rank samples
 
 
 def test_run_returns_tokens_that_are_not_yet_fetched(runner, make_engine):
@@ -542,10 +539,10 @@ class TestDummySamplerRun:
         sampling_runner._dummy_sampler_run()
         assert sampling_runner.sampled[0][0] == (4, 32)
 
-    def test_only_rank_zero_samples(self, sampling_runner):
+    def test_every_rank_samples(self, sampling_runner):
         sampling_runner.rank = 1
         sampling_runner._dummy_sampler_run()
-        assert sampling_runner.sampled == []
+        assert sampling_runner.sampled
 
     def test_running_out_of_memory_names_the_knobs(self, sampling_runner):
         def oom(logits, temperatures, *top_k_top_p):
@@ -556,7 +553,7 @@ class TestDummySamplerRun:
             sampling_runner._dummy_sampler_run()
 
 
-def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
+def reference_batch(seqs: list[Sequence], block_size: int) -> dict:
     """The per-token loops prepare_batch replaced, kept as its oracle; pending tokens aside."""
     out = dict(input_ids=[], positions=[], slot_mapping=[], cu_seqlens_q=[0], cu_seqlens_k=[0], context_lens=[])
     last_tokens = {}
@@ -575,7 +572,7 @@ def reference_batch(seqs: list[Sequence], block_size: int, rank: int) -> dict:
             ]
     sampling = [seq for seq in seqs if id(seq) in last_tokens]
     out["logits_indices"] = [last_tokens[id(seq)] for seq in sampling]
-    temperatures = [seq.temperature for seq in sampling] if rank == 0 else []
+    temperatures = [seq.temperature for seq in sampling]
     out["temperatures"] = None if all(t == 0 for t in temperatures) else temperatures
     tables = [seq.block_table for seq in ModelRunner.decodes_first(seqs)]
     width = max(map(len, tables))
@@ -615,7 +612,7 @@ def test_the_numpy_batch_matches_the_per_token_loops(runner, device, rank):
     rng = random.Random(rank)
     for step in range(20):
         seqs = random_batch(rng, runner.block_size, with_tables=step % 5 != 0)  # every fifth is warmup-like
-        check_batch(runner, seqs, reference_batch(seqs, runner.block_size, rank))
+        check_batch(runner, seqs, reference_batch(seqs, runner.block_size))
 
 
 def check_batch(runner, seqs: list[Sequence], want: dict):

@@ -79,6 +79,13 @@ def test_pending_count_survives_pickle():
     assert restored.num_planned_tokens == 4
 
 
+def test_sampling_params_survive_pickle():
+    """Every rank samples, so each needs the row's id and sampling params."""
+    seq = Sequence([1, 2, 3], SamplingParams(temperature=0.7, top_k=5, top_p=0.9))
+    restored = pickle.loads(pickle.dumps(seq))
+    assert (restored.seq_id, restored.temperature, restored.top_k, restored.top_p) == (seq.seq_id, 0.7, 5, 0.9)
+
+
 def test_commit_without_reservation_raises():
     """Prevent silent counter underflow."""
     seq = make()

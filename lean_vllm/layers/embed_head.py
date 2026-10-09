@@ -51,21 +51,17 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor, all_gather: bool = False):
-        """Logits on rank 0 alone, which samples, or with all_gather on every rank, as vLLM's LogitsProcessor."""
+    def forward(self, x: torch.Tensor):
+        """Logits on every rank, each of which samples, as vLLM's LogitsProcessor with all-gather."""
         context = get_context()
         if context.logits_indices is not None:
             # A chunk that has not finished its prompt has no token to sample.
             # [num_batch_tokens, hidden_dim] -> [num_sampling_rows, hidden_dim]
             x = x[context.logits_indices].contiguous()
         logits = F.linear(x, self.weight)
-        if self.tp_size > 1 and all_gather:
+        if self.tp_size > 1:
             gathered = logits.new_empty(self.tp_size * logits.size(0), logits.size(1))
             dist.all_gather_into_tensor(gathered, logits)
             # [tp * rows, part] -> [rows, tp, part] -> [rows, vocab]
             return gathered.view(self.tp_size, *logits.shape).transpose(0, 1).reshape(logits.size(0), -1)
-        if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0)
-            return torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits

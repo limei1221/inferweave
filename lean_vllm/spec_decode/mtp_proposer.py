@@ -4,7 +4,6 @@ from typing import Callable
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from torch import nn
 
 from lean_vllm.engine.compilation import PiecewiseBackend, compile_piecewise, mark_dynamic_tokens
@@ -59,12 +58,10 @@ class MTPProposer:
         self,
         drafter: DeepSeekMTP,
         embed_tokens: Callable[[torch.Tensor], torch.Tensor],
-        compute_logits: Callable[..., torch.Tensor | None],
+        compute_logits: Callable[[torch.Tensor], torch.Tensor],
         num_speculative_tokens: int,
         block_size: int,
         max_model_len: int,
-        rank: int,
-        world_size: int,
         device: torch.device,
     ):
         self.drafter = drafter
@@ -73,24 +70,15 @@ class MTPProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self.block_size = block_size
         self.max_model_len = max_model_len
-        self.rank, self.world_size = rank, world_size
         self.device = device
         self.first_pass = FirstPass(drafter, embed_tokens)
         self.buffers = InputBuffers(device)  # its own, so a draft pass never rewrites the target's inputs
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}  # by MTP layer and batch size
 
-    def broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Rank 0's tokens on every rank, as only it samples while every rank runs the drafter's layers."""
-        if self.world_size > 1:
-            dist.broadcast(tensor, src=0)
-        return tensor
-
     def _draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy drafts; rejection sampling then needs no draft probabilities. Every rank
         gathers the logits and takes the argmax itself, so no rank waits on another's tokens."""
-        logits = self.compute_logits(hidden_states, all_gather=True)
-        assert logits is not None
-        return logits.argmax(dim=-1)
+        return self.compute_logits(hidden_states).argmax(dim=-1)
 
     @torch.inference_mode()
     def propose(

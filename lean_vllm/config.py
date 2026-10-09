@@ -47,6 +47,7 @@ class Config:
     enable_chunked_prefill: bool = True  # off never mixes prefill and decode, kept for the A/B
     enable_prefix_caching: bool = True  # off recomputes every prompt, kept for the A/B
     async_scheduling: bool = True  # schedule the next step before awaiting the last
+    seed: int = 0  # every rank samples, so all must draw the same random numbers
     prefix_caching_hash_algo: str = "sha256"  # or "xxhash", which is faster and not cryptographic
     scheduling_policy: str = "fcfs"  # or "priority"
     long_prefill_token_threshold: int = 0  # per-step token cap for one prompt; 0 is none
@@ -64,10 +65,6 @@ class Config:
             f"unknown prefix_caching_hash_algo {self.prefix_caching_hash_algo!r}, expected one of {sorted(HASH_ALGOS)}"
         )
         assert 1 <= self.tensor_parallel_size <= 8
-        if self.async_scheduling and self.tensor_parallel_size > 1:
-            # Ranks above zero never see the sampled tokens, so they could not follow.
-            logger.warning("async_scheduling is off: tensor_parallel_size > 1 does not support it")
-            self.async_scheduling = False
         if self.kv_transfer_config and self.kv_transfer is None:
             self.kv_transfer = parse_kv_transfer_config(self.kv_transfer_config)
         if not self.dist_port:  # resolved here, so spawned workers get the same one

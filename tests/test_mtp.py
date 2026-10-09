@@ -364,3 +364,10 @@ def test_sampled_decoding_runs_to_its_length(make_engine):
 def test_tensor_parallel_ranks_draft_together(make_engine):
     want = generate(make_engine())
     assert generate(make_engine(2, tensor_parallel_size=2)) == want
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 2])
+def test_tensor_parallel_ranks_sample_together(make_engine, num_speculative_tokens):
+    """Every rank samples with the same seed; a rank that drew other tokens would feed its next step wrong ones."""
+    want = generate(make_engine(num_speculative_tokens), temperature=0.7)
+    assert generate(make_engine(num_speculative_tokens, tensor_parallel_size=2), temperature=0.7) == want

@@ -160,8 +160,6 @@ class ModelRunner:
                 self.num_speculative_tokens,
                 self.block_size,
                 config.max_model_len,
-                rank,
-                self.world_size,
                 self.device,
             )
             if self.cudagraph_mode != "none":
@@ -183,6 +181,8 @@ class ModelRunner:
             self.capture_piecewise()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        # After warmup and capture, so every rank's samplers start from the same state.
+        torch.manual_seed(config.seed)
 
         if self.world_size > 1 and rank > 0:
             self.loop()
@@ -258,8 +258,6 @@ class ModelRunner:
         hidden_states = torch.rand(num_rows * num_logits, self.config.hf_config.hidden_size)
         with set_context(False):  # no logits_indices, so every row samples
             logits = self.model.compute_logits(hidden_states)
-        if self.rank != 0:
-            return  # only rank 0 gathers logits and samples
         # Non-greedy and truncated, the costlier path: the sort holds the whole vocab twice over.
         temperatures = torch.full((num_rows,), 0.5, dtype=torch.float32)
         top_k = torch.full((num_rows,), logits.size(1) - 1, dtype=torch.int64)
@@ -384,8 +382,7 @@ class ModelRunner:
         offsets = np.arange(num_logits.sum()) - np.repeat(np.cumsum(num_logits) - num_logits, num_logits)
         logits_indices = np.repeat(last_index[row_of[sampling]] - sampling_drafts, num_logits) + offsets
         sampling_rows = [seqs[i] for i in sampling.tolist()]
-        # Only the sampling rank owns sampling parameters.
-        row_temperatures = [seq.temperature for seq in sampling_rows] if self.rank == 0 else []
+        row_temperatures = [seq.temperature for seq in sampling_rows]
 
         block_tables = slot_mapping = None
         common_prefix_len = 0
@@ -424,7 +421,7 @@ class ModelRunner:
         temperatures = None if all_greedy else buffers.put("temperatures", row_temperatures, torch.float32)
         # Both or neither: one sort serves both, and the compiled sampler has no other variant for warmup to compile.
         top_k = top_p = None
-        if self.rank == 0 and any(seq.top_k > 0 or seq.top_p < 1 for seq in sampling_rows):
+        if any(seq.top_k > 0 or seq.top_p < 1 for seq in sampling_rows):
             top_k = buffers.put("top_k", [seq.top_k for seq in sampling_rows], torch.int64)
             top_p = buffers.put("top_p", [seq.top_p for seq in sampling_rows], torch.float32)
         self._top_k_top_p = (top_k, top_p)
@@ -449,10 +446,9 @@ class ModelRunner:
             input_ids.index_copy_(0, dst, in_flight.draft_token_ids.flatten().index_select(0, src))
         if self.proposer is not None:
             num_draft_tokens = buffers.put("num_draft_tokens", sampling_drafts, torch.int64)
-            draft_token_ids = None
-            if self.rank == 0:  # it alone verifies; the drafts are the tokens after each sampling row's first
-                is_draft = offsets < np.repeat(sampling_drafts, num_logits)
-                draft_token_ids = input_ids[buffers.put("draft_index", logits_indices[is_draft] + 1, torch.int64)]
+            # The drafts are the tokens after each sampling row's first.
+            is_draft = offsets < np.repeat(sampling_drafts, num_logits)
+            draft_token_ids = input_ids[buffers.put("draft_index", logits_indices[is_draft] + 1, torch.int64)]
             self._spec_inputs = (draft_token_ids, num_draft_tokens)
             samples = np.zeros(num_rows, bool)
             samples[row_of[sampling]] = True
@@ -605,7 +601,7 @@ class ModelRunner:
         context.piecewise_size, context.num_actual_tokens = bucket, num_tokens
         return self.model(buffers["input_ids"][:bucket], buffers["positions"][:bucket])[:num_tokens]
 
-    def run(self, seqs: list[Sequence]) -> SampledTokens | None:
+    def run(self, seqs: list[Sequence]) -> SampledTokens:
         """Prepare, launch and sample. The tokens are not fetched here; the engine awaits them."""
         with record_function("prepare_batch"):
             input_ids, positions, temperatures, context = self.prepare_batch(seqs)
@@ -617,7 +613,8 @@ class ModelRunner:
                     verified = self._verify(logits, temperatures)
                     tokens = None
                 else:
-                    tokens = self.sampler(logits, temperatures, *self._top_k_top_p) if self.rank == 0 else None
+                    # Every rank samples, from the same logits and seed, so each can feed the next step itself.
+                    tokens = self.sampler(logits, temperatures, *self._top_k_top_p)
         if self.proposer is not None:
             with record_function("propose"):
                 num_accepted = (verified >= 0).sum(dim=1) - 1
@@ -626,28 +623,20 @@ class ModelRunner:
                     self._draft_inputs, context, self._hidden_states, num_accepted, next_token_ids
                 )
             self.in_flight_drafts = InFlightDrafts(next_token_ids, drafts, self._spec_inputs[1] - num_accepted)
-            tokens = torch.cat([verified, drafts], dim=1) if self.rank == 0 else None
-        if tokens is None:
-            return None
+            tokens = torch.cat([verified, drafts], dim=1)
         pending = SampledTokens(tokens, self.device)
         self._prev_tokens = pending
         self._prev_rows = {seq.seq_id: i for i, seq in enumerate(self._sampling_rows)}
         return pending
 
-    def _verify(self, logits: torch.Tensor | None, temperatures: torch.Tensor | None) -> torch.Tensor:
+    def _verify(self, logits: torch.Tensor, temperatures: torch.Tensor | None) -> torch.Tensor:
         """Each sampling row's kept drafts and next token, [rows, num_speculative_tokens + 1], -1 past the last; on
         every rank, as each runs the drafter on them."""
         assert self.proposer is not None
-        if self.rank == 0:
-            draft_token_ids, num_draft_tokens = self._spec_inputs
-            assert logits is not None and draft_token_ids is not None
-            tokens = self.rejection_sampler(
-                logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens, *self._top_k_top_p
-            )
-        else:
-            shape = (len(self._draft_inputs.sampling_rows), self.num_speculative_tokens + 1)
-            tokens = torch.empty(shape, dtype=torch.int64, device=self.device)
-        return self.proposer.broadcast(tokens)
+        draft_token_ids, num_draft_tokens = self._spec_inputs
+        return self.rejection_sampler(
+            logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens, *self._top_k_top_p
+        )
 
     @torch.inference_mode()
     def capture_piecewise(self):

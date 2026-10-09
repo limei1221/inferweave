@@ -43,7 +43,7 @@ def run_rank(rank: int, port: int, path: str, enable_expert_parallel: bool, out:
         input_ids, positions, _, context = runner.prepare_batch([row(PROMPT, 0, len(PROMPT), block_table=[])])
         context["logits_indices"] = None  # every position, not just the last
         with torch.inference_mode(), set_context(**context):
-            logits = model.compute_logits(model(input_ids, positions))  # None off rank 0
+            logits = model.compute_logits(model(input_ids, positions))
         if rank == 0:
             layers = [m for m in model.modules() if isinstance(m, FusedMoE)]
             split = [(m.ep_size, m.tp_size, m.gate_up_proj.size(0), m.gate_up_proj.size(1)) for m in layers]
