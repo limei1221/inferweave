@@ -258,14 +258,20 @@ class ModelRunner:
             logits = self.model.compute_logits(hidden_states)
         if self.rank != 0:
             return  # only rank 0 gathers logits and samples
-        temperatures = torch.full((num_rows,), 0.5, dtype=torch.float32)  # non-greedy, the costlier path
+        # Non-greedy and truncated, the costlier path, as vLLM's: the sort holds the whole vocab twice over.
+        temperatures = torch.full((num_rows,), 0.5, dtype=torch.float32)
+        top_k = torch.full((num_rows,), logits.size(1) - 1, dtype=torch.int64)
+        top_p = torch.full((num_rows,), 0.9, dtype=torch.float32)
         try:
             if self.proposer is None:
-                self.sampler(logits, temperatures)
+                self.sampler(logits, temperatures)  # compiles the untruncated variant too
+                self.sampler(logits, temperatures, top_k, top_p)
             else:
                 num_draft_tokens = torch.full((num_rows,), self.num_speculative_tokens, dtype=torch.int64)
                 drafts = torch.zeros(num_rows * self.num_speculative_tokens, dtype=torch.int64)
-                self.rejection_sampler(logits, drafts, num_draft_tokens, temperatures, self.num_speculative_tokens)
+                self.rejection_sampler(
+                    logits, drafts, num_draft_tokens, temperatures, self.num_speculative_tokens, top_k, top_p
+                )
         except torch.OutOfMemoryError as error:
             raise RuntimeError(
                 f"out of memory warming up the sampler with {num_rows} rows; "
@@ -414,6 +420,12 @@ class ModelRunner:
         positions_t = buffers.put("positions", positions, torch.int64)
         all_greedy = all(temperature == 0 for temperature in row_temperatures)
         temperatures = None if all_greedy else buffers.put("temperatures", row_temperatures, torch.float32)
+        # Both or neither: one sort serves both, and the compiled sampler has no other variant for warmup to compile.
+        top_k = top_p = None
+        if self.rank == 0 and any(seq.top_k > 0 or seq.top_p < 1 for seq in sampling_rows):
+            top_k = buffers.put("top_k", [seq.top_k for seq in sampling_rows], torch.int64)
+            top_p = buffers.put("top_p", [seq.top_p for seq in sampling_rows], torch.float32)
+        self._top_k_top_p = (top_k, top_p)
         if pending_dst:
             if in_flight is not None:
                 prev = in_flight.next_token_ids
@@ -603,7 +615,7 @@ class ModelRunner:
                     verified = self._verify(logits, temperatures)
                     tokens = None
                 else:
-                    tokens = self.sampler(logits, temperatures) if self.rank == 0 else None
+                    tokens = self.sampler(logits, temperatures, *self._top_k_top_p) if self.rank == 0 else None
         if self.proposer is not None:
             with record_function("propose"):
                 num_accepted = (verified >= 0).sum(dim=1) - 1
@@ -628,7 +640,7 @@ class ModelRunner:
             draft_token_ids, num_draft_tokens = self._spec_inputs
             assert logits is not None and draft_token_ids is not None
             tokens = self.rejection_sampler(
-                logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens
+                logits, draft_token_ids, num_draft_tokens, temperatures, self.num_speculative_tokens, *self._top_k_top_p
             )
         else:
             shape = (len(self._draft_inputs.sampling_rows), self.num_speculative_tokens + 1)

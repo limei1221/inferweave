@@ -1,8 +1,10 @@
-"""Prompt validation at admission: the guard both front doors share, without a model."""
+"""Prompt validation at admission: the guard both front doors share, without a model. And generate() and shutdown."""
+
+from types import SimpleNamespace
 
 import pytest
 
-from lean_vllm.engine.llm_engine import validate_request
+from lean_vllm.engine.llm_engine import LLMEngine, validate_request
 from lean_vllm.engine.scheduler import InvalidRequest
 from lean_vllm.sampling_params import SamplingParams
 
@@ -38,3 +40,47 @@ class TestPromptValidation:
 
     def test_the_edges_of_the_vocabulary_are_accepted(self):
         check([0, VOCAB - 1])
+
+
+class TestExit:
+    def test_a_second_exit_is_a_no_op(self):
+        """atexit calls exit() again after a caller's own."""
+        calls: list[str] = []
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.profiler, engine.ps = None, []
+        engine.model_runner = SimpleNamespace(call=calls.append)
+        engine.exit()
+        engine.exit()
+        assert calls == ["exit"]
+
+
+def admitting_engine(refuse: int | None = None) -> tuple[LLMEngine, list[str], list[str]]:
+    """add_request refuses the prompt at index refuse; records what was added and aborted."""
+    added: list[str] = []
+    aborted: list[str] = []
+    engine = LLMEngine.__new__(LLMEngine)
+
+    def add_request(prompt, sampling_params):
+        if len(added) == refuse:
+            raise InvalidRequest("refused")
+        added.append(f"req-{len(added)}")
+        return added[-1]
+
+    engine.add_request = add_request
+    engine.abort_request = aborted.append
+    return engine, added, aborted
+
+
+class TestGenerate:
+    def test_a_refused_prompt_aborts_those_admitted_before_it(self):
+        """Left queued, their outputs would reach the next call, which has no slot for them."""
+        engine, added, aborted = admitting_engine(refuse=1)
+        with pytest.raises(InvalidRequest):
+            engine.generate([[1], [2], [3]], SamplingParams(), use_tqdm=False)
+        assert aborted == added == ["req-0"]
+
+    def test_mismatched_sampling_params_are_refused_before_any_admission(self):
+        engine, added, _ = admitting_engine()
+        with pytest.raises(ValueError, match="2 prompts but 1 sampling params"):
+            engine.generate([[1], [2]], [SamplingParams()], use_tqdm=False)
+        assert not added

@@ -552,6 +552,18 @@ class TestChunkedPrefillDisabled:
         engine.step()
         assert seq.finish_reason == "capacity"
 
+    def test_blocks_freed_by_a_drop_mid_step_admit_no_chunk(self, make_engine):
+        """A decode dropped for capacity frees its blocks, but the prompt waiting on them still goes whole or not
+        at all; this one is over the budget, so not at all."""
+        engine = make_engine(num_kvcache_blocks=4, max_num_batched_tokens=16, enable_chunked_prefill=False)
+        running = engine.add(prompt(8), FOREVER)  # 72 tokens, over the 32-slot cache
+        while len(running.block_table) < 2:
+            engine.step()
+        waiting = engine.add(prompt(24, 100), FOREVER)  # 3 blocks, so it waits for the running one to go
+        engine.run_to_completion()
+        assert running.finish_reason == waiting.finish_reason == "capacity"
+        assert all(r != waiting.request_id for _, rows in engine.model_runner.batches for r, _ in rows)
+
     def test_the_long_prefill_cap_does_not_split_a_prompt(self, make_engine):
         engine = make_engine(max_num_batched_tokens=64, enable_chunked_prefill=False, long_prefill_token_threshold=8)
         seq = engine.add(prompt(40), FOREVER)

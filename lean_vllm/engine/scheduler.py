@@ -129,11 +129,12 @@ class Scheduler:
             still_running.append(seq)
         self.running = still_running
 
-        # Admitting new work while under memory pressure would only preempt again.
-        if not output.preempted:
+        # Admitting new work while under memory pressure would only preempt again. Chunking off, only whole
+        # prompts are admitted, by _schedule_whole_prompts.
+        if self.enable_chunked_prefill and not output.preempted:
             while self.waiting and len(output.scheduled) < self.max_num_seqs and budget > 0:
                 seq = self.waiting.peek()
-                if seq.num_blocks > len(self.block_manager.blocks):
+                if self._never_fits(seq):
                     self.waiting.pop()  # impossible even with the entire cache free
                     self._drop(seq, "capacity", output)
                     continue
@@ -155,7 +156,7 @@ class Scheduler:
         budget = self.max_num_batched_tokens
         while self.waiting and len(output.scheduled) < self.max_num_seqs:
             seq = self.waiting.peek()
-            if seq.num_blocks > len(self.block_manager.blocks):
+            if self._never_fits(seq):
                 self.waiting.pop()
                 self._drop(seq, "capacity", output)
                 continue
@@ -173,6 +174,10 @@ class Scheduler:
                 break
             budget -= self._admit(seq, num_cached_blocks, budget, output)
         return output
+
+    def _never_fits(self, seq: Sequence) -> bool:
+        """Short of blocks with the entire cache free, counting the drafter's lookahead slots as can_allocate does."""
+        return self.block_manager._num_blocks(seq, self.num_lookahead_tokens) > len(self.block_manager.blocks)
 
     def _loads_remotely(self, seq: Sequence) -> bool:
         params = seq.kv_transfer_params

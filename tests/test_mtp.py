@@ -215,7 +215,7 @@ def reference_drafts(engine, token_ids: list[int], k: int) -> list[int]:
     return drafts
 
 
-def keep_drafts_at_random(logits, draft_token_ids, num_draft_tokens, temperatures, max_num_drafts):
+def keep_drafts_at_random(logits, draft_token_ids, num_draft_tokens, temperatures, max_num_drafts, top_k, top_p):
     """Stands in for the rejection sampler, as vLLM's synthetic method: random weights would keep almost no draft.
     Each row keeps a random number of its drafts, then the target's token after them."""
     generator = torch.Generator().manual_seed(len(draft_token_ids) * 1000 + logits.size(0))

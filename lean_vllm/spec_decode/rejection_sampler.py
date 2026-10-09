@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 
+from lean_vllm.layers.sampler import apply_top_k_top_p
 from lean_vllm.spec_decode.config import PLACEHOLDER_TOKEN_ID
 
 
@@ -19,11 +20,14 @@ class RejectionSampler(nn.Module):
         num_draft_tokens: torch.Tensor,
         temperatures: torch.Tensor | None,
         max_num_drafts: int,
+        top_k: torch.Tensor | None = None,
+        top_p: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The tokens each row produced, [rows, max_num_drafts + 1], PLACEHOLDER_TOKEN_ID past its last.
 
         logits holds each row's draft positions, then its bonus position, row after row: [sum(n + 1), vocab].
         draft_token_ids is every row's drafts in the same order, and num_draft_tokens how many each row has.
+        temperatures, top_k and top_p are per row; the target's probabilities are taken after all three, as vLLM's.
         """
         num_rows, num_drafts = num_draft_tokens.numel(), draft_token_ids.numel()
         device = logits.device
@@ -43,7 +47,12 @@ class RejectionSampler(nn.Module):
             candidates = greedy
         else:
             row_temperatures = torch.repeat_interleave(temperatures, num_logits, output_size=logits.size(0))
-            probs = torch.softmax(logits.float() / row_temperatures.clamp_min(1e-10).unsqueeze(1), dim=-1)
+            scaled = logits.float() / row_temperatures.clamp_min(1e-10).unsqueeze(1)
+            if top_k is not None:
+                top_k = torch.repeat_interleave(top_k, num_logits, output_size=logits.size(0))
+            if top_p is not None:
+                top_p = torch.repeat_interleave(top_p, num_logits, output_size=logits.size(0))
+            probs = torch.softmax(apply_top_k_top_p(scaled, top_k, top_p), dim=-1)
             draft_probs = probs[draft_index, draft_token_ids]
             is_greedy = temperatures[draft_rows] == 0
             accepted = torch.where(

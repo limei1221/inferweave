@@ -63,6 +63,31 @@ class TestRejectionSampler:
         both = kept & (out[:, 1] == 2)
         assert (out[both, 2] >= 0).all() and (out[~both, 2] == -1).all()
 
+    def test_top_k_one_keeps_a_draft_only_if_it_is_the_argmax(self):
+        """With the target cut to its argmax, a sampled row verifies as a greedy one."""
+        temperatures, top_k = torch.ones(2), torch.ones(2, dtype=torch.int64)
+        logits = logits_for([4, 6, 1, 2, 2, 2])
+        drafts = torch.tensor([4, 7, 2, 2])
+        out = RejectionSampler()(logits, drafts, torch.tensor([2, 2]), temperatures, 2, top_k, None).tolist()
+        assert out == [[4, 6, -1], [2, 2, 2]]
+
+    def test_a_draft_outside_the_top_p_is_always_rejected(self):
+        torch.manual_seed(0)
+        num_rows = 1000
+        p = torch.tensor([0.6, 0.3, 0.1])
+        logits = p.log().repeat(2 * num_rows, 1)  # each row's draft position and bonus position
+        out = RejectionSampler()(
+            logits,
+            torch.full((num_rows,), 2),  # the 0.1 token, outside the top 0.7
+            torch.ones(num_rows, dtype=torch.int64),
+            torch.ones(num_rows),
+            1,
+            None,
+            torch.full((num_rows,), 0.7),
+        )
+        assert set(out[:, 0].tolist()) == {0, 1}
+        assert (out[:, 1] == -1).all()
+
 
 class FakeDraftingRunner(FakeModelRunner):
     """Verifies drafts as greedy rejection does, and drafts the true tokens except where wrong(seq, index) says.
@@ -170,6 +195,16 @@ class TestScheduler:
         # Async, that next is placed as if the first kept them, which it does.
         a_decodes = [n for _, rows in engine.model_runner.batches for r, n in rows if r == "a"][1:]
         assert a_decodes == [4, 1]
+
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False], ids=["chunked", "whole"])
+    def test_a_prompt_that_fits_only_without_its_lookahead_is_dropped(self, async_scheduling, enable_chunked_prefill):
+        """Its lookahead slots can never be free, so admission would otherwise wait on it forever."""
+        engine = make_drafting_engine(
+            2, num_kvcache_blocks=2, async_scheduling=async_scheduling, enable_chunked_prefill=enable_chunked_prefill
+        )
+        seq = engine.add(list(range(16)), SamplingParams(max_tokens=1))  # both blocks, then one lookahead slot
+        assert engine.run_to_completion() == {seq.request_id: []}
+        assert seq.finish_reason == "capacity"
 
     @pytest.mark.parametrize("wrong", [lambda seq, index: True, lambda seq, index: index % 3 == 1])
     def test_a_rejected_draft_gives_back_its_slot(self, monkeypatch, wrong, async_scheduling):
