@@ -1,9 +1,9 @@
 # lean-vLLM
 
-A small inference engine for learning [vLLM](https://github.com/vllm-project/vllm)
-and the concepts behind LLM inference by implementing them. Built on nano-vLLM,
-with selected vLLM features and benchmarks against vLLM. Runs on CPU or NVIDIA
-GPUs with CUDA.
+A lean inference engine for studying [vLLM](https://github.com/vllm-project/vllm)'s
+design and implementation. It extends
+[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm) with additional vLLM
+features and includes benchmarks against vLLM. Runs on CPU or NVIDIA GPUs with CUDA.
 
 ## Beyond nano-vLLM
 

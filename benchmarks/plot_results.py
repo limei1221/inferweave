@@ -87,13 +87,6 @@ def main():
         fig.legend(
             *axes[0].get_legend_handles_labels(), loc="lower center", bbox_to_anchor=(0.5, 0.08), ncol=2, frameon=False
         )
-        fig.text(
-            0.075,
-            0.025,
-            "Throughput includes queue drain; no latency cutoff. One run per point. Source: docs/benchmark-results-2026-10-03.md",
-            fontsize=8,
-            color="#64748b",
-        )
         output = DESTINATION / filename
         fig.savefig(output, dpi=180)
         plt.close(fig)
