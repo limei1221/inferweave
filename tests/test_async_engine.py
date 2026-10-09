@@ -296,6 +296,21 @@ class TestAbort:
         assert len(blocks.free_block_ids) == free_before
 
     @asyncio_test
+    async def test_abort_ends_a_waiting_reader(self, make_async_engine):
+        """Its state is gone, so no later output would reach the stream."""
+        engine = make_async_engine(gated=True)
+        outputs = await engine.add_request(prompt(8), FOREVER, "aborted")
+        reading = asyncio.ensure_future(anext(outputs))
+        await asyncio.sleep(0)  # now waiting on the stream
+
+        engine.abort("aborted")
+        last = await asyncio.wait_for(reading, 1)
+        assert last.finished and last.finish_reason == "abort"
+        runner_of(engine).release(2)
+        await settle(engine)
+        assert not fake_of(engine).scheduler.seqs
+
+    @asyncio_test
     async def test_abort_of_an_unknown_request_is_harmless(self, make_async_engine):
         engine = make_async_engine()
         engine.abort("req-nobody")

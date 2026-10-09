@@ -56,7 +56,11 @@ class OutputProcessor:
         self.request_states[request_id] = RequestState(detokenizer, stream)
 
     def abort_request(self, request_id: str) -> RequestState | None:
-        return self.request_states.pop(request_id, None)
+        """A live stream gets a final output, so its reader is not left waiting."""
+        state = self.request_states.pop(request_id, None)
+        if state is not None and state.stream is not None:
+            state.stream.put(RequestOutput(request_id, [], finished=True, finish_reason="abort"))
+        return state
 
     def process_outputs(self, outputs: list[RequestOutput]) -> list[RequestOutput]:
         """Fill in each output's text and hand it to its stream. Returns those of requests without one."""

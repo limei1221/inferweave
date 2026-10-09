@@ -269,10 +269,19 @@ class LLMEngine:
         use_tqdm: bool = True,
     ) -> list[dict]:
         """Each prompt's {"text", "token_ids"}, in order."""
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
-        request_ids = [self.add_request(prompt, sp) for prompt, sp in zip(prompts, sampling_params)]
+        if len(sampling_params) != len(prompts):
+            raise ValueError(f"{len(prompts)} prompts but {len(sampling_params)} sampling params")
+        request_ids: list[str] = []
+        try:
+            for prompt, sp in zip(prompts, sampling_params):
+                request_ids.append(self.add_request(prompt, sp))
+        except BaseException:
+            for request_id in request_ids:  # else a later call gets their outputs
+                self.abort_request(request_id)
+            raise
+        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         collected: dict[str, dict] = {request_id: {"text": "", "token_ids": []} for request_id in request_ids}
         prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
