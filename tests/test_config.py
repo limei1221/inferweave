@@ -32,7 +32,7 @@ def test_tensor_parallelism_turns_async_scheduling_off(make_config, caplog):
 @pytest.mark.parametrize("architecture, supported", [("DeepseekV2ForCausalLM", True), ("Qwen3ForCausalLM", False)])
 def test_expert_parallelism_needs_a_moe_model(make_config, monkeypatch, architecture, supported):
     monkeypatch.setattr(FakeHFConfig, "architectures", [architecture], raising=False)
-    assert make_config().enable_expert_parallel is False  # off by default, as in vLLM
+    assert make_config().enable_expert_parallel is False  # off by default
     if supported:
         assert make_config(enable_expert_parallel=True).enable_expert_parallel
     else:

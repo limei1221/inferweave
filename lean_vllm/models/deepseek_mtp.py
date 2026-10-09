@@ -38,11 +38,11 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Nothing comes before position 0, so its embedding is masked, as vLLM's.
+        # Nothing comes before position 0, so its embedding is masked.
         inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
         hidden_states = self.eh_proj(torch.cat([self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)], dim=-1))
         hidden_states, residual = self.mtp_block(positions, hidden_states, None)
-        # Normed once, both for the logits and for the next draft step, as vLLM's and SGLang's.
+        # Normed once, both for the logits and for the next draft step.
         hidden_states, _ = self.shared_head.norm(hidden_states, residual)
         return hidden_states
 

@@ -26,7 +26,7 @@ def shared_mlp(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor, act_f
 
 
 def determine_expert_map(ep_size: int, ep_rank: int, num_experts: int) -> tuple[int, torch.Tensor | None]:
-    """vLLM's linear placement: each rank a contiguous run, the first ranks one extra when it does not divide.
+    """Linear placement: each rank gets a contiguous run, with one extra expert on the first ranks if needed.
 
     The map takes a global expert id to its local one, or -1 for another rank's. None when there is one rank.
     """
@@ -142,7 +142,7 @@ def _(
     return router_logits.new_empty(shape, dtype=torch.float32), router_logits.new_empty(shape, dtype=torch.int32)
 
 
-# Opaque to torch.compile, as vLLM's: the Triton path picks its launch from the batch size, which a trace would fix.
+# Opaque to torch.compile: the Triton path picks its launch from the batch size, which a trace would fix.
 @torch.library.custom_op("lean_vllm::moe_experts", mutates_args=())
 def moe_experts(
     x: torch.Tensor,
@@ -161,7 +161,7 @@ def moe_experts(
             out = out + shared_mlp(x, shared_gate_up, shared_down, silu_and_mul)
         return out
     has_shared = shared_gate_up is not None
-    # A small step leaves SMs idle, so the shared experts take them on a side stream, as in vLLM.
+    # A small step leaves SMs idle, so the shared experts take them on a side stream.
     overlap = has_shared and x.size(0) <= envs.LEAN_VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
     if overlap:
         stream, current = aux_stream(), torch.cuda.current_stream()
@@ -199,7 +199,7 @@ class FusedMoE(nn.Module):
     """Routed experts, stacked per projection and run as two grouped matrix multiplies.
 
     Triton kernels from `fused_moe.py` on CUDA, `grouped_mm` elsewhere. TP shards each expert's intermediate size;
-    with expert parallelism each rank holds whole experts instead, as in vLLM without DP. Either way the ranks'
+    with expert parallelism each rank holds whole experts instead. Either way the ranks'
     partial sums meet in one all-reduce.
     """
 

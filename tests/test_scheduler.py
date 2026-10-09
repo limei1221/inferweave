@@ -83,7 +83,7 @@ class TestFinishReason:
         assert seq.finish_reason == "stop"
 
     def test_a_client_stop_token_is_honoured_even_with_ignore_eos(self, make_engine):
-        """ignore_eos covers the eos token only, as in vLLM."""
+        """ignore_eos covers the eos token only."""
         engine = make_engine()
         seq = engine.add(prompt(8), SamplingParams(max_tokens=64, ignore_eos=True, stop_token_ids=[1002]))
         engine.run_to_completion()

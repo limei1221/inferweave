@@ -49,15 +49,17 @@ def cudagraph_capture_sizes(max_num_seqs: int, max_num_batched_tokens: int) -> l
 
 def decode_query_len(lens: np.ndarray, num_speculative_tokens: int) -> int:
     """The query length of the rows MLA decode takes this step: 1, or with drafts the commonest one up to 1 + drafts,
-    as FlashMLA takes one per call. vLLM's FlashMLA likewise needs its decode rows uniform."""
+    as FlashMLA takes one per call."""
     short = lens[lens <= 1 + num_speculative_tokens]
     return int(np.argmax(np.bincount(short))) if short.size else 1
 
 
 @dataclass(slots=True)
 class InFlightDrafts:
-    """What a launched speculative step leaves on the device for the next, by sampling row: vLLM's
-    prev_sampled_token_ids, _draft_token_ids and valid_sampled_token_count."""
+    """Sampled tokens, drafts, and rejection counts left on the device for the next step, indexed by sampling row.
+
+    Related vLLM state: prev_sampled_token_ids, _draft_token_ids, and valid_sampled_token_count.
+    """
 
     next_token_ids: torch.Tensor  # each row's newest token, after its kept drafts
     draft_token_ids: torch.Tensor  # [rows, num_speculative_tokens], for the next step to verify
@@ -229,7 +231,7 @@ class ModelRunner:
         return self.kv_aggregator.aggregate(outputs) if outputs is not None else None
 
     def compile_model(self):
-        """As vLLM: traced whole, split at attention, pieces compiled by Inductor. Warmup's step runs the compile."""
+        """Traced whole, split at attention, pieces compiled by Inductor. Warmup's step runs the compile."""
         self.graph_pool = torch.cuda.graph_pool_handle()
         self.compile_backend = compile_piecewise(self.model, self.graph_pool)
 
@@ -248,17 +250,17 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _dummy_sampler_run(self):
-        """As vLLM does: a step samples up to one row per sequence, far more than the warmup prefill, so measure that too.
+        """A step samples up to one row per sequence, far more than the warmup prefill, so measure that too.
         With drafts, each row has a logits row per draft beside its own."""
         num_logits = 1 + self.num_speculative_tokens
         num_rows = max(min(self.config.max_num_seqs * num_logits, self.config.max_num_batched_tokens) // num_logits, 1)
-        # Random, as vLLM's: dummy hidden states could hold values that break the sampler.
+        # Random: dummy hidden states could hold values that break the sampler.
         hidden_states = torch.rand(num_rows * num_logits, self.config.hf_config.hidden_size)
         with set_context(False):  # no logits_indices, so every row samples
             logits = self.model.compute_logits(hidden_states)
         if self.rank != 0:
             return  # only rank 0 gathers logits and samples
-        # Non-greedy and truncated, the costlier path, as vLLM's: the sort holds the whole vocab twice over.
+        # Non-greedy and truncated, the costlier path: the sort holds the whole vocab twice over.
         temperatures = torch.full((num_rows,), 0.5, dtype=torch.float32)
         top_k = torch.full((num_rows,), logits.size(1) - 1, dtype=torch.int64)
         top_p = torch.full((num_rows,), 0.9, dtype=torch.float32)
@@ -330,12 +332,12 @@ class ModelRunner:
         # A row with nothing left to prefill samples its last token, and each of its drafts' positions.
         sampling = np.flatnonzero(starts[row_of] + lens[row_of] >= planned)  # in scheduler order
         # Rows of an async step verifying drafts while the step before is in flight: placed as if it kept all of
-        # its own, as vLLM's optimistic num_computed_tokens, and moved back on the device, so the host never waits.
+        # its own, and moved back on the device, so the host never waits.
         in_flight = self.in_flight_drafts
         moved = [i for i, seq in enumerate(batch) if seq.num_pending_tokens] if in_flight is not None else []
         moved_src = [self._prev_row(batch[i]) for i in moved]
         # Rows of several queries prefill, unless every row verifies as many drafts and attends latents: then MLA
-        # decodes them whole, every token samples, and a full graph can hold the step, as vLLM's uniform decode.
+        # decodes them whole, every token samples, and a full graph can hold the step.
         has_prompt = any(seq.is_prefill for seq in seqs)
         uniform = not has_prompt and self.decodes_latents and bool((lens == query_len).all())
         is_prefill = has_prompt or (bool(num_drafts.any()) and not uniform)
@@ -537,8 +539,8 @@ class ModelRunner:
 
     def _step_kind(self, is_prefill: bool, num_tokens: int, cascade: bool = False, query_len: int = 1) -> str:
         """How this step runs: "graph", "piecewise", or why no graph covers it. A decode step's rows each have
-        query_len tokens; the full graphs hold rows of graph_query_len. A cascade step takes no full graph, as in
-        vLLM: the graphs hold the one-kernel decode."""
+        query_len tokens; the full graphs hold rows of graph_query_len. A cascade step takes no full graph:
+        the graphs hold the one-kernel decode."""
         if self.cudagraph_mode == "none":
             return "enforced"
         if not is_prefill and not cascade and self.cudagraph_mode in FULL_MODES and self.graph_bs:
@@ -683,7 +685,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         # With drafts, each decode row verifies them beside its token, so a graph's rows hold 1 + drafts queries,
-        # as vLLM's uniform_decode_query_len; a step of one query per row then runs piecewise, as in vLLM.
+        # as vLLM's uniform_decode_query_len; a step of one query per row then runs piecewise.
         q = self.graph_query_len = 1 + self.num_speculative_tokens
         self.graph_bs = [bs for bs in self._decode_graph_sizes() if bs * q <= config.max_num_batched_tokens]
         if not self.graph_bs:

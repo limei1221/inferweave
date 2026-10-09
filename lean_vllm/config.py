@@ -37,7 +37,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     kvcache_memory_gb: float = 2.0  # cpu only; cuda uses gpu_memory_utilization
     tensor_parallel_size: int = 1
-    enable_expert_parallel: bool = False  # MoE layers hold whole experts per rank, not slices of each; as vLLM
+    enable_expert_parallel: bool = False  # MoE layers hold whole experts per rank, not slices of each
     enforce_eager: bool = False
     cudagraph_mode: str = "full_and_piecewise"  # none | full | piecewise | full_and_piecewise
     hf_config: Any = None  # the checkpoint's transformers config, loaded in __post_init__
@@ -46,14 +46,14 @@ class Config:
     num_kvcache_blocks: int = -1
     enable_chunked_prefill: bool = True  # off never mixes prefill and decode, kept for the A/B
     enable_prefix_caching: bool = True  # off recomputes every prompt, kept for the A/B
-    async_scheduling: bool = True  # schedule the next step before awaiting the last, as vLLM does
+    async_scheduling: bool = True  # schedule the next step before awaiting the last
     prefix_caching_hash_algo: str = "sha256"  # or "xxhash", which is faster and not cryptographic
     scheduling_policy: str = "fcfs"  # or "priority"
     long_prefill_token_threshold: int = 0  # per-step token cap for one prompt; 0 is none
     dist_port: int = 0  # rendezvous port for the ranks; 0 picks a free one
-    kv_transfer_config: str = ""  # JSON, as vLLM's --kv-transfer-config; empty disaggregates nothing
+    kv_transfer_config: str = ""  # JSON connector settings; empty disables disaggregation
     kv_transfer: KVTransferConfig | None = None  # kv_transfer_config, parsed
-    speculative_config: str = ""  # JSON, as vLLM's --speculative-config: method ("mtp"), num_speculative_tokens
+    speculative_config: str = ""  # JSON: method ("mtp"), num_speculative_tokens
     speculative: SpeculativeConfig | None = None  # speculative_config, parsed
 
     def __post_init__(self):

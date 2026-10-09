@@ -33,7 +33,7 @@ def _dead_error(prefix: str, error: BaseException) -> EngineDeadError:
 
 
 class AsyncMPClient:
-    """The engine core in another process, over two ZMQ sockets, as vLLM's AsyncMPClient."""
+    """The engine core in another process, over two ZMQ sockets."""
 
     def __init__(
         self,

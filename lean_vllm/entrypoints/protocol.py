@@ -40,8 +40,8 @@ class BaseRequest(BaseModel):
     model: str
     max_tokens: int = 64
     temperature: float = 1.0  # 0 is greedy
-    top_p: float | None = None  # None is 1.0, the whole vocab, as vLLM's
-    top_k: int | None = None  # None, 0 or -1 is the whole vocab, as vLLM's
+    top_p: float | None = None  # None is 1.0, the whole vocab
+    top_k: int | None = None  # None, 0 or -1 is the whole vocab
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
@@ -49,7 +49,7 @@ class BaseRequest(BaseModel):
     # Extras: the OpenAI schema has no field for these, so they ride in the body.
     ignore_eos: bool = False
     priority: int = 0
-    kv_transfer_params: dict[str, Any] | None = None  # disaggregated prefill, as vLLM's; the proxy sets it
+    kv_transfer_params: dict[str, Any] | None = None  # disaggregated prefill; the proxy sets it
 
     @model_validator(mode="before")
     @classmethod

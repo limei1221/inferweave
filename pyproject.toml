@@ -27,7 +27,7 @@ serve = [
     "fastapi>=0.115",
     "httpx",    # the disaggregated proxy's client
     "pydantic>=2",
-    "pyzmq>=25",    # the engine core process's sockets, as vLLM's
+    "pyzmq>=25",    # the engine core process's sockets
     "uvicorn>=0.30",
 ]
 cuda = [

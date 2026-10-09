@@ -118,7 +118,7 @@ async def _serve(
     request: Request | None = None,
 ):
     if body.model != model:
-        # As in OpenAI and vLLM, an unserved model name is a 404, not a field to ignore.
+        # An unserved model name returns 404.
         raise HTTPException(404, f"the model {body.model!r} does not exist")
     if engine.is_dead:
         raise HTTPException(503, f"the engine died: {engine.error!r}")

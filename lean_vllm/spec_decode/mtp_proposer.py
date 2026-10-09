@@ -40,15 +40,15 @@ class FirstPass(nn.Module):
 
 
 class MTPProposer:
-    """Drafts num_speculative_tokens tokens per sampling row with the checkpoint's MTP layers, as vLLM's proposer.
+    """Drafts num_speculative_tokens tokens per sampling row with the checkpoint's MTP layers.
 
     The first pass runs over the target's whole batch, each token beside the one after it, so the drafter's cache
     follows the target's; its rows end at the last kept token, beside the token sampled after it. Every further pass
-    is one token per row: the draft before it, at the next position. As vLLM's padded drafter batch, the kept-draft
+    is one token per row: the draft before it, at the next position. The kept-draft
     counts stay on the device: rejected drafts' rows run in the first pass as padding, and the later passes find
     their positions there, so the host never waits on verification. Those single-token passes replay full CUDA
     graphs when the target captures its own. The first pass is compiled piecewise when the target is, and replays
-    the target's buckets, as vLLM compiles its drafter.
+    the target's buckets.
     """
 
     graph_bs: list[int] = []  # captured batch sizes; none until capture_cudagraphs
@@ -86,8 +86,8 @@ class MTPProposer:
         return tensor
 
     def _draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Greedy drafts, as vLLM's MTP drafts; rejection sampling then needs no draft probabilities. Every rank
-        gathers the logits and takes the argmax itself, as vLLM's default, so no rank waits on another's tokens."""
+        """Greedy drafts; rejection sampling then needs no draft probabilities. Every rank
+        gathers the logits and takes the argmax itself, so no rank waits on another's tokens."""
         logits = self.compute_logits(hidden_states, all_gather=True)
         assert logits is not None
         return logits.argmax(dim=-1)

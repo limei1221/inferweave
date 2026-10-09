@@ -1,4 +1,4 @@
-"""temperature == 0 means greedy, and must not divide the logits by zero; top-k and top-p truncate as vLLM's."""
+"""temperature == 0 means greedy, and must not divide the logits by zero; top-k and top-p truncate the distribution."""
 
 import torch
 
@@ -66,7 +66,7 @@ def test_top_k_samples_only_from_each_rows_top_k():
 
 
 def test_top_p_keeps_the_smallest_set_reaching_p():
-    """As vLLM's: a token goes only while the mass below it is within 1 - p, so the most likely always stays."""
+    """A token goes only while the mass below it is within 1 - p, so the most likely always stays."""
     probs = torch.tensor([0.5, 0.3, 0.15, 0.05]).repeat(3, 1)
     masked = apply_top_k_top_p(probs.log(), None, torch.tensor([0.75, 0.9, 0.1]))
     assert torch.isfinite(masked).tolist() == [

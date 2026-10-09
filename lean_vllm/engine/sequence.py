@@ -12,12 +12,12 @@ from lean_vllm.sampling_params import SamplingParams
 
 
 def _serialize(token_ids: tuple[int, ...], prefix: int) -> bytes:
-    """Pickle, as vLLM does. Stable within a Python version, not across them."""
+    """Pickle serialization. Stable within a Python version, not across them."""
     return pickle.dumps((prefix, token_ids), protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def sha256_hash(token_ids: tuple[int, ...], prefix: int) -> int:
-    """The default, and vLLM's. A collision would serve one tenant another's tokens."""
+    """The default hash. A collision would serve one tenant another's tokens."""
     return int.from_bytes(hashlib.sha256(_serialize(token_ids, prefix)).digest(), "big")
 
 

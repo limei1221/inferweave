@@ -1,6 +1,6 @@
 """Disaggregated prefill end to end: a prefill and a decode engine, each in its own process, on a real model on CPU.
 
-The decode engine recomputes the last prompt token against the pulled KV, as vLLM's does, so its greedy tokens are
+The decode engine recomputes the last prompt token against the pulled KV, so its greedy tokens are
 compared with the prefill engine running the same prompt split the same way: all but one token, then that one.
 """
 

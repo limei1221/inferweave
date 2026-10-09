@@ -76,7 +76,7 @@ class FlashAttention3Backend(AttentionBackend):
 
     @staticmethod
     def supports_head_size(head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256  # as vLLM's FlashAttention backend
+        return head_size % 8 == 0 and head_size <= 256
 
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
@@ -108,7 +108,7 @@ class FlashAttention3Backend(AttentionBackend):
                 causal=True,
             )
             return write_into(out, o)
-        # Keys come from the pages, cold rows too, as vLLM's V1; FA3's varlen entry takes no page table.
+        # Keys come from the pages, cold rows too; FA3's varlen entry takes no page table.
         if context.common_prefix_len:
             return self._cascade(q, k_cache, v_cache, context, out)
         assert context.cu_seqlens_k is not None
@@ -235,7 +235,7 @@ class FlashAttention3Backend(AttentionBackend):
         causal,
     ) -> torch.Tensor:
         """FA3's tile schedule for one problem, made by the step's first layer to pose it so the rest skip the
-        in-kernel pass, as vLLM's AOT schedule. A full graph reads it from a buffer refilled before each replay."""
+        in-kernel pass. A full graph reads it from a buffer refilled before each replay."""
         page_size = k_cache.size(1)
         shape = (self.num_heads, self.num_kv_heads, self.head_dim, v_cache.size(-1), q.dtype, page_size)
         key = ("fa3", kind, *shape, context.full_graph_size)  # the step cache holds other backends' plans too
@@ -267,7 +267,7 @@ class FlashAttention3Backend(AttentionBackend):
 
     @classmethod
     def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
-        """Remake the schedule each full graph at batch_size reads, for this step's lengths, as vLLM's builder does
+        """Remake the schedule each full graph at batch_size reads, for this step's lengths
         before every replay."""
         lens = None
         for key, problem in FlashAttention3Backend._graph_problems.items():
@@ -280,7 +280,7 @@ class FlashAttention3Backend(AttentionBackend):
 
 
 def _into_graph_schedule(key: tuple, schedule: torch.Tensor) -> torch.Tensor:
-    """schedule copied into the buffer full graphs read, its tail zeroed as vLLM's, since a stale tail misdirects
+    """schedule copied into the buffer full graphs read, its tail zeroed, since a stale tail misdirects
     thread blocks. One buffer per layer shape, sized by the first capture, which is the largest batch."""
     buffers = FlashAttention3Backend._graph_schedules
     shape = key[:-1]

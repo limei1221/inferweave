@@ -50,7 +50,7 @@ def load_model(model: nn.Module, path: str):
                     weight_loader(param, f.get_tensor(checkpoint_name))
                     loaded.add(weight_name)
     check_loaded(model, loaded, path)
-    for module in model.modules():  # vLLM's hook, for what is derived from the weights once
+    for module in model.modules():  # compute derived weights once after loading
         if hasattr(module, "process_weights_after_loading"):
             module.process_weights_after_loading()  # type: ignore[operator]
 

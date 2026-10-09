@@ -30,7 +30,7 @@ def write_into(out: torch.Tensor | None, o: torch.Tensor) -> torch.Tensor:
 class AttentionBackend(ABC):
     """Execution strategy for one attention layer. See docs/attention-backends.md."""
 
-    # What the backend serves, checked by validate; vLLM's defaults are fp16 and bf16 too.
+    # What the backend serves, checked by validate.
     supported_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16)
     supported_kinds: tuple[str, ...] = ("decoder", "mla")
 
@@ -63,7 +63,7 @@ class AttentionBackend(ABC):
     @classmethod
     def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
         """Refresh what the full graph captured at batch_size reads but cannot compute itself, from this step's
-        pure-decode context, before it replays. vLLM's metadata builders run before every replay too."""
+        pure-decode context, before it replays."""
 
     @staticmethod
     def split_decodes() -> bool:
@@ -195,7 +195,7 @@ class AttentionBackend(ABC):
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One step of a layer, after its keys are stored, written into out if given. A splitting backend runs the
-        leading one-query rows through decode and the rest through prefill, as vLLM does; others hand a step with
+        leading one-query rows through decode and the rest through prefill; others hand a step with
         prompt rows to prefill."""
         if not context.is_prefill:
             return self.decode(q, k_cache, v_cache, context, out=out)
@@ -207,7 +207,7 @@ class AttentionBackend(ABC):
             return self.prefill(q, k, v, k_cache, v_cache, prefills, out=out)
         if prefills is None:
             return self.decode(q, k_cache, v_cache, decodes, out=out)
-        # Each half writes its rows of one output, as vLLM's, so no copy joins them.
+        # Each half writes its rows of one output, so no copy joins them.
         if out is None:
             out = torch.empty_like(q)
         self.decode(q[:n], k_cache, v_cache, decodes, out=out[:n])

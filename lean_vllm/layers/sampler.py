@@ -3,7 +3,7 @@ from torch import nn
 
 
 def apply_top_k_top_p(logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None) -> torch.Tensor:
-    """Masks each row's logits outside its top k, then outside its top p of probability, as vLLM's pytorch op.
+    """Masks each row's logits outside its top k, then outside its top p of probability.
 
     A k of 0 keeps the whole row, as does a p of 1. It sorts the vocab, so a batch with neither passes None.
     The logits are updated in place.

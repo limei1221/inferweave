@@ -1111,7 +1111,7 @@ def test_fa3_cascade_matches_attending_each_row_whole(fake_fa3, decode):
 
 
 def test_fa3_makes_one_schedule_per_problem_per_step(fake_fa3):
-    """As vLLM's AOT schedule: the first layer to pose a problem makes it, and the rest are handed the same one."""
+    """The first layer to pose a problem makes it, and the rest are handed the same one."""
     backend, fake = fake_fa3
     q, k_cache, v_cache, context, expected = _shared_prefix_step(decode=True)
     for _ in range(3):  # layers

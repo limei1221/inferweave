@@ -16,7 +16,7 @@ try:
 except ImportError as e:  # the cuda extra installs it on Linux
     _IMPORT_ERROR = e
 
-# Scratch for split-KV partial results, shared by every wrapper as vLLM shares one.
+# Scratch for split-KV partial results, shared by every wrapper.
 WORKSPACE_BYTES = 256 * 1024 * 1024
 
 
@@ -52,7 +52,7 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def supports_head_size(head_size: int) -> bool:
-        return head_size in (64, 128, 256)  # as vLLM's FlashInfer backend
+        return head_size in (64, 128, 256)
 
     def store_kvcache(self, key, value, k_cache, v_cache, slot_mapping) -> None:
         triton_cache.store_kvcache(key, value, k_cache, v_cache, slot_mapping)
@@ -125,7 +125,7 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def before_full_graph_replay(cls, context: Context, batch_size: int) -> None:
-        """Re-plan the decode wrappers the graph at batch_size captured, for this step's rows, as vLLM's builder does.
+        """Re-plan the decode wrappers the graph at batch_size captured, for this step's rows.
         Their page tables are the graph's buffers, so the replay reads the new plan."""
         pages = {}
         for key, wrapper in cls._wrappers.items():
@@ -146,11 +146,11 @@ class FlashInferBackend(AttentionBackend):
         workspace = self._workspace_for(device)
         if kind == "paged":
             return BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
-        # Wide query groups decode on tensor cores, as vLLM chose; the CUDA-core kernel takes few group sizes.
+        # Wide query groups decode on tensor cores; the CUDA-core kernel takes few group sizes.
         use_tensor_cores = self.num_heads // self.num_kv_heads > 4
         if graph_size is None:
             return BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD", use_tensor_cores=use_tensor_cores)
-        # One per captured batch size, over slices of one fixed page table, as vLLM's.
+        # One per captured batch size, over slices of one fixed page table.
         if FlashInferBackend._graph_pages is None:
             assert context.block_tables is not None
             rows, width = context.block_tables.shape  # graphs capture largest first, so this bounds the rest
@@ -187,7 +187,7 @@ class FlashInferBackend(AttentionBackend):
         flat = (rows * block_tables.size(1) + pages).to(block_tables.device, non_blocking=True)
         indices = block_tables.flatten()[flat]
         last_page_len = kv_lens - (num_pages - 1) * page_size
-        if num_rows is not None:  # a last length of 1, as vLLM pads, though an empty row reads none
+        if num_rows is not None:  # a last length of 1, though an empty row reads none
             pad = num_rows - kv_lens.numel()
             indptr = torch.cat([indptr, indptr[-1:].expand(pad)])
             last_page_len = torch.cat([last_page_len, last_page_len.new_ones(pad)])

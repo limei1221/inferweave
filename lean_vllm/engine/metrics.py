@@ -16,7 +16,7 @@ TPOT_BUCKETS = (0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, INF)
 STEP_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, INF)
 TOKEN_BUCKETS = (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, INF)
 BATCH_BUCKETS = (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, INF)
-# As vLLM's NIXL transfer histograms.
+# Match the NIXL transfer histogram buckets for dashboard compatibility.
 TRANSFER_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 5.0, INF)
 BYTE_BUCKETS = tuple(2 ** (10 + i) for i in range(1, 25, 2)) + (INF,)
 
@@ -170,7 +170,7 @@ class Metrics:
         )
         self.kv_transfer_bytes = Histogram("lean_vllm:kv_transfer_bytes", "Bytes per load, all ranks.", BYTE_BUCKETS)
 
-        # Speculative decoding, as vLLM's: a draft is one row's drafts in one step.
+        # Speculative decoding: a draft is one row's drafts in one step.
         self.spec_drafts = Counter("lean_vllm:spec_decode_num_drafts_total", "Rows that verified drafts.")
         self.spec_draft_tokens = Counter("lean_vllm:spec_decode_num_draft_tokens_total", "Draft tokens verified.")
         self.spec_accepted_tokens = Counter("lean_vllm:spec_decode_num_accepted_tokens_total", "Draft tokens kept.")
@@ -207,7 +207,7 @@ class Metrics:
             self.prefix_cache_queries.inc(output.num_queried_blocks)
             self.prefix_cache_hits.inc(output.num_cached_blocks)
             self.running.set(len(scheduler.running))
-            self.waiting.set(len(scheduler.waiting) + len(scheduler.recving))  # as vLLM, loads count as waiting
+            self.waiting.set(len(scheduler.waiting) + len(scheduler.recving))  # KV loads count as waiting
             self.kv_usage.set(scheduler.block_manager.usage)
             for request_output in outputs:
                 if request_output.finished:

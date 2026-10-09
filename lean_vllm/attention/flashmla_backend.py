@@ -56,7 +56,7 @@ class FlashMLABackend(FlashAttention3Backend):
         assert context.context_lens is not None
         batch_size = context.context_lens.size(0)
         o, _ = flash_mla_with_kvcache(
-            q.view(batch_size, -1, *q.shape[1:]),  # [B, Lq, H, D]: Lq queries per row, causal, as vLLM's
+            q.view(batch_size, -1, *q.shape[1:]),  # [B, Lq, H, D]: Lq queries per row, causal
             latent_cache.unsqueeze(-2),  # add a head dim of 1
             context.block_tables,
             context.context_lens,

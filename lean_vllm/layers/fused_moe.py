@@ -1,8 +1,8 @@
-"""A fused MoE built the way vLLM's Triton path builds it.
+"""A fused MoE implemented in Triton.
 
 Pairs are sorted by expert and padded to whole row blocks, so each block reads one expert's weight.
 No shape is decided on the host, so the layer stays capturable.
-Tile sizes come from a tuned JSON file per shape and GPU, as vLLM's, or vLLM's defaults; benchmarks/tune_moe.py writes them.
+Tile sizes come from a tuned JSON file per shape and GPU, or vLLM's defaults; benchmarks/tune_moe.py writes them.
 """
 
 import functools
@@ -59,7 +59,7 @@ else:
         """One block of padded rows against one expert: C[pair] = A[pair // TOP_K] @ B[expert]."""
         pid = tl.program_id(0)
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-        # Grouped order, as vLLM's: GROUP_SIZE_M row blocks in turn take each column tile, sharing it in L2.
+        # Grouped order: GROUP_SIZE_M row blocks in turn take each column tile, sharing it in L2.
         num_pid_in_group = GROUP_SIZE_M * num_pid_n
         first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
         group_size_m = min(num_blocks - first_pid_m, GROUP_SIZE_M)
@@ -74,7 +74,7 @@ else:
         c_ptrs = c_ptr + offs_pair[:, None] * stride_cm + offs_cn[None, :] * stride_cn
         c_mask = pair_mask[:, None] & (offs_cn < N)[None, :]
         expert = tl.load(block_experts_ptr + pid_m)
-        if expert == -1:  # another EP rank's expert: its pairs add zero here, as in vLLM
+        if expert == -1:  # another EP rank's expert: its pairs add zero here
             tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty), mask=c_mask)
             return
 
@@ -117,8 +117,11 @@ else:
         RENORMALIZE: tl.constexpr,
         BLOCK_T: tl.constexpr,
     ):
-        """vLLM's topk_softmax and grouped_topk for BLOCK_T tokens: score, the best groups if grouped, top-k, all in
-        registers. A correction bias steers the picks, not the weights."""
+        """Route BLOCK_T tokens: score experts, select groups if grouped, then select top-k experts, all in
+        registers. A correction bias steers the picks, not the weights.
+
+        Corresponds to vLLM's topk_softmax and grouped_topk.
+        """
         rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
         cols = tl.arange(0, EXPERTS_POW2)
         row_mask = rows < num_tokens
@@ -157,7 +160,7 @@ else:
                 group_scores = tl.where(group_cols[None, :] == picked[:, None], float("-inf"), group_scores)
             choice = tl.where(eligible != 0, choice, float("-inf"))
 
-        # Top-k by repeated argmax, as vLLM's kernel: k is small, and a tie goes to the lower expert.
+        # Top-k by repeated argmax: k is small, and a tie goes to the lower expert.
         k_cols = tl.arange(0, TOP_K_POW2)
         weights = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.float32)
         ids = tl.zeros((BLOCK_T, TOP_K_POW2), dtype=tl.int32)
@@ -292,7 +295,7 @@ def get_config_file_name(E: int, N: int, device_name: str | None = None) -> str:
     """vLLM's name for bf16, so its tuned files load here too. N is the intermediate size per expert, after TP."""
     if device_name is None:
         device_name = re.sub(r"[\s/]+", "_", torch.cuda.get_device_name())
-    if "H200" in device_name.split("_"):  # one file serves the H200 family, as in vLLM
+    if "H200" in device_name.split("_"):  # one file serves the H200 family
         device_name = "NVIDIA_H200"
     return f"E={E},N={N},device_name={device_name}.json"
 

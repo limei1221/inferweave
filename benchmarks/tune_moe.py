@@ -120,9 +120,9 @@ def tune(num_tokens: int, shape: tuple, dtype: torch.dtype, configs: list[dict])
     best_config, best_time = None, float("inf")
     for i, config in enumerate(tqdm(configs, desc=f"batch {num_tokens}", leave=False)):
         try:
-            # 20 iterations, as vLLM's tuner: enough to rank, not to report.
+            # 20 iterations: enough to rank, not to report.
             kernel_time = benchmark_config(config, num_tokens, *shape, dtype, num_iters=20)
-        except triton.runtime.autotuner.OutOfResources:  # the path vLLM catches
+        except triton.runtime.autotuner.OutOfResources:
             continue  # too much shared memory or too many registers for this GPU
         if kernel_time < best_time:
             best_config, best_time = config, kernel_time

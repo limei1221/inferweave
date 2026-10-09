@@ -11,12 +11,12 @@ class SamplingParams:
     stop_token_ids: list[int] = field(default_factory=list)
     skip_special_tokens: bool = True
     priority: int = 0  # lower is scheduled sooner, under the priority policy
-    kv_transfer_params: dict | None = None  # disaggregated prefill, as vLLM's: do_remote_decode, or what to pull
+    kv_transfer_params: dict | None = None  # disaggregated prefill: do_remote_decode, or what to pull
 
     def __post_init__(self):
         assert self.temperature >= 0
         assert self.max_tokens >= 1
         assert 0 < self.top_p <= 1
         assert self.top_k >= -1
-        if self.temperature == 0:  # as vLLM's: greedy takes the argmax, whatever the truncation
+        if self.temperature == 0:  # greedy takes the argmax, whatever the truncation
             self.top_p, self.top_k = 1.0, 0

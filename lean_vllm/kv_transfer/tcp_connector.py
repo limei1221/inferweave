@@ -107,7 +107,7 @@ class TcpConnectorScheduler(KVConnectorScheduler):
 
     def request_finished(self, seq) -> tuple[bool, dict | None]:
         params = seq.kv_transfer_params
-        # As vLLM: a prefill that hit its max_tokens or a stop token hands over; an abort ends there.
+        # A prefill that hit its max_tokens or a stop token hands over; an abort ends there.
         if not params or not params.get("do_remote_decode") or seq.finish_reason not in ("length", "stop"):
             return False, None
         block_ids = seq.block_table[: _cdiv(seq.num_prompt_tokens, self.block_size)]

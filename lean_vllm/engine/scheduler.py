@@ -55,7 +55,7 @@ class Scheduler:
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         speculative = config.speculative
         self.num_speculative_tokens = speculative.num_speculative_tokens if speculative is not None else 0
-        # Slots past a row's last token that the drafter writes, its first draft aside, as vLLM's lookahead.
+        # Slots past a row's last token that the drafter writes, its first draft aside.
         self.num_lookahead_tokens = max(self.num_speculative_tokens - 1, 0)
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
@@ -320,7 +320,7 @@ class Scheduler:
                 elif seq.num_completion_tokens == seq.max_tokens:
                     reason = "length"
                 if reason is not None:
-                    break  # the tokens after a stop are dropped, as vLLM's
+                    break  # the tokens after a stop are dropped
             if seq.first_token_time is None:
                 seq.first_token_time = perf_counter()  # when the token reaches the host, not at launch
             stepped.append(seq)
@@ -355,7 +355,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 continue
             if request_id in kv_output.finished_recving:
-                # As vLLM: the last prompt token recomputes, so this engine samples the first token itself.
+                # The last prompt token is recomputed, so this engine samples the first token itself.
                 seq.num_cached_tokens = seq.num_prompt_tokens - 1
                 self.block_manager.hash_blocks(seq, seq.num_cached_tokens)
             seq.status = SequenceStatus.RUNNING

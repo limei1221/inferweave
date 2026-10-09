@@ -1,4 +1,4 @@
-"""Piecewise compilation, as vLLM does it: the model is traced once and split at attention, and each piece between
+"""Piecewise compilation: the model is traced once and split at attention, and each piece between
 two attention ops is compiled by Inductor. A piece captures one CUDA graph per bucket; attention runs eager between."""
 
 from typing import Any, Callable
@@ -112,6 +112,6 @@ def compile_piecewise(model: nn.Module, pool=None) -> PiecewiseBackend:
 
 
 def mark_dynamic_tokens(*tensors: torch.Tensor):
-    """The token dim symbolic, and nothing else, as vLLM marks it. A trace that bakes the size in fails loudly."""
+    """The token dim symbolic, and nothing else. A trace that bakes the size in fails loudly."""
     for tensor in tensors:
         torch._dynamo.mark_dynamic(tensor, 0)

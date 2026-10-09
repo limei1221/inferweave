@@ -27,7 +27,7 @@ class RejectionSampler(nn.Module):
 
         logits holds each row's draft positions, then its bonus position, row after row: [sum(n + 1), vocab].
         draft_token_ids is every row's drafts in the same order, and num_draft_tokens how many each row has.
-        temperatures, top_k and top_p are per row; the target's probabilities are taken after all three, as vLLM's.
+        temperatures, top_k and top_p are per row; the target's probabilities are taken after all three.
         """
         num_rows, num_drafts = num_draft_tokens.numel(), draft_token_ids.numel()
         device = logits.device

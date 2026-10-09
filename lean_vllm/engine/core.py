@@ -24,7 +24,7 @@ PARENT_POLL_MS = 1000  # how often an idle core checks that the client is still 
 
 
 def make_engine(model: str, **kwargs):
-    """The engine a core serves. Detokenization stays with the client, as in vLLM, so the step loop skips it."""
+    """The engine a core serves. Detokenization stays with the client, so the step loop skips it."""
     from lean_vllm.engine.llm_engine import LLMEngine
 
     return LLMEngine(model, detokenize=False, **kwargs)
@@ -40,7 +40,7 @@ def picklable(error: BaseException) -> BaseException:
 
 
 class EngineCore:
-    """vLLM's busy loop: take every queued request, step, send the outputs; block only when there is nothing to run."""
+    """Take every queued request, step, send the outputs; block only when there is nothing to run."""
 
     def __init__(self, engine, input_socket: zmq.Socket, output_socket: zmq.Socket):
         self.engine = engine

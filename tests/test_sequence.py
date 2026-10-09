@@ -99,6 +99,6 @@ def test_top_p_and_top_k_are_checked(bad):
 
 
 def test_greedy_drops_top_p_and_top_k():
-    """As vLLM's: the argmax needs no truncation, and the batch then skips the sort."""
+    """The argmax needs no truncation, and the batch then skips the sort."""
     params = SamplingParams(temperature=0, top_p=0.5, top_k=3)
     assert (params.top_p, params.top_k) == (1.0, 0)

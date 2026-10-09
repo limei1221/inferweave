@@ -241,8 +241,8 @@ def test_mixed_rows_keep_latent_decode_and_original_order(models, runner, monkey
 
 
 def test_rows_verifying_drafts_decode_their_latents(models, runner, monkeypatch):
-    """Rows of 1 + drafts queries attend the latents through mla_decode, as vLLM's MLA backends with
-    reorder_batch_threshold raised by the drafts; a row of another length, and a prompt, expand beside them."""
+    """Rows of 1 + drafts queries attend the latents through mla_decode; rows of other lengths and prompts
+    expand beside them."""
     reference, model = models
     runner.num_speculative_tokens = 2
     layers = [module for module in model.modules() if isinstance(module, MLAAttention)]

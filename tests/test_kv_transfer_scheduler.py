@@ -69,7 +69,7 @@ class TestDecodeSide:
         assert (req.remote_request_id, req.remote_host, req.remote_port) == ("p-1", "10.0.0.1", 14579)
 
     def test_once_loaded_it_computes_only_its_last_prompt_token(self, make_disagg_engine):
-        """As vLLM: the decode instance recomputes one token so that it samples the first one itself."""
+        """The decode instance recomputes one token so that it samples the first one itself."""
         engine = make_disagg_engine()
         engine.add(PROMPT, SamplingParams(max_tokens=3, ignore_eos=True, kv_transfer_params=remote_prefill()), "d-1")
         engine.step()
@@ -209,7 +209,7 @@ class TestPrefillSide:
         assert engine.last_output.num_cached_blocks == 2
 
     def test_a_prefill_that_stops_on_a_stop_token_hands_over_too(self, make_disagg_engine):
-        """As vLLM: a stop token hands over as max_tokens does; the decode instance samples its own first token."""
+        """A stop token hands over as max_tokens does; the decode instance samples its own first token."""
         engine = make_disagg_engine(eos_after={"p-1": 0})
         seq = engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params={"do_remote_decode": True}), "p-1")
         final = [output for output in engine.step() + engine.step() if output.finished]
@@ -241,7 +241,7 @@ class TestPrefillSide:
 
 
 def test_a_load_counts_as_waiting(make_disagg_engine):
-    """As vLLM's num_requests_waiting, which includes WAITING_FOR_REMOTE_KVS."""
+    """Remote KV loads count as waiting: vLLM's num_requests_waiting includes WAITING_FOR_REMOTE_KVS."""
     engine = make_disagg_engine()
     engine.add(PROMPT, SamplingParams(max_tokens=1, kv_transfer_params=remote_prefill()), "d-1")
     engine.step()

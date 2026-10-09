@@ -199,7 +199,7 @@ def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner
 
 @pytest.mark.parametrize("decodes_latents", [True, False], ids=["latents", "expanded"])
 def test_rows_verifying_as_many_drafts_decode_whole_when_latents_are_attended(runner, decodes_latents):
-    """As vLLM's uniform decode: MLA decodes them in one call, every token samples, and a full graph can hold them.
+    """MLA decodes them in one call, every token samples, and a full graph can hold them.
     A backend that expands latents prefills them, and rows of other lengths split."""
     runner.num_speculative_tokens = 2
     runner.decodes_latents = decodes_latents
@@ -245,7 +245,7 @@ def decoding_rows(tables: list[list[int]], cached: list[int]) -> list[Sequence]:
 
 @pytest.mark.parametrize("answers, want", [((True, True), 16), ((True, False), 0)], ids=["all_agree", "one_declines"])
 def test_cascade_takes_the_pages_every_row_shares_up_to_the_fewest_cached(runner, answers, want):
-    """Rows share blocks 1 and 2, and the third page only in part; every layer kind must agree, as vLLM's groups."""
+    """Rows share blocks 1 and 2, and the third page only in part; every layer kind must agree."""
     runner.cascade_layers = [CascadeLayer(answer) for answer in answers]
     rows = decoding_rows([[1, 2, 3, 9], [1, 2, 3, 10], [1, 2, 4, 11]], [30, 25, 28])
 
@@ -332,12 +332,12 @@ class TestStepKind:
         assert runner._step_kind(is_prefill=False, num_tokens=51, query_len=3) == "decode"
 
     def test_one_query_rows_skip_graphs_of_verifying_rows(self, runner):
-        """As vLLM's: the full graphs hold the uniform 1 + drafts decode alone."""
+        """The full graphs hold the uniform 1 + drafts decode alone."""
         runner.graph_query_len = 3
         assert runner._step_kind(is_prefill=False, num_tokens=8) == "decode"
 
     def test_a_cascade_decode_skips_the_full_graph(self, runner):
-        """The full graphs hold one-kernel decode, so a cascade step falls back, as vLLM's dispatcher does."""
+        """The full graphs hold one-kernel decode, so a cascade step falls back."""
         assert runner._step_kind(is_prefill=False, num_tokens=8, cascade=True) == "decode"
         assert runner._step_kind(is_prefill=False, num_tokens=512, cascade=True) == "piecewise"
 
@@ -508,7 +508,7 @@ def test_recomputed_suffix_stays_prefill_across_chunks(runner, make_engine):
 
 
 class TestDummySamplerRun:
-    """Warmup must reach the peak of sampling one row per sequence, as vLLM's profile run does."""
+    """Warmup must reach the peak of sampling one row per sequence."""
 
     @pytest.fixture
     def sampling_runner(self, runner):

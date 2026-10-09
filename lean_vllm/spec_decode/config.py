@@ -11,7 +11,7 @@ class SpeculativeConfig:
     """vLLM's --speculative-config, as JSON. Only a checkpoint's own MTP layers draft."""
 
     method: str = "mtp"
-    num_speculative_tokens: int = 1  # drafts per request per step; past the MTP layers' count they repeat, as vLLM's
+    num_speculative_tokens: int = 1  # drafts per request per step; past the MTP layers' count they repeat
 
     def __post_init__(self):
         if self.method not in MTP_METHODS:

@@ -1,4 +1,4 @@
-"""Speculative decoding with a checkpoint's own multi-token prediction layers, as vLLM's MTP method."""
+"""Speculative decoding with a checkpoint's own multi-token prediction layers."""
 
 from lean_vllm.spec_decode.config import PLACEHOLDER_TOKEN_ID, SpeculativeConfig, split_sampled
 from lean_vllm.spec_decode.rejection_sampler import RejectionSampler

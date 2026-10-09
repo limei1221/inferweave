@@ -16,8 +16,7 @@ def merge_attention(o_a, lse_a, o_b, lse_b) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def merge_attention_(o_a, lse_a, o_b, lse_b, out=None) -> None:
-    """merge_attention written over out, or else o_a, and lse_a: one Triton launch on CUDA, as vLLM's
-    merge_attn_states."""
+    """merge_attention written over out, or else o_a, and lse_a: one Triton launch on CUDA."""
     if o_a.is_cuda and triton_merge._IMPORT_ERROR is None:
         triton_merge.merge_attn_states_(o_a, lse_a, o_b, lse_b, out)
         return

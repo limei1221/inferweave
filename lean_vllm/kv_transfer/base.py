@@ -100,7 +100,7 @@ class KVConnectorMetadata:
 
 @dataclass(slots=True)
 class KVTransferStats:
-    """One load, as vLLM's NIXL stats record a transfer: from the read to the blocks landing."""
+    """One load: from the read to the blocks landing."""
 
     seconds: float
     num_bytes: int
@@ -125,7 +125,7 @@ class KVConnectorOutput:
 
 
 class KVOutputAggregator:
-    """A transfer is over once every rank has reported it, as vLLM's; a load failed if any rank's did."""
+    """A transfer is over once every rank has reported it; a load failed if any rank's did."""
 
     def __init__(self, world_size: int):
         self.world_size = world_size
