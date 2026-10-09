@@ -148,6 +148,8 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner"):
+            return  # already exited, and atexit calls it again
         if self.profiler is not None:
             self.profiler.close()
         self.model_runner.call("exit")

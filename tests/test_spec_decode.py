@@ -171,6 +171,16 @@ class TestScheduler:
         a_decodes = [n for _, rows in engine.model_runner.batches for r, n in rows if r == "a"][1:]
         assert a_decodes == [4, 1]
 
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False], ids=["chunked", "whole"])
+    def test_a_prompt_that_fits_only_without_its_lookahead_is_dropped(self, async_scheduling, enable_chunked_prefill):
+        """Its lookahead slots can never be free, so admission would otherwise wait on it forever."""
+        engine = make_drafting_engine(
+            2, num_kvcache_blocks=2, async_scheduling=async_scheduling, enable_chunked_prefill=enable_chunked_prefill
+        )
+        seq = engine.add(list(range(16)), SamplingParams(max_tokens=1))  # both blocks, then one lookahead slot
+        assert engine.run_to_completion() == {seq.request_id: []}
+        assert seq.finish_reason == "capacity"
+
     @pytest.mark.parametrize("wrong", [lambda seq, index: True, lambda seq, index: index % 3 == 1])
     def test_a_rejected_draft_gives_back_its_slot(self, monkeypatch, wrong, async_scheduling):
         """Only the newest token is left uncached after a step, however many drafts it kept; async, past the

@@ -1,8 +1,10 @@
-"""Prompt validation at admission: the guard both front doors share, without a model."""
+"""Prompt validation at admission: the guard both front doors share, without a model. And shutdown."""
+
+from types import SimpleNamespace
 
 import pytest
 
-from lean_vllm.engine.llm_engine import validate_request
+from lean_vllm.engine.llm_engine import LLMEngine, validate_request
 from lean_vllm.engine.scheduler import InvalidRequest
 from lean_vllm.sampling_params import SamplingParams
 
@@ -38,3 +40,15 @@ class TestPromptValidation:
 
     def test_the_edges_of_the_vocabulary_are_accepted(self):
         check([0, VOCAB - 1])
+
+
+class TestExit:
+    def test_a_second_exit_is_a_no_op(self):
+        """atexit calls exit() again after a caller's own."""
+        calls: list[str] = []
+        engine = LLMEngine.__new__(LLMEngine)
+        engine.profiler, engine.ps = None, []
+        engine.model_runner = SimpleNamespace(call=calls.append)
+        engine.exit()
+        engine.exit()
+        assert calls == ["exit"]
