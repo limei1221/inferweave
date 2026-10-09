@@ -61,7 +61,7 @@ def test_run_returns_tokens_that_are_not_yet_fetched(runner, make_engine):
     engine = make_engine()
     engine.add([10, 11, 12], SamplingParams(temperature=0.0))
     scheduled = engine.scheduler.schedule().scheduled
-    runner.sampler = lambda logits, temperatures: torch.tensor([42], dtype=torch.int64)
+    runner.sampler = lambda logits, temperatures, top_k, top_p: torch.tensor([42], dtype=torch.int64)
     runner.run_model = lambda ids, positions, is_prefill: torch.zeros(len(ids), 8)
     runner.step_kind = "enforced"
 
@@ -151,6 +151,31 @@ def test_an_all_greedy_batch_sends_no_temperatures(runner):
     _, _, temperatures, _ = runner.prepare_batch([seq])
 
     assert temperatures is None
+
+
+def test_a_batch_with_no_truncation_sends_no_top_k_or_top_p(runner):
+    """The sort they need costs a vocab's worth per row, so a batch that asks for neither skips it."""
+    seq = Sequence([10, 11, 12], SamplingParams(temperature=0.5))
+    seq.num_scheduled_tokens = 3
+
+    runner.prepare_batch([seq])
+
+    assert runner._top_k_top_p == (None, None)
+
+
+def test_one_row_asking_for_top_p_sends_both_for_every_row(runner):
+    """Both or neither, so the compiled sampler has no variant warmup missed."""
+    plain = Sequence([10, 11, 12], SamplingParams(temperature=0.5))
+    nucleus = Sequence([20, 21, 22], SamplingParams(temperature=0.5, top_p=0.9))
+    greedy = Sequence([30, 31, 32], SamplingParams(temperature=0, top_k=5))
+    for seq in (plain, nucleus, greedy):
+        seq.num_scheduled_tokens = 3
+
+    runner.prepare_batch([plain, nucleus, greedy])
+
+    top_k, top_p = runner._top_k_top_p
+    assert top_k.tolist() == [0, 0, 0]  # greedy drops its top_k
+    assert top_p.tolist() == pytest.approx([1.0, 0.9, 1.0])
 
 
 def test_one_query_rows_lead_the_batch_but_sample_in_the_schedulers_order(runner):
@@ -494,14 +519,23 @@ class TestDummySamplerRun:
         )
         runner.model = SimpleNamespace(compute_logits=lambda hidden: torch.zeros(hidden.size(0), 32))
         runner.sampled = []
-        runner.sampler = lambda logits, temperatures: runner.sampled.append((logits.shape, temperatures))
+        runner.sampler = lambda logits, temperatures, *top_k_top_p: runner.sampled.append(
+            (logits.shape, temperatures, top_k_top_p)
+        )
         return runner
 
     def test_it_samples_one_row_per_sequence_off_the_greedy_path(self, sampling_runner):
         sampling_runner._dummy_sampler_run()
-        ((shape, temperatures),) = sampling_runner.sampled
+        (shape, temperatures, _), _ = sampling_runner.sampled
         assert shape == (6, 32)
         assert (temperatures > 0).all()
+
+    def test_it_warms_up_with_and_without_top_k_and_top_p(self, sampling_runner):
+        """Each is a compiled variant, and the truncated one also holds the sort's memory."""
+        sampling_runner._dummy_sampler_run()
+        (_, _, plain), (_, _, (top_k, top_p)) = sampling_runner.sampled
+        assert plain == ()
+        assert (top_k == 31).all() and (top_p < 1).all()
 
     def test_a_token_budget_under_max_num_seqs_caps_the_rows(self, sampling_runner):
         sampling_runner.config.max_num_batched_tokens = 4
@@ -514,7 +548,7 @@ class TestDummySamplerRun:
         assert sampling_runner.sampled == []
 
     def test_running_out_of_memory_names_the_knobs(self, sampling_runner):
-        def oom(logits, temperatures):
+        def oom(logits, temperatures, *top_k_top_p):
             raise torch.OutOfMemoryError("CUDA out of memory")
 
         sampling_runner.sampler = oom

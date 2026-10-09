@@ -90,3 +90,15 @@ def test_max_tokens_must_be_at_least_one():
     """Prevent guard condition from hanging the request."""
     with pytest.raises(AssertionError):
         SamplingParams(max_tokens=0)
+
+
+@pytest.mark.parametrize("bad", [dict(top_p=0.0), dict(top_p=1.5), dict(top_k=-2)])
+def test_top_p_and_top_k_are_checked(bad):
+    with pytest.raises(AssertionError):
+        SamplingParams(**bad)
+
+
+def test_greedy_drops_top_p_and_top_k():
+    """As vLLM's: the argmax needs no truncation, and the batch then skips the sort."""
+    params = SamplingParams(temperature=0, top_p=0.5, top_k=3)
+    assert (params.top_p, params.top_k) == (1.0, 0)

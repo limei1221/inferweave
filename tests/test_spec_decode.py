@@ -63,6 +63,31 @@ class TestRejectionSampler:
         both = kept & (out[:, 1] == 2)
         assert (out[both, 2] >= 0).all() and (out[~both, 2] == -1).all()
 
+    def test_top_k_one_keeps_a_draft_only_if_it_is_the_argmax(self):
+        """With the target cut to its argmax, a sampled row verifies as a greedy one."""
+        temperatures, top_k = torch.ones(2), torch.ones(2, dtype=torch.int64)
+        logits = logits_for([4, 6, 1, 2, 2, 2])
+        drafts = torch.tensor([4, 7, 2, 2])
+        out = RejectionSampler()(logits, drafts, torch.tensor([2, 2]), temperatures, 2, top_k, None).tolist()
+        assert out == [[4, 6, -1], [2, 2, 2]]
+
+    def test_a_draft_outside_the_top_p_is_always_rejected(self):
+        torch.manual_seed(0)
+        num_rows = 1000
+        p = torch.tensor([0.6, 0.3, 0.1])
+        logits = p.log().repeat(2 * num_rows, 1)  # each row's draft position and bonus position
+        out = RejectionSampler()(
+            logits,
+            torch.full((num_rows,), 2),  # the 0.1 token, outside the top 0.7
+            torch.ones(num_rows, dtype=torch.int64),
+            torch.ones(num_rows),
+            1,
+            None,
+            torch.full((num_rows,), 0.7),
+        )
+        assert set(out[:, 0].tolist()) == {0, 1}
+        assert (out[:, 1] == -1).all()
+
 
 class FakeDraftingRunner(FakeModelRunner):
     """Verifies drafts as greedy rejection does, and drafts the true tokens except where wrong(seq, index) says.

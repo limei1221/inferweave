@@ -139,6 +139,20 @@ class TestCompletions:
         complete(client, temperature=0)
         assert engine.requests[0][1].temperature == 0
 
+    def test_top_p_and_top_k_reach_the_sampling_params(self, client, engine):
+        complete(client, top_p=0.9, top_k=20)
+        assert (engine.requests[0][1].top_p, engine.requests[0][1].top_k) == (0.9, 20)
+
+    def test_null_top_p_and_top_k_keep_the_whole_vocab(self, client, engine):
+        assert complete(client, top_p=None, top_k=None).status_code == 200
+        assert (engine.requests[0][1].top_p, engine.requests[0][1].top_k) == (1.0, 0)
+
+    @pytest.mark.parametrize("field, value", [("top_p", 0), ("top_p", 1.5), ("top_k", -2)])
+    def test_an_out_of_range_top_p_or_top_k_is_a_400(self, client, field, value):
+        response = complete(client, **{field: value})
+        assert response.status_code == 400
+        assert field in response.json()["error"]["message"]
+
     def test_the_priority_extra_reaches_the_sampling_params(self, client, engine):
         complete(client, priority=3, ignore_eos=True)
         assert (engine.requests[0][1].priority, engine.requests[0][1].ignore_eos) == (3, True)
@@ -238,8 +252,7 @@ class TestRefusals:
     @pytest.mark.parametrize(
         "field, value",
         [
-            ("top_p", 0.9),
-            ("top_k", 20),
+            ("min_p", 0.1),
             ("seed", 1),
             ("logprobs", 1),
             ("presence_penalty", 0.1),

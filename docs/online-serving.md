@@ -32,17 +32,19 @@ Both completion endpoints stream over Server-Sent Events (SSE) with
 | `model`, `prompt` / `messages` | Required |
 | `max_tokens` | Default 64 |
 | `temperature` | Default 1.0; 0 is greedy |
+| `top_p` | Default 1.0, in (0, 1] |
+| `top_k` | Default 0; 0 or -1 keeps the whole vocab |
 | `stream`, `stream_options.include_usage` | Supported |
 | `stop` | A string or a list of strings |
 | `n` (completions per prompt) | 1 only |
 | `ignore_eos` (extra) | Generates the full `max_tokens` |
 | `priority` (extra) | Lower runs first, under `--scheduling-policy priority` |
 | `kv_transfer_params` (extra) | Disaggregated prefill, as vLLM's; see [disaggregated-prefill.md](disaggregated-prefill.md) |
-| `top_p`, `top_k`, `min_p`, `seed`, penalties, `logprobs`, `logit_bias`, `tools`, `echo`, `suffix`, `best_of` | **Refused with a 400** |
+| `min_p`, `seed`, penalties, `logprobs`, `logit_bias`, `tools`, `echo`, `suffix`, `best_of` | **Refused with a 400** |
 
 Unsupported fields are refused rather than ignored, because ignoring them would
 silently return the wrong output. A field set to its no-op value, such as
-`"top_p": 1.0`, is accepted, since many clients send those by default.
+`"min_p": 0`, is accepted, since many clients send those by default.
 
 ### Errors
 

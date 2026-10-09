@@ -7,9 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Refused by name with a reason. Each allows its no-op values, which clients send by default.
 UNSUPPORTED = {
-    "top_p": ((1.0,), "lean-vLLM samples with temperature only"),
-    "top_k": ((0, -1), "lean-vLLM samples with temperature only"),
-    "min_p": ((0.0,), "lean-vLLM samples with temperature only"),
+    "min_p": ((0.0,), "lean-vLLM samples with temperature, top-k and top-p only"),
     "best_of": ((1,), "n > 1 is out of scope"),
     "logprobs": ((False, 0), "the sampler does not return logprobs"),
     "top_logprobs": ((0,), "the sampler does not return logprobs"),
@@ -42,6 +40,8 @@ class BaseRequest(BaseModel):
     model: str
     max_tokens: int = 64
     temperature: float = 1.0  # 0 is greedy
+    top_p: float | None = None  # None is 1.0, the whole vocab, as vLLM's
+    top_k: int | None = None  # None, 0 or -1 is the whole vocab, as vLLM's
     stream: bool = False
     stream_options: StreamOptions | None = None
     stop: str | list[str] | None = None
@@ -73,6 +73,10 @@ class BaseRequest(BaseModel):
             raise ValueError("max_tokens must be at least 1")
         if self.temperature < 0:
             raise ValueError("temperature must not be negative")
+        if self.top_p is not None and not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if self.top_k is not None and self.top_k < -1:
+            raise ValueError("top_k must be 0 or -1 (disable), or at least 1")
         return self
 
     @property

@@ -64,6 +64,8 @@ class Sequence:
         self.block_table: list[int] = []
         self.block_hashes: list[int] = []  # chained, one per full block, filled on demand
         self.temperature = sampling_params.temperature
+        self.top_p = sampling_params.top_p
+        self.top_k = sampling_params.top_k
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.stop_token_ids = sampling_params.stop_token_ids

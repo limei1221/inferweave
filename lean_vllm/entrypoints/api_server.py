@@ -129,6 +129,8 @@ async def _serve(
     request_id = f"{'chatcmpl' if chat else 'cmpl'}-{uuid4().hex}"
     sampling_params = SamplingParams(
         temperature=body.temperature,
+        top_p=1.0 if body.top_p is None else body.top_p,
+        top_k=0 if body.top_k is None else body.top_k,
         max_tokens=body.max_tokens,
         ignore_eos=body.ignore_eos,
         priority=body.priority,
